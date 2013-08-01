@@ -14,6 +14,7 @@
 #    under the License.
 
 import webob.exc
+import os
 
 from nova.api.openstack import common
 from nova.api.openstack.compute.views import images as views_images
@@ -206,8 +207,38 @@ class Controller(wsgi.Controller):
         req.cache_db_items('images', images, 'id')
         return self._view_builder.detail(req, images)
 
-    def create(self, *args, **kwargs):
-        raise webob.exc.HTTPMethodNotAllowed()
+    @wsgi.response(202)
+    def create(self, req, body):
+        context = req.environ['nova.context']
+        entity = body.get("createImage", {})
+        metadata = entity.get("metadata")
+
+        image_name = entity.get("name")
+	image_spec = entity.get("imageSpec")
+        image_meta = entity.get("metadata")
+
+        if not image_name:
+            msg = _("createImage entity requires name attribute")
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+        if not image_spec:
+            msg = _("createImage entity requires imageSpec attribute")
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+	if 'osName' not in image_spec:
+            msg = _("imageSpec entity requires osName attribute")
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+	
+        image = self._image_service.create(context, image_meta)
+        image_id = str(image['id'])
+        image_ref = os.path.join(req.application_url,
+                                 context.project_id,
+                                 'images',
+                                 image_id)
+
+        resp = webob.Response(status_int=202)
+        resp.headers['Location'] = image_ref
+        return resp
 
 
 def create_resource():
