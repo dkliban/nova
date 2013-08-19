@@ -313,7 +313,7 @@
 
 # whether to use per-user rate limiting for the api. (boolean
 # value)
-#api_rate_limit=true
+#api_rate_limit=false
 
 # The strategy to use for auth: noauth or keystone. (string
 # value)
@@ -385,6 +385,9 @@
 # drive (string value)
 #config_drive_skip_versions=1.0 2007-01-19 2007-03-01 2007-08-29 2007-10-10 2007-12-15 2008-02-01 2008-09-01
 
+# Driver to use for vendor data (string value)
+#vendordata_driver=nova.api.metadata.vendordata_json.JsonFileVendorData
+
 
 #
 # Options defined in nova.api.metadata.handler
@@ -397,6 +400,14 @@
 # Shared secret to validate proxies Neutron metadata requests
 # (string value)
 #neutron_metadata_proxy_shared_secret=
+
+
+#
+# Options defined in nova.api.metadata.vendordata_json
+#
+
+# File to load json formated vendor data from (string value)
+#vendordata_jsonfile_path=<None>
 
 
 #
@@ -537,17 +548,6 @@
 
 
 #
-# Options defined in nova.cmd.clear_rabbit_queues
-#
-
-# Queues to delete (multi valued)
-#queues=
-
-# delete nova exchange too. (boolean value)
-#delete_exchange=false
-
-
-#
 # Options defined in nova.cmd.novnc
 #
 
@@ -676,6 +676,10 @@
 # (integer value)
 #network_allocate_retries=0
 
+# The number of times to attempt to reap an instance's files.
+# (integer value)
+#maximum_instance_delete_attempts=5
+
 # interval to pull bandwidth usage info (integer value)
 #bandwidth_poll_interval=600
 
@@ -711,6 +715,10 @@
 # removing from a host.  -1 never offload, 0 offload when
 # shelved (integer value)
 #shelved_offload_time=0
+
+# Interval in seconds for retrying failed instance file
+# deletes (integer value)
+#instance_delete_interval=300
 
 # Action to take if a running deleted instance is
 # detected.Valid options are 'noop', 'log' and 'reap'. Set to
@@ -917,7 +925,7 @@
 # value)
 #image_decryption_dir=/tmp
 
-# hostname or ip for openstack to use when accessing the s3
+# hostname or ip for OpenStack to use when accessing the s3
 # api (string value)
 #s3_host=$my_ip
 
@@ -1158,11 +1166,6 @@
 # Number of addresses in each private subnet (integer value)
 #network_size=256
 
-# DEPRECATED - Fixed IP address block.If set to an empty
-# string, the subnet range(s) will be automatically determined
-# and configured. (string value)
-#fixed_range=10.0.0.0/8
-
 # Fixed IPv6 address block (string value)
 #fixed_range_v6=fd00::/48
 
@@ -1266,6 +1269,10 @@
 # (integer value)
 #neutron_extension_sync_interval=600
 
+# Location of ca certicates file to use for neutronclient
+# requests. (string value)
+#neutron_ca_certificates_file=<None>
+
 
 #
 # Options defined in nova.network.rpcapi
@@ -1303,69 +1310,28 @@
 
 
 #
-# Options defined in nova.openstack.common.db.api
-#
-
-# The backend to use for db (string value)
-#db_backend=sqlalchemy
-
-# Enable the experimental use of thread pooling for all DB API
-# calls (boolean value)
-#dbapi_use_tpool=false
-
-
-#
 # Options defined in nova.openstack.common.db.sqlalchemy.session
 #
-
-# The SQLAlchemy connection string used to connect to the
-# database (string value)
-#sql_connection=sqlite:////nova/openstack/common/db/$sqlite_db
 
 # the filename to use with sqlite (string value)
 #sqlite_db=nova.sqlite
 
-# timeout before idle sql connections are reaped (integer
-# value)
-#sql_idle_timeout=3600
-
-# If passed, use synchronous mode for sqlite (boolean value)
+# If true, use synchronous mode for sqlite (boolean value)
 #sqlite_synchronous=true
-
-# Minimum number of SQL connections to keep open in a pool
-# (integer value)
-#sql_min_pool_size=1
-
-# Maximum number of SQL connections to keep open in a pool
-# (integer value)
-#sql_max_pool_size=5
-
-# maximum db connection retries during startup. (setting -1
-# implies an infinite retry count) (integer value)
-#sql_max_retries=10
-
-# interval between retries of opening a sql connection
-# (integer value)
-#sql_retry_interval=10
-
-# If set, use this value for max_overflow with sqlalchemy
-# (integer value)
-#sql_max_overflow=<None>
-
-# Verbosity of SQL debugging information. 0=None,
-# 100=Everything (integer value)
-#sql_connection_debug=0
-
-# Add python stack traces to SQL as comment strings (boolean
-# value)
-#sql_connection_trace=false
 
 
 #
 # Options defined in nova.openstack.common.eventlet_backdoor
 #
 
-# port for eventlet backdoor to listen (integer value)
+# Enable eventlet backdoor. Acceptable values are 0, <port>
+# and <start>:<end>, where 0 results in listening on a random
+# tcp port number, <port> results in listening on the
+# specified port number and not enabling backdoorif it is in
+# use and <start>:<end> results in listening on the smallest
+# unused port number within the specified range of port
+# numbers. The chosen port is displayed in the service's log
+# file. (string value)
 #backdoor_port=<None>
 
 
@@ -1376,8 +1342,7 @@
 # Whether to disable inter-process locks (boolean value)
 #disable_process_locking=false
 
-# Directory to use for lock files. Default to a temp directory
-# (string value)
+# Directory to use for lock files. (string value)
 #lock_path=<None>
 
 
@@ -1491,7 +1456,7 @@
 # Options defined in nova.openstack.common.notifier.rpc_notifier
 #
 
-# AMQP topic used for openstack notifications (list value)
+# AMQP topic used for OpenStack notifications (list value)
 #notification_topics=notifications
 
 
@@ -2143,6 +2108,10 @@
 # Base dir where Scality SOFS shall be mounted (string value)
 #scality_sofs_mount_point=$state_path/scality
 
+# Protocols listed here will be accessed directly from QEMU.
+# Currently supported protocols: [gluster] (list value)
+#qemu_allowed_storage_drivers=
+
 
 #
 # Options defined in nova.virt.powervm.driver
@@ -2264,6 +2233,40 @@
 
 
 #
+# Options defined in nova.virt.xenapi.image.bittorrent
+#
+
+# Base URL for torrent files. (string value)
+#xenapi_torrent_base_url=<None>
+
+# Probability that peer will become a seeder. (1.0 = 100%)
+# (floating point value)
+#xenapi_torrent_seed_chance=1.0
+
+# Number of seconds after downloading an image via BitTorrent
+# that it should be seeded for other peers. (integer value)
+#xenapi_torrent_seed_duration=3600
+
+# Cached torrent files not accessed within this number of
+# seconds can be reaped (integer value)
+#xenapi_torrent_max_last_accessed=86400
+
+# Beginning of port range to listen on (integer value)
+#xenapi_torrent_listen_port_start=6881
+
+# End of port range to listen on (integer value)
+#xenapi_torrent_listen_port_end=6891
+
+# Number of seconds a download can remain at the same progress
+# percentage w/o being considered a stall (integer value)
+#xenapi_torrent_download_stall_cutoff=600
+
+# Maximum number of seeder processes to run concurrently
+# within a given dom0. (-1 = no limit) (integer value)
+#xenapi_torrent_max_seeder_processes_per_host=1
+
+
+#
 # Options defined in nova.virt.xenapi.pool
 #
 
@@ -2302,13 +2305,14 @@
 #max_kernel_ramdisk_size=16777216
 
 # Filter for finding the SR to be used to install guest
-# instances on. The default value is the Local Storage in
-# default XenServer/XCP installations. To select an SR with a
-# different matching criteria, you could set it to other-
+# instances on. To use the Local Storage in default
+# XenServer/XCP installations set this flag to other-config
+# :i18n-key=local-storage. To select an SR with a different
+# matching criteria, you could set it to other-
 # config:my_favorite_sr=true. On the other hand, to fall back
 # on the Default SR, as displayed by XenCenter, set this flag
 # to: default-sr:true (string value)
-#sr_matching_filter=other-config:i18n-key=local-storage
+#sr_matching_filter=default-sr:true
 
 # Whether to use sparse_copy for copying data on a resize down
 # (False will use standard dd). This speeds up resizes down
@@ -2323,35 +2327,6 @@
 # (all|some|none). (string value)
 #xenapi_torrent_images=none
 
-# Base URL for torrent files. (string value)
-#xenapi_torrent_base_url=<None>
-
-# Probability that peer will become a seeder. (1.0 = 100%)
-# (floating point value)
-#xenapi_torrent_seed_chance=1.0
-
-# Number of seconds after downloading an image via BitTorrent
-# that it should be seeded for other peers. (integer value)
-#xenapi_torrent_seed_duration=3600
-
-# Cached torrent files not accessed within this number of
-# seconds can be reaped (integer value)
-#xenapi_torrent_max_last_accessed=86400
-
-# Beginning of port range to listen on (integer value)
-#xenapi_torrent_listen_port_start=6881
-
-# End of port range to listen on (integer value)
-#xenapi_torrent_listen_port_end=6891
-
-# Number of seconds a download can remain at the same progress
-# percentage w/o being considered a stall (integer value)
-#xenapi_torrent_download_stall_cutoff=600
-
-# Maximum number of seeder processes to run concurrently
-# within a given dom0. (-1 = no limit) (integer value)
-#xenapi_torrent_max_seeder_processes_per_host=1
-
 
 #
 # Options defined in nova.virt.xenapi.vmops
@@ -2365,9 +2340,9 @@
 # value)
 #xenapi_vif_driver=nova.virt.xenapi.vif.XenAPIBridgeDriver
 
-# Object Store Driver used to handle image uploads. (string
+# Dom0 plugin driver used to handle image uploads. (string
 # value)
-#xenapi_image_upload_handler=nova.virt.xenapi.imageupload.glance.GlanceStore
+#xenapi_image_upload_handler=nova.virt.xenapi.image.glance.GlanceStore
 
 
 #
@@ -2466,6 +2441,14 @@
 
 
 #
+# Options defined in nova.virt.hyperv.utilsfactory
+#
+
+# Force V1 volume utility class (boolean value)
+#force_volumeutils_v1=false
+
+
+#
 # Options defined in nova.virt.hyperv.vif
 #
 
@@ -2507,9 +2490,6 @@
 # (integer value)
 #volume_attach_retry_interval=5
 
-# Force volumeutils v1 (boolean value)
-#force_volumeutils_v1=false
-
 
 [osapi_v3]
 
@@ -2546,23 +2526,67 @@
 #manager=nova.conductor.manager.ConductorManager
 
 
-[ssl]
+[database]
 
 #
-# Options defined in nova.openstack.common.sslutils
+# Options defined in nova.openstack.common.db.api
 #
 
-# CA certificate file to use to verify connecting clients
-# (string value)
-#ca_file=<None>
+# The backend to use for db (string value)
+#backend=sqlalchemy
 
-# Certificate file to use when starting the server securely
-# (string value)
-#cert_file=<None>
+# Enable the experimental use of thread pooling for all DB API
+# calls (boolean value)
+#use_tpool=false
 
-# Private key file to use when starting the server securely
-# (string value)
-#key_file=<None>
+
+#
+# Options defined in nova.openstack.common.db.sqlalchemy.session
+#
+
+# The SQLAlchemy connection string used to connect to the
+# database (string value)
+#connection=sqlite:////nova/openstack/common/db/$sqlite_db
+
+# The SQLAlchemy connection string used to connect to the
+# slave database (string value)
+#slave_connection=
+
+# timeout before idle sql connections are reaped (integer
+# value)
+#idle_timeout=3600
+
+# Minimum number of SQL connections to keep open in a pool
+# (integer value)
+#min_pool_size=1
+
+# Maximum number of SQL connections to keep open in a pool
+# (integer value)
+#max_pool_size=<None>
+
+# maximum db connection retries during startup. (setting -1
+# implies an infinite retry count) (integer value)
+#max_retries=10
+
+# interval between retries of opening a sql connection
+# (integer value)
+#retry_interval=10
+
+# If set, use this value for max_overflow with sqlalchemy
+# (integer value)
+#max_overflow=<None>
+
+# Verbosity of SQL debugging information. 0=None,
+# 100=Everything (integer value)
+#connection_debug=0
+
+# Add python stack traces to SQL as comment strings (boolean
+# value)
+#connection_trace=false
+
+# If set, use this value for pool_timeout with sqlalchemy
+# (integer value)
+#pool_timeout=<None>
 
 
 [cells]
@@ -2723,6 +2747,18 @@
 # Number of seconds to wait until retrying to join the session
 # (integer value)
 #sg_retry_interval=5
+
+
+[image_file_url]
+
+#
+# Options defined in nova.image.download.file
+#
+
+# A list of filesystems that will be configured in this file
+# under the sections image_file_url:<list entry name> (list
+# value)
+#filesystems=
 
 
 [baremetal]
@@ -2895,7 +2931,7 @@
 # Options defined in nova.openstack.common.notifier.rpc_notifier2
 #
 
-# AMQP topic(s) used for openstack notifications (list value)
+# AMQP topic(s) used for OpenStack notifications (list value)
 #topics=notifications
 
 
@@ -2913,6 +2949,25 @@
 
 # Password for Redis server. (optional) (string value)
 #password=<None>
+
+
+[ssl]
+
+#
+# Options defined in nova.openstack.common.sslutils
+#
+
+# CA certificate file to use to verify connecting clients
+# (string value)
+#ca_file=<None>
+
+# Certificate file to use when starting the server securely
+# (string value)
+#cert_file=<None>
+
+# Private key file to use when starting the server securely
+# (string value)
+#key_file=<None>
 
 
 [trusted_computing]
@@ -3068,6 +3123,10 @@
 # compute_driver is vmwareapi.VMwareVCDriver. (string value)
 #cluster_name=<None>
 
+# Regex to match the name of a datastore. Used only if
+# compute_driver is vmwareapi.VMwareVCDriver. (string value)
+#datastore_regex=<None>
+
 # The interval used for polling of remote tasks. Used only if
 # compute_driver is vmwareapi.VMwareESXDriver or
 # vmwareapi.VMwareVCDriver. (floating point value)
@@ -3112,6 +3171,20 @@
 
 
 #
+# Options defined in nova.virt.vmwareapi.vim_util
+#
+
+# The maximum number of ObjectContent data objects that should
+# be returned in a single result. A positive value will cause
+# the operation to suspend the retrieval when the count of
+# objects reaches the specified maximum. The server may still
+# limit the count to something less than the configured value.
+# Any remaining objects may be retrieved with additional
+# requests. (integer value)
+#maximum_objects=100
+
+
+#
 # Options defined in nova.virt.vmwareapi.vmops
 #
 
@@ -3147,4 +3220,3 @@
 #keymap=en-us
 
 
-# Total option count: 627

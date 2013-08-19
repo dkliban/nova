@@ -27,7 +27,9 @@ from nova.compute import power_state
 from nova import context as nova_context
 from nova import exception
 from nova.openstack.common import excutils
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import importutils
+from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
 from nova import paths
 from nova.virt.baremetal import baremetal_states
@@ -165,7 +167,7 @@ class BareMetalDriver(driver.ComputeDriver):
         return 1
 
     def legacy_nwinfo(self):
-        return True
+        return False
 
     def list_instances(self):
         l = []
@@ -414,6 +416,7 @@ class BareMetalDriver(driver.ComputeDriver):
                'hypervisor_version': self.get_hypervisor_version(),
                'hypervisor_hostname': str(node['uuid']),
                'cpu_info': 'baremetal cpu',
+               'supported_instances': jsonutils.dumps(self.supported_instances)
                }
         return dic
 
@@ -480,12 +483,12 @@ class BareMetalDriver(driver.ComputeDriver):
             for pif in pifs:
                 if pif['vif_uuid']:
                     db.bm_interface_set_vif_uuid(context, pif['id'], None)
-        for (network, mapping) in network_info:
-            self.vif_driver.plug(instance, (network, mapping))
+        for vif in network_info:
+            self.vif_driver.plug(instance, vif)
 
     def _unplug_vifs(self, instance, network_info):
-        for (network, mapping) in network_info:
-            self.vif_driver.unplug(instance, (network, mapping))
+        for vif in network_info:
+            self.vif_driver.unplug(instance, vif)
 
     def manage_image_cache(self, context, all_instances):
         """Manage the local cache of images."""

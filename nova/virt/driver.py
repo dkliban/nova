@@ -26,6 +26,7 @@ import sys
 
 from oslo.config import cfg
 
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
 from nova import utils
@@ -38,7 +39,6 @@ driver_opts = [
                    'fake.FakeDriver, baremetal.BareMetalDriver, '
                    'vmwareapi.VMwareESXDriver, vmwareapi.VMwareVCDriver'),
     cfg.StrOpt('default_ephemeral_format',
-               default=None,
                help='The default format an ephemeral_volume will be '
                     'formatted with on creation.'),
     cfg.StrOpt('preallocate_images',
@@ -470,7 +470,7 @@ class ComputeDriver(object):
         """Retrieve resource information.
 
         This method is called when nova-compute launches, and
-        as part of a periodic task
+        as part of a periodic task that records the results in the DB.
 
         :param nodename:
             node which the caller want to get resources from
@@ -905,7 +905,7 @@ class ComputeDriver(object):
         """
         raise NotImplementedError()
 
-    def get_available_nodes(self):
+    def get_available_nodes(self, refresh=False):
         """Returns nodenames of all nodes managed by the compute service.
 
         This method is for multi compute-nodes support. If a driver supports
@@ -913,10 +913,17 @@ class ComputeDriver(object):
         by the service. Otherwise, this method should return
         [hypervisor_hostname].
         """
-        stats = self.get_host_stats(refresh=True)
+        stats = self.get_host_stats(refresh=refresh)
         if not isinstance(stats, list):
             stats = [stats]
         return [s['hypervisor_hostname'] for s in stats]
+
+    def node_is_available(self, nodename):
+        """Return whether this compute service manages a particular node."""
+        if nodename in self.get_available_nodes():
+            return True
+        # Refresh and check again.
+        return nodename in self.get_available_nodes(refresh=True)
 
     def get_per_instance_usage(self):
         """Get information about instance resource usage.
@@ -972,6 +979,13 @@ class ComputeDriver(object):
         except Exception as ex:
             LOG.error(_("Exception dispatching event %(event)s: %(ex)s"),
                       {'event': event, 'ex': ex})
+
+    def delete_instance_files(self, instance):
+        """Delete any lingering instance files for an instance.
+
+        :returns: True if the instance was deleted from disk, False otherwise.
+        """
+        return True
 
 
 def load_compute_driver(virtapi, compute_driver=None):

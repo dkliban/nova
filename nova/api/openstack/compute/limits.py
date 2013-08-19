@@ -44,6 +44,7 @@ import webob.exc
 from nova.api.openstack.compute.views import limits as limits_views
 from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import importutils
 from nova.openstack.common import jsonutils
 from nova import quota
@@ -289,7 +290,7 @@ class RateLimitingMiddleware(base_wsgi.Middleware):
         if delay:
             msg = _("This request was rate-limited.")
             retry = time.time() + delay
-            return wsgi.OverLimitFault(msg, error, retry)
+            return wsgi.RateLimitFault(msg, error, retry)
 
         req.environ["nova.limits"] = self._limiter.get_limits(username)
 

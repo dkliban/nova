@@ -19,6 +19,8 @@ from lxml import etree
 import time
 import uuid
 
+from nova.openstack.common.gettextutils import _
+
 # Allow passing None to the various connect methods
 # (i.e. allow the client to rely on default URLs)
 allow_default_uri_connection = True
@@ -122,6 +124,9 @@ VIR_ERR_OPERATION_TIMEOUT = 68
 VIR_ERR_NO_NWFILTER = 620
 VIR_ERR_SYSTEM_ERROR = 900
 VIR_ERR_INTERNAL_ERROR = 950
+
+# Readonly
+VIR_CONNECT_RO = 1
 
 
 def _parse_disk_info(element):
@@ -886,14 +891,7 @@ class Connection(object):
         return []
 
 
-def openReadOnly(uri):
-    return Connection(uri, readonly=True)
-
-
 def openAuth(uri, auth, flags):
-    if flags != 0:
-        raise Exception(_("Please extend mock libvirt module to support "
-                          "flags"))
 
     if type(auth) != list:
         raise Exception(_("Expected a list for 'auth' parameter"))
@@ -906,7 +904,7 @@ def openAuth(uri, auth, flags):
         raise Exception(
             _("Expected a function in 'auth[1]' parameter"))
 
-    return Connection(uri, readonly=False)
+    return Connection(uri, (flags == VIR_CONNECT_RO))
 
 
 def virEventRunDefaultImpl():

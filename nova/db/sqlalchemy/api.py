@@ -57,6 +57,7 @@ from nova import exception
 from nova.openstack.common.db import exception as db_exc
 from nova.openstack.common.db.sqlalchemy import session as db_session
 from nova.openstack.common.db.sqlalchemy import utils as sqlalchemyutils
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova.openstack.common import timeutils
 from nova.openstack.common import uuidutils
@@ -72,8 +73,9 @@ db_opts = [
 CONF = cfg.CONF
 CONF.register_opts(db_opts)
 CONF.import_opt('compute_topic', 'nova.compute.rpcapi')
-CONF.import_opt('sql_connection',
-                'nova.openstack.common.db.sqlalchemy.session')
+CONF.import_opt('connection',
+                'nova.openstack.common.db.sqlalchemy.session',
+                group='database')
 
 LOG = logging.getLogger(__name__)
 
@@ -281,25 +283,25 @@ def convert_datetimes(values, *datetime_keys):
     return values
 
 
-def _sync_instances(context, project_id, session):
+def _sync_instances(context, project_id, user_id, session):
     return dict(zip(('instances', 'cores', 'ram'),
-                    _instance_data_get_for_project(
-                context, project_id, session)))
+                    _instance_data_get_for_user(
+                context, project_id, user_id, session)))
 
 
-def _sync_floating_ips(context, project_id, session):
+def _sync_floating_ips(context, project_id, user_id, session):
     return dict(floating_ips=_floating_ip_count_by_project(
                 context, project_id, session))
 
 
-def _sync_fixed_ips(context, project_id, session):
+def _sync_fixed_ips(context, project_id, user_id, session):
     return dict(fixed_ips=_fixed_ip_count_by_project(
                 context, project_id, session))
 
 
-def _sync_security_groups(context, project_id, session):
-    return dict(security_groups=_security_group_count_by_project(
-                context, project_id, session))
+def _sync_security_groups(context, project_id, user_id, session):
+    return dict(security_groups=_security_group_count_by_project_and_user(
+                context, project_id, user_id, session))
 
 QUOTA_SYNC_FUNCTIONS = {
     '_sync_instances': _sync_instances,
@@ -372,7 +374,6 @@ def service_destroy(context, service_id):
                     soft_delete(synchronize_session=False)
 
 
-@require_admin_context
 def _service_get(context, service_id, with_compute_node=True, session=None):
     query = model_query(context, models.Service, session=session).\
                      filter_by(id=service_id)
@@ -887,7 +888,6 @@ def floating_ip_get_by_address(context, address):
     return _floating_ip_get_by_address(context, address)
 
 
-@require_context
 def _floating_ip_get_by_address(context, address, session=None):
 
     # if address string is empty explicitly set it to None
@@ -943,7 +943,6 @@ def floating_ip_update(context, address, values):
             raise exception.FloatingIpExists(address=values['address'])
 
 
-@require_context
 def _dnsdomain_get(context, session, fqdomain):
     return model_query(context, models.DNSDomain,
                        session=session, read_deleted="no").\
@@ -959,7 +958,6 @@ def dnsdomain_get(context, fqdomain):
         return _dnsdomain_get(context, session, fqdomain)
 
 
-@require_admin_context
 def _dnsdomain_get_or_create(context, session, fqdomain):
     domain_ref = _dnsdomain_get(context, session, fqdomain)
     if not domain_ref:
@@ -1184,7 +1182,6 @@ def fixed_ip_get_by_address(context, address):
     return _fixed_ip_get_by_address(context, address)
 
 
-@require_context
 def _fixed_ip_get_by_address(context, address, session=None):
     if session is None:
         session = get_session()
@@ -1344,7 +1341,6 @@ def virtual_interface_create(context, values):
     return vif_ref
 
 
-@require_context
 def _virtual_interface_query(context, session=None):
     return model_query(context, models.VirtualInterface, session=session,
                        read_deleted="no")
@@ -1476,6 +1472,27 @@ def _validate_unique_server_name(context, session, name):
         raise exception.InstanceExists(name=lowername)
 
 
+def _handle_objects_related_type_conversions(values):
+    """Make sure that certain things in values (which may have come from
+    an objects.instance.Instance object) are in suitable form for the
+    database.
+    """
+    # NOTE(danms): Make sure IP addresses are passed as strings to
+    # the database engine
+    for key in ('access_ip_v4', 'access_ip_v6'):
+        if key in values and values[key] is not None:
+            values[key] = str(values[key])
+
+    # NOTE(danms): Strip UTC timezones from datetimes, since they're
+    # stored that way in the database
+    for key in ('created_at', 'deleted_at', 'updated_at',
+                'launched_at', 'terminated_at', 'scheduled_at'):
+        if key in values and values[key]:
+            if isinstance(values[key], basestring):
+                values[key] = timeutils.parse_strtime(values[key])
+            values[key] = values[key].replace(tzinfo=None)
+
+
 @require_context
 def instance_create(context, values):
     """Create a new Instance record in the database.
@@ -1489,6 +1506,7 @@ def instance_create(context, values):
 
     values['system_metadata'] = _metadata_refs(
             values.get('system_metadata'), models.InstanceSystemMetadata)
+    _handle_objects_related_type_conversions(values)
 
     instance_ref = models.Instance()
     if not values.get('uuid'):
@@ -1526,15 +1544,18 @@ def instance_create(context, values):
     return instance_ref
 
 
-def _instance_data_get_for_project(context, project_id, session=None):
+def _instance_data_get_for_user(context, project_id, user_id, session=None):
     result = model_query(context,
                          func.count(models.Instance.id),
                          func.sum(models.Instance.vcpus),
                          func.sum(models.Instance.memory_mb),
                          base_model=models.Instance,
                          session=session).\
-                     filter_by(project_id=project_id).\
-                     first()
+                     filter_by(project_id=project_id)
+    if user_id:
+        result = result.filter_by(user_id=user_id).first()
+    else:
+        result = result.first()
     # NOTE(vish): convert None to 0
     return (result[0] or 0, result[1] or 0, result[2] or 0)
 
@@ -1574,7 +1595,6 @@ def instance_get_by_uuid(context, uuid, columns_to_join=None):
             columns_to_join=columns_to_join)
 
 
-@require_context
 def _instance_get_by_uuid(context, uuid, session=None, columns_to_join=None):
     result = _build_instance_get(context, session=session,
                                  columns_to_join=columns_to_join).\
@@ -1605,7 +1625,6 @@ def instance_get(context, instance_id, columns_to_join=None):
         raise exception.InvalidID(id=instance_id)
 
 
-@require_context
 def _build_instance_get(context, session=None, columns_to_join=None):
     query = model_query(context, models.Instance, session=session,
                         project_only=True).\
@@ -1688,8 +1707,7 @@ def instance_get_all(context, columns_to_join=None):
 
 @require_context
 def instance_get_all_by_filters(context, filters, sort_key, sort_dir,
-                                limit=None, marker=None, columns_to_join=None,
-                                session=None):
+                                limit=None, marker=None, columns_to_join=None):
     """Return instances that match all filters.  Deleted instances
     will be returned by default, unless there's a filter that says
     otherwise.
@@ -1726,8 +1744,7 @@ def instance_get_all_by_filters(context, filters, sort_key, sort_dir,
 
     sort_fn = {'desc': desc, 'asc': asc}
 
-    if not session:
-        session = get_session()
+    session = get_session()
 
     if columns_to_join is None:
         columns_to_join = ['info_cache', 'security_groups']
@@ -1771,6 +1788,12 @@ def instance_get_all_by_filters(context, filters, sort_key, sort_dir,
             if not filters.pop('soft_deleted', False):
                 query_prefix = query_prefix.\
                     filter(models.Instance.vm_state != vm_states.SOFT_DELETED)
+
+    if 'cleaned' in filters:
+        if filters.pop('cleaned'):
+            query_prefix = query_prefix.filter(models.Instance.cleaned == 1)
+        else:
+            query_prefix = query_prefix.filter(models.Instance.cleaned == 0)
 
     if not context.is_admin:
         # If we're not admin context, add appropriate filter..
@@ -1884,7 +1907,7 @@ def regex_filter(query, model, filters):
         'oracle': 'REGEXP_LIKE',
         'sqlite': 'REGEXP'
     }
-    db_string = CONF.sql_connection.split(':')[0].split('+')[0]
+    db_string = CONF.database.connection.split(':')[0].split('+')[0]
     db_regexp_op = regexp_op_map.get(db_string, 'LIKE')
     for filter_name in filters.iterkeys():
         try:
@@ -1919,7 +1942,6 @@ def instance_get_active_by_window_joined(context, begin, end=None,
     return _instances_fill_metadata(context, query.all())
 
 
-@require_admin_context
 def _instance_get_all_query(context, project_only=False, joins=None):
     if joins is None:
         joins = ['info_cache', 'security_groups']
@@ -1937,7 +1959,6 @@ def instance_get_all_by_host(context, host, columns_to_join=None):
                                 manual_joins=columns_to_join)
 
 
-@require_admin_context
 def _instance_get_all_uuids_by_host(context, host, session=None):
     """Return a list of the instance uuids on a given host.
 
@@ -2134,21 +2155,7 @@ def _instance_update(context, instance_uuid, values, copy_old_instance=False):
                                                values.pop('system_metadata'),
                                                session)
 
-        # NOTE(danms): Make sure IP addresses are passed as strings to
-        # the database engine
-        for key in ('access_ip_v4', 'access_ip_v6'):
-            if key in values and values[key] is not None:
-                values[key] = str(values[key])
-
-        # NOTE(danms): Strip UTC timezones from datetimes, since they're
-        # stored that way in the database
-        for key in ('created_at', 'deleted_at', 'updated_at',
-                    'launched_at', 'terminated_at', 'scheduled_at'):
-            if key in values and values[key]:
-                if isinstance(values[key], basestring):
-                    values[key] = timeutils.parse_strtime(values[key])
-                values[key] = values[key].replace(tzinfo=None)
-
+        _handle_objects_related_type_conversions(values)
         instance_ref.update(values)
         instance_ref.save(session=session)
 
@@ -2340,7 +2347,6 @@ def network_associate(context, project_id, network_id=None, force=False):
     return network_ref
 
 
-@require_admin_context
 def _network_ips_query(context, network_id):
     return model_query(context, models.FixedIp, read_deleted="no").\
                    filter_by(network_id=network_id)
@@ -2377,7 +2383,7 @@ def network_delete_safe(context, network_id):
                          count()
         if result != 0:
             raise exception.NetworkInUse(network_id=network_id)
-        network_ref = network_get(context, network_id=network_id,
+        network_ref = _network_get(context, network_id=network_id,
                                   session=session)
 
         model_query(context, models.FixedIp, session=session,
@@ -2399,8 +2405,7 @@ def network_disassociate(context, network_id, disassociate_host,
     network_update(context, network_id, net_update)
 
 
-@require_context
-def network_get(context, network_id, session=None, project_only='allow_none'):
+def _network_get(context, network_id, session=None, project_only='allow_none'):
     result = model_query(context, models.Network, session=session,
                          project_only=project_only).\
                     filter_by(id=network_id).\
@@ -2410,6 +2415,11 @@ def network_get(context, network_id, session=None, project_only='allow_none'):
         raise exception.NetworkNotFound(network_id=network_id)
 
     return result
+
+
+@require_context
+def network_get(context, network_id, project_only='allow_none'):
+    return _network_get(context, network_id, project_only=project_only)
 
 
 @require_context
@@ -2509,7 +2519,6 @@ def network_in_use_on_host(context, network_id, host):
     return len(fixed_ips) > 0
 
 
-@require_admin_context
 def _network_get_query(context, session=None):
     return model_query(context, models.Network, session=session,
                        read_deleted="no")
@@ -2588,7 +2597,7 @@ def network_set_host(context, network_id, host_id):
 def network_update(context, network_id, values):
     session = get_session()
     with session.begin():
-        network_ref = network_get(context, network_id, session=session)
+        network_ref = _network_get(context, network_id, session=session)
         network_ref.update(values)
         try:
             network_ref.save(session=session)
@@ -2601,14 +2610,39 @@ def network_update(context, network_id, values):
 
 
 @require_context
-def quota_get(context, project_id, resource):
-    result = model_query(context, models.Quota, read_deleted="no").\
-                     filter_by(project_id=project_id).\
-                     filter_by(resource=resource).\
-                     first()
+def quota_get(context, project_id, resource, user_id=None):
+    model = models.ProjectUserQuota if user_id else models.Quota
+    query = model_query(context, model).\
+                    filter_by(project_id=project_id).\
+                    filter_by(resource=resource)
+    if user_id:
+        query = query.filter_by(user_id=user_id)
 
+    result = query.first()
     if not result:
-        raise exception.ProjectQuotaNotFound(project_id=project_id)
+        if user_id:
+            raise exception.ProjectUserQuotaNotFound(project_id=project_id,
+                                                     user_id=user_id)
+        else:
+            raise exception.ProjectQuotaNotFound(project_id=project_id)
+
+    return result
+
+
+@require_context
+def quota_get_all_by_project_and_user(context, project_id, user_id):
+    nova.context.authorize_project_context(context, project_id)
+
+    user_quotas = model_query(context, models.ProjectUserQuota.resource,
+                       models.ProjectUserQuota.hard_limit,
+                       base_model=models.ProjectUserQuota).\
+                   filter_by(project_id=project_id).\
+                   filter_by(user_id=user_id).\
+                   all()
+
+    result = {'project_id': project_id, 'user_id': user_id}
+    for quota in user_quotas:
+        result[quota.resource] = quota.hard_limit
 
     return result
 
@@ -2628,9 +2662,22 @@ def quota_get_all_by_project(context, project_id):
     return result
 
 
+@require_context
+def quota_get_all(context, project_id):
+    nova.context.authorize_project_context(context, project_id)
+
+    result = model_query(context, models.ProjectUserQuota).\
+                   filter_by(project_id=project_id).\
+                   all()
+
+    return result
+
+
 @require_admin_context
-def quota_create(context, project_id, resource, limit):
-    quota_ref = models.Quota()
+def quota_create(context, project_id, resource, limit, user_id=None):
+    quota_ref = models.ProjectUserQuota() if user_id else models.Quota()
+    if user_id:
+        quota_ref.user_id = user_id
     quota_ref.project_id = project_id
     quota_ref.resource = resource
     quota_ref.hard_limit = limit
@@ -2642,14 +2689,21 @@ def quota_create(context, project_id, resource, limit):
 
 
 @require_admin_context
-def quota_update(context, project_id, resource, limit):
-    result = model_query(context, models.Quota, read_deleted="no").\
-                     filter_by(project_id=project_id).\
-                     filter_by(resource=resource).\
-                     update({'hard_limit': limit})
+def quota_update(context, project_id, resource, limit, user_id=None):
+    model = models.ProjectUserQuota if user_id else models.Quota
+    query = model_query(context, model).\
+                filter_by(project_id=project_id).\
+                filter_by(resource=resource)
+    if user_id:
+        query = query.filter_by(user_id=user_id)
 
+    result = query.update({'hard_limit': limit})
     if not result:
-        raise exception.ProjectQuotaNotFound(project_id=project_id)
+        if user_id:
+            raise exception.ProjectUserQuotaNotFound(project_id=project_id,
+                                                     user_id=user_id)
+        else:
+            raise exception.ProjectQuotaNotFound(project_id=project_id)
 
 
 ###################
@@ -2720,11 +2774,14 @@ def quota_class_update(context, class_name, resource, limit):
 
 
 @require_context
-def quota_usage_get(context, project_id, resource):
-    result = model_query(context, models.QuotaUsage, read_deleted="no").\
+def quota_usage_get(context, project_id, resource, user_id=None):
+    query = model_query(context, models.QuotaUsage, read_deleted="no").\
                      filter_by(project_id=project_id).\
-                     filter_by(resource=resource).\
-                     first()
+                     filter_by(resource=resource)
+    if user_id:
+        result = query.filter_by(user_id=user_id).first()
+    else:
+        result = query.first()
 
     if not result:
         raise exception.QuotaUsageNotFound(project_id=project_id)
@@ -2732,30 +2789,48 @@ def quota_usage_get(context, project_id, resource):
     return result
 
 
-@require_context
-def quota_usage_get_all_by_project(context, project_id):
+def _quota_usage_get_all(context, project_id, user_id=None):
     nova.context.authorize_project_context(context, project_id)
-
-    rows = model_query(context, models.QuotaUsage, read_deleted="no").\
-                   filter_by(project_id=project_id).\
-                   all()
-
+    query = model_query(context, models.QuotaUsage, read_deleted="no").\
+                   filter_by(project_id=project_id)
     result = {'project_id': project_id}
+    if user_id:
+        query = query.filter_by(user_id=user_id)
+        result['user_id'] = user_id
+
+    rows = query.all()
     for row in rows:
-        result[row.resource] = dict(in_use=row.in_use, reserved=row.reserved)
+        if row.resource in result:
+            result[row.resource]['in_use'] += row.in_use
+            result[row.resource]['reserved'] += row.reserved
+        else:
+            result[row.resource] = dict(in_use=row.in_use,
+                                        reserved=row.reserved)
 
     return result
 
 
-@require_admin_context
-def _quota_usage_create(context, project_id, resource, in_use, reserved,
-                       until_refresh, session=None):
+@require_context
+def quota_usage_get_all_by_project_and_user(context, project_id, user_id):
+    return _quota_usage_get_all(context, project_id, user_id=user_id)
+
+
+@require_context
+def quota_usage_get_all_by_project(context, project_id):
+    return _quota_usage_get_all(context, project_id)
+
+
+def _quota_usage_create(context, project_id, user_id, resource, in_use,
+                        reserved, until_refresh, session=None):
     quota_usage_ref = models.QuotaUsage()
     quota_usage_ref.project_id = project_id
+    quota_usage_ref.user_id = user_id
     quota_usage_ref.resource = resource
     quota_usage_ref.in_use = in_use
     quota_usage_ref.reserved = reserved
     quota_usage_ref.until_refresh = until_refresh
+    # updated_at is needed for judgement of max_age
+    quota_usage_ref.updated_at = timeutils.utcnow()
 
     quota_usage_ref.save(session=session)
 
@@ -2763,17 +2838,16 @@ def _quota_usage_create(context, project_id, resource, in_use, reserved,
 
 
 @require_admin_context
-def quota_usage_update(context, project_id, resource, **kwargs):
+def quota_usage_update(context, project_id, user_id, resource, **kwargs):
     updates = {}
-    if 'in_use' in kwargs:
-        updates['in_use'] = kwargs['in_use']
-    if 'reserved' in kwargs:
-        updates['reserved'] = kwargs['reserved']
-    if 'until_refresh' in kwargs:
-        updates['until_refresh'] = kwargs['until_refresh']
+
+    for key in ['in_use', 'reserved', 'until_refresh']:
+        if key in kwargs:
+            updates[key] = kwargs[key]
 
     result = model_query(context, models.QuotaUsage, read_deleted="no").\
                      filter_by(project_id=project_id).\
+                     filter_by(user_id=user_id).\
                      filter_by(resource=resource).\
                      update(updates)
 
@@ -2797,19 +2871,19 @@ def reservation_get(context, uuid):
 
 
 @require_admin_context
-def reservation_create(context, uuid, usage, project_id, resource, delta,
-                       expire):
-    return _reservation_create(context, uuid, usage, project_id,
+def reservation_create(context, uuid, usage, project_id, user_id, resource,
+                       delta, expire):
+    return _reservation_create(context, uuid, usage, project_id, user_id,
                                resource, delta, expire)
 
 
-@require_admin_context
-def _reservation_create(context, uuid, usage, project_id, resource, delta,
-                       expire, session=None):
+def _reservation_create(context, uuid, usage, project_id, user_id, resource,
+                        delta, expire, session=None):
     reservation_ref = models.Reservation()
     reservation_ref.uuid = uuid
     reservation_ref.usage_id = usage['id']
     reservation_ref.project_id = project_id
+    reservation_ref.user_id = user_id
     reservation_ref.resource = resource
     reservation_ref.delta = delta
     reservation_ref.expire = expire
@@ -2825,30 +2899,58 @@ def _reservation_create(context, uuid, usage, project_id, resource, delta,
 # code always acquires the lock on quota_usages before acquiring the lock
 # on reservations.
 
-def _get_quota_usages(context, session, project_id):
+def _get_user_quota_usages(context, session, project_id, user_id):
     # Broken out for testability
+    rows = model_query(context, models.QuotaUsage,
+                       read_deleted="no",
+                       session=session).\
+                   filter_by(project_id=project_id).\
+                   filter_by(user_id=user_id).\
+                   with_lockmode('update').\
+                   all()
+    return dict((row.resource, row) for row in rows)
+
+
+def _get_project_quota_usages(context, session, project_id):
     rows = model_query(context, models.QuotaUsage,
                        read_deleted="no",
                        session=session).\
                    filter_by(project_id=project_id).\
                    with_lockmode('update').\
                    all()
-    return dict((row.resource, row) for row in rows)
+    result = dict()
+    # Get the total count of in_use,reserved
+    for row in rows:
+        if row.resource in result:
+            result[row.resource]['in_use'] += row.in_use
+            result[row.resource]['reserved'] += row.reserved
+            result[row.resource]['total'] += (row.in_use + row.reserved)
+        else:
+            result[row.resource] = dict(in_use=row.in_use,
+                                        reserved=row.reserved,
+                                        total=row.in_use + row.reserved)
+    return result
 
 
 @require_context
 @_retry_on_deadlock
-def quota_reserve(context, resources, quotas, deltas, expire,
-                  until_refresh, max_age, project_id=None):
+def quota_reserve(context, resources, project_quotas, user_quotas, deltas,
+                  expire, until_refresh, max_age, project_id=None,
+                  user_id=None):
     elevated = context.elevated()
     session = get_session()
     with session.begin():
 
         if project_id is None:
             project_id = context.project_id
+        if user_id is None:
+            user_id = context.user_id
 
         # Get the current usages
-        usages = _get_quota_usages(context, session, project_id)
+        user_usages = _get_user_quota_usages(context, session,
+                                             project_id, user_id)
+        project_usages = _get_project_quota_usages(context, session,
+                                                   project_id)
 
         # Handle usage refresh
         work = set(deltas.keys())
@@ -2857,23 +2959,24 @@ def quota_reserve(context, resources, quotas, deltas, expire,
 
             # Do we need to refresh the usage?
             refresh = False
-            if resource not in usages:
-                usages[resource] = _quota_usage_create(elevated,
+            if resource not in user_usages:
+                user_usages[resource] = _quota_usage_create(elevated,
                                                       project_id,
+                                                      user_id,
                                                       resource,
                                                       0, 0,
                                                       until_refresh or None,
                                                       session=session)
                 refresh = True
-            elif usages[resource].in_use < 0:
+            elif user_usages[resource].in_use < 0:
                 # Negative in_use count indicates a desync, so try to
                 # heal from that...
                 refresh = True
-            elif usages[resource].until_refresh is not None:
-                usages[resource].until_refresh -= 1
-                if usages[resource].until_refresh <= 0:
+            elif user_usages[resource].until_refresh is not None:
+                user_usages[resource].until_refresh -= 1
+                if user_usages[resource].until_refresh <= 0:
                     refresh = True
-            elif max_age and (usages[resource].updated_at -
+            elif max_age and (user_usages[resource].updated_at -
                               timeutils.utcnow()).seconds >= max_age:
                 refresh = True
 
@@ -2882,20 +2985,21 @@ def quota_reserve(context, resources, quotas, deltas, expire,
                 # Grab the sync routine
                 sync = QUOTA_SYNC_FUNCTIONS[resources[resource].sync]
 
-                updates = sync(elevated, project_id, session)
+                updates = sync(elevated, project_id, user_id, session)
                 for res, in_use in updates.items():
                     # Make sure we have a destination for the usage!
-                    if res not in usages:
-                        usages[res] = _quota_usage_create(elevated,
+                    if res not in user_usages:
+                        user_usages[res] = _quota_usage_create(elevated,
                                                          project_id,
+                                                         user_id,
                                                          res,
                                                          0, 0,
                                                          until_refresh or None,
                                                          session=session)
 
                     # Update the usage
-                    usages[res].in_use = in_use
-                    usages[res].until_refresh = until_refresh or None
+                    user_usages[res].in_use = in_use
+                    user_usages[res].until_refresh = until_refresh or None
 
                     # Because more than one resource may be refreshed
                     # by the call to the sync routine, and we don't
@@ -2912,16 +3016,22 @@ def quota_reserve(context, resources, quotas, deltas, expire,
         # Check for deltas that would go negative
         unders = [res for res, delta in deltas.items()
                   if delta < 0 and
-                  delta + usages[res].in_use < 0]
+                  delta + user_usages[res].in_use < 0]
 
         # Now, let's check the quotas
         # NOTE(Vek): We're only concerned about positive increments.
         #            If a project has gone over quota, we want them to
         #            be able to reduce their usage without any
         #            problems.
+        for key, value in user_usages.items():
+            if key not in project_usages:
+                project_usages[key] = value
         overs = [res for res, delta in deltas.items()
-                 if quotas[res] >= 0 and delta >= 0 and
-                 quotas[res] < delta + usages[res].total]
+                 if user_quotas[res] >= 0 and delta >= 0 and
+                 (project_quotas[res] < delta +
+                  project_usages[res]['total'] or
+                  user_quotas[res] < delta +
+                  user_usages[res].total)]
 
         # NOTE(Vek): The quota check needs to be in the transaction,
         #            but the transaction doesn't fail just because
@@ -2936,8 +3046,9 @@ def quota_reserve(context, resources, quotas, deltas, expire,
             for res, delta in deltas.items():
                 reservation = _reservation_create(elevated,
                                                  str(uuid.uuid4()),
-                                                 usages[res],
+                                                 user_usages[res],
                                                  project_id,
+                                                 user_id,
                                                  res, delta, expire,
                                                  session=session)
                 reservations.append(reservation.uuid)
@@ -2955,19 +3066,23 @@ def quota_reserve(context, resources, quotas, deltas, expire,
                 #            To prevent this, we only update the
                 #            reserved value if the delta is positive.
                 if delta > 0:
-                    usages[res].reserved += delta
+                    user_usages[res].reserved += delta
 
         # Apply updates to the usages table
-        for usage_ref in usages.values():
+        for usage_ref in user_usages.values():
             usage_ref.save(session=session)
 
     if unders:
         LOG.warning(_("Change will make usage less than 0 for the following "
                       "resources: %s"), unders)
     if overs:
+        if project_quotas == user_quotas:
+            usages = project_usages
+        else:
+            usages = user_usages
         usages = dict((k, dict(in_use=v['in_use'], reserved=v['reserved']))
                       for k, v in usages.items())
-        raise exception.OverQuota(overs=sorted(overs), quotas=quotas,
+        raise exception.OverQuota(overs=sorted(overs), quotas=user_quotas,
                                   usages=usages)
 
     return reservations
@@ -2985,10 +3100,10 @@ def _quota_reservations_query(session, context, reservations):
 
 
 @require_context
-def reservation_commit(context, reservations, project_id=None):
+def reservation_commit(context, reservations, project_id=None, user_id=None):
     session = get_session()
     with session.begin():
-        usages = _get_quota_usages(context, session, project_id)
+        usages = _get_user_quota_usages(context, session, project_id, user_id)
         reservation_query = _quota_reservations_query(session, context,
                                                       reservations)
         for reservation in reservation_query.all():
@@ -3000,10 +3115,10 @@ def reservation_commit(context, reservations, project_id=None):
 
 
 @require_context
-def reservation_rollback(context, reservations, project_id=None):
+def reservation_rollback(context, reservations, project_id=None, user_id=None):
     session = get_session()
     with session.begin():
-        usages = _get_quota_usages(context, session, project_id)
+        usages = _get_user_quota_usages(context, session, project_id, user_id)
         reservation_query = _quota_reservations_query(session, context,
                                                       reservations)
         for reservation in reservation_query.all():
@@ -3011,6 +3126,29 @@ def reservation_rollback(context, reservations, project_id=None):
             if reservation.delta >= 0:
                 usage.reserved -= reservation.delta
         reservation_query.soft_delete(synchronize_session=False)
+
+
+@require_admin_context
+def quota_destroy_all_by_project_and_user(context, project_id, user_id):
+    session = get_session()
+    with session.begin():
+        model_query(context, models.ProjectUserQuota, session=session,
+                    read_deleted="no").\
+                filter_by(project_id=project_id).\
+                filter_by(user_id=user_id).\
+                soft_delete(synchronize_session=False)
+
+        model_query(context, models.QuotaUsage,
+                    session=session, read_deleted="no").\
+                filter_by(project_id=project_id).\
+                filter_by(user_id=user_id).\
+                soft_delete(synchronize_session=False)
+
+        model_query(context, models.Reservation,
+                    session=session, read_deleted="no").\
+                filter_by(project_id=project_id).\
+                filter_by(user_id=user_id).\
+                soft_delete(synchronize_session=False)
 
 
 @require_admin_context
@@ -3053,13 +3191,11 @@ def reservation_expire(context):
 ###################
 
 
-@require_context
 def _ec2_volume_get_query(context, session=None):
     return model_query(context, models.VolumeIdMapping,
                        session=session, read_deleted='yes')
 
 
-@require_context
 def _ec2_snapshot_get_query(context, session=None):
     return model_query(context, models.SnapshotIdMapping,
                        session=session, read_deleted='yes')
@@ -3079,8 +3215,8 @@ def ec2_volume_create(context, volume_uuid, id=None):
 
 
 @require_context
-def get_ec2_volume_id_by_uuid(context, volume_id, session=None):
-    result = _ec2_volume_get_query(context, session=session).\
+def get_ec2_volume_id_by_uuid(context, volume_id):
+    result = _ec2_volume_get_query(context).\
                     filter_by(uuid=volume_id).\
                     first()
 
@@ -3091,8 +3227,8 @@ def get_ec2_volume_id_by_uuid(context, volume_id, session=None):
 
 
 @require_context
-def get_volume_uuid_by_ec2_id(context, ec2_id, session=None):
-    result = _ec2_volume_get_query(context, session=session).\
+def get_volume_uuid_by_ec2_id(context, ec2_id):
+    result = _ec2_volume_get_query(context).\
                     filter_by(id=ec2_id).\
                     first()
 
@@ -3116,8 +3252,8 @@ def ec2_snapshot_create(context, snapshot_uuid, id=None):
 
 
 @require_context
-def get_ec2_snapshot_id_by_uuid(context, snapshot_id, session=None):
-    result = _ec2_snapshot_get_query(context, session=session).\
+def get_ec2_snapshot_id_by_uuid(context, snapshot_id):
+    result = _ec2_snapshot_get_query(context).\
                     filter_by(uuid=snapshot_id).\
                     first()
 
@@ -3128,8 +3264,8 @@ def get_ec2_snapshot_id_by_uuid(context, snapshot_id, session=None):
 
 
 @require_context
-def get_snapshot_uuid_by_ec2_id(context, ec2_id, session=None):
-    result = _ec2_snapshot_get_query(context, session=session).\
+def get_snapshot_uuid_by_ec2_id(context, ec2_id):
+    result = _ec2_snapshot_get_query(context).\
                     filter_by(id=ec2_id).\
                     first()
 
@@ -3469,11 +3605,13 @@ def security_group_destroy(context, security_group_id):
                 soft_delete()
 
 
-def _security_group_count_by_project(context, project_id, session=None):
+def _security_group_count_by_project_and_user(context, project_id, user_id,
+                                             session=None):
     nova.context.authorize_project_context(context, project_id)
     return model_query(context, models.SecurityGroup, read_deleted="no",
                        session=session).\
                    filter_by(project_id=project_id).\
+                   filter_by(user_id=user_id).\
                    count()
 
 
@@ -3511,6 +3649,8 @@ def security_group_rule_get_by_security_group(context, security_group_id):
             filter_by(parent_group_id=security_group_id).
             options(joinedload_all('grantee_group.instances.'
                                    'system_metadata')).
+            options(joinedload('grantee_group.instances.'
+                               'info_cache')).
             all())
 
 
@@ -3555,9 +3695,8 @@ def _security_group_rule_get_default_query(context, session=None):
 
 
 @require_context
-def security_group_default_rule_get(context, security_group_rule_default_id,
-                                    session=None):
-    result = _security_group_rule_get_default_query(context, session=session).\
+def security_group_default_rule_get(context, security_group_rule_default_id):
+    result = _security_group_rule_get_default_query(context).\
                         filter_by(id=security_group_rule_default_id).\
                         first()
 
@@ -3591,8 +3730,8 @@ def security_group_default_rule_create(context, values):
 
 
 @require_context
-def security_group_default_rule_list(context, session=None):
-    return _security_group_rule_get_default_query(context, session=session).\
+def security_group_default_rule_list(context):
+    return _security_group_rule_get_default_query(context).\
                                     all()
 
 
@@ -3657,14 +3796,13 @@ def migration_create(context, values):
 def migration_update(context, id, values):
     session = get_session()
     with session.begin():
-        migration = migration_get(context, id, session=session)
+        migration = _migration_get(context, id, session=session)
         migration.update(values)
         migration.save(session=session)
         return migration
 
 
-@require_admin_context
-def migration_get(context, id, session=None):
+def _migration_get(context, id, session=None):
     result = model_query(context, models.Migration, session=session,
                          read_deleted="yes").\
                      filter_by(id=id).\
@@ -3674,6 +3812,11 @@ def migration_get(context, id, session=None):
         raise exception.MigrationNotFound(migration_id=id)
 
     return result
+
+
+@require_admin_context
+def migration_get(context, id):
+    return _migration_get(context, id)
 
 
 @require_admin_context
@@ -3692,12 +3835,11 @@ def migration_get_by_instance_and_status(context, instance_uuid, status):
 
 @require_admin_context
 def migration_get_unconfirmed_by_dest_compute(context, confirm_window,
-        dest_compute, session=None):
+                                              dest_compute):
     confirm_window = (timeutils.utcnow() -
                       datetime.timedelta(seconds=confirm_window))
 
-    return model_query(context, models.Migration, session=session,
-                       read_deleted="yes").\
+    return model_query(context, models.Migration, read_deleted="yes").\
             filter(models.Migration.updated_at <= confirm_window).\
             filter_by(status="finished").\
             filter_by(dest_compute=dest_compute).\
@@ -3705,10 +3847,9 @@ def migration_get_unconfirmed_by_dest_compute(context, confirm_window,
 
 
 @require_admin_context
-def migration_get_in_progress_by_host_and_node(context, host, node,
-                                               session=None):
+def migration_get_in_progress_by_host_and_node(context, host, node):
 
-    return model_query(context, models.Migration, session=session).\
+    return model_query(context, models.Migration).\
             filter(or_(and_(models.Migration.source_compute == host,
                             models.Migration.source_node == node),
                        and_(models.Migration.dest_compute == host,
@@ -3941,14 +4082,12 @@ def flavor_get_all(context, inactive=False, filters=None):
     return [_dict_with_extra_specs(i) for i in inst_types]
 
 
-@require_context
 def _instance_type_get_id_from_flavor_query(context, flavor_id, session=None):
     return model_query(context, models.InstanceTypes.id, read_deleted="no",
                        session=session, base_model=models.InstanceTypes).\
                 filter_by(flavorid=flavor_id)
 
 
-@require_context
 def _instance_type_get_id_from_flavor(context, flavor_id, session=None):
     result = _instance_type_get_id_from_flavor_query(context, flavor_id,
                                                      session=session).\
@@ -4015,7 +4154,6 @@ def flavor_destroy(context, name):
                 soft_delete()
 
 
-@require_context
 def _instance_type_access_query(context, session=None):
     return model_query(context, models.InstanceTypeProjects, session=session,
                        read_deleted="no")
@@ -4186,6 +4324,8 @@ def cell_get_all(context):
 # User-provided metadata
 
 def _instance_metadata_get_multi(context, instance_uuids, session=None):
+    if not instance_uuids:
+        return []
     return model_query(context, models.InstanceMetadata,
                        session=session).\
                     filter(
@@ -4199,15 +4339,9 @@ def _instance_metadata_get_query(context, instance_uuid, session=None):
 
 
 @require_context
-def instance_metadata_get(context, instance_uuid, session=None):
-    rows = _instance_metadata_get_query(context, instance_uuid,
-                                        session=session).all()
-
-    result = {}
-    for row in rows:
-        result[row['key']] = row['value']
-
-    return result
+def instance_metadata_get(context, instance_uuid):
+    rows = _instance_metadata_get_query(context, instance_uuid).all()
+    return dict((row['key'], row['value']) for row in rows)
 
 
 @require_context
@@ -4218,19 +4352,15 @@ def instance_metadata_delete(context, instance_uuid, key):
 
 
 @require_context
-def instance_metadata_update(context, instance_uuid, metadata, delete,
-                             session=None):
+def instance_metadata_update(context, instance_uuid, metadata, delete):
     all_keys = metadata.keys()
-    synchronize_session = "fetch"
-    if session is None:
-        session = get_session()
-        synchronize_session = False
+    session = get_session()
     with session.begin(subtransactions=True):
         if delete:
             _instance_metadata_get_query(context, instance_uuid,
                                          session=session).\
                 filter(~models.InstanceMetadata.key.in_(all_keys)).\
-                soft_delete(synchronize_session=synchronize_session)
+                soft_delete(synchronize_session=False)
 
         already_existing_keys = []
         meta_refs = _instance_metadata_get_query(context, instance_uuid,
@@ -4257,6 +4387,8 @@ def instance_metadata_update(context, instance_uuid, metadata, delete,
 
 
 def _instance_system_metadata_get_multi(context, instance_uuids, session=None):
+    if not instance_uuids:
+        return []
     return model_query(context, models.InstanceSystemMetadata,
                        session=session).\
                     filter(
@@ -4270,31 +4402,21 @@ def _instance_system_metadata_get_query(context, instance_uuid, session=None):
 
 
 @require_context
-def instance_system_metadata_get(context, instance_uuid, session=None):
-    rows = _instance_system_metadata_get_query(context, instance_uuid,
-                                               session=session).all()
-
-    result = {}
-    for row in rows:
-        result[row['key']] = row['value']
-
-    return result
+def instance_system_metadata_get(context, instance_uuid):
+    rows = _instance_system_metadata_get_query(context, instance_uuid).all()
+    return dict((row['key'], row['value']) for row in rows)
 
 
 @require_context
-def instance_system_metadata_update(context, instance_uuid, metadata, delete,
-                                    session=None):
+def instance_system_metadata_update(context, instance_uuid, metadata, delete):
     all_keys = metadata.keys()
-    synchronize_session = "fetch"
-    if session is None:
-        session = get_session()
-        synchronize_session = False
+    session = get_session()
     with session.begin(subtransactions=True):
         if delete:
             _instance_system_metadata_get_query(context, instance_uuid,
                                                 session=session).\
                 filter(~models.InstanceSystemMetadata.key.in_(all_keys)).\
-                soft_delete(synchronize_session=synchronize_session)
+                soft_delete(synchronize_session=False)
 
         already_existing_keys = []
         meta_refs = _instance_system_metadata_get_query(context, instance_uuid,
@@ -4332,10 +4454,8 @@ def agent_build_create(context, values):
 
 
 @require_admin_context
-def agent_build_get_by_triple(context, hypervisor, os, architecture,
-                              session=None):
-    return model_query(context, models.AgentBuild, session=session,
-                       read_deleted="no").\
+def agent_build_get_by_triple(context, hypervisor, os, architecture):
+    return model_query(context, models.AgentBuild, read_deleted="no").\
                    filter_by(hypervisor=hypervisor).\
                    filter_by(os=os).\
                    filter_by(architecture=architecture).\
@@ -4392,10 +4512,9 @@ def bw_usage_get_by_uuids(context, uuids, start_period):
 @require_context
 @_retry_on_deadlock
 def bw_usage_update(context, uuid, mac, start_period, bw_in, bw_out,
-                    last_ctr_in, last_ctr_out, last_refreshed=None,
-                    session=None):
-    if not session:
-        session = get_session()
+                    last_ctr_in, last_ctr_out, last_refreshed=None):
+
+    session = get_session()
 
     if last_refreshed is None:
         last_refreshed = timeutils.utcnow()
@@ -4692,6 +4811,22 @@ def aggregate_metadata_get_by_host(context, host, key=None):
 
 
 @require_admin_context
+def aggregate_metadata_get_by_metadata_key(context, aggregate_id, key):
+    query = model_query(context, models.Aggregate)
+    query = query.join("_metadata")
+    query = query.filter(models.Aggregate.id == aggregate_id)
+    query = query.options(contains_eager("_metadata"))
+    query = query.filter(models.AggregateMetadata.key == key)
+    rows = query.all()
+
+    metadata = collections.defaultdict(set)
+    for agg in rows:
+        for kv in agg._metadata:
+            metadata[kv['key']].add(kv['value'])
+    return dict(metadata)
+
+
+@require_admin_context
 def aggregate_host_get_by_metadata_key(context, key):
     query = model_query(context, models.Aggregate)
     query = query.join("_metadata")
@@ -4765,9 +4900,8 @@ def aggregate_get_all(context):
     return _aggregate_get_query(context, models.Aggregate).all()
 
 
-@require_admin_context
-def aggregate_metadata_get_query(context, aggregate_id, session=None,
-                                 read_deleted="yes"):
+def _aggregate_metadata_get_query(context, aggregate_id, session=None,
+                                  read_deleted="yes"):
     return model_query(context,
                        models.AggregateMetadata,
                        read_deleted=read_deleted,
@@ -4809,9 +4943,9 @@ def aggregate_metadata_add(context, aggregate_id, metadata, set_delete=False):
     session = get_session()
     all_keys = metadata.keys()
     with session.begin():
-        query = aggregate_metadata_get_query(context, aggregate_id,
-                                             read_deleted='no',
-                                             session=session)
+        query = _aggregate_metadata_get_query(context, aggregate_id,
+                                              read_deleted='no',
+                                              session=session)
         if set_delete:
             query.filter(~models.AggregateMetadata.key.in_(all_keys)).\
                 soft_delete(synchronize_session=False)
@@ -4885,6 +5019,9 @@ def instance_fault_create(context, values):
 
 def instance_fault_get_by_instance_uuids(context, instance_uuids):
     """Get all instance faults for the provided instance_uuids."""
+    if not instance_uuids:
+        return {}
+
     rows = model_query(context, models.InstanceFault, read_deleted='no').\
                        filter(models.InstanceFault.instance_uuid.in_(
                            instance_uuids)).\
@@ -5042,9 +5179,8 @@ def ec2_instance_create(context, instance_uuid, id=None):
 
 
 @require_context
-def get_ec2_instance_id_by_uuid(context, instance_id, session=None):
-    result = _ec2_instance_get_query(context,
-                                     session=session).\
+def get_ec2_instance_id_by_uuid(context, instance_id):
+    result = _ec2_instance_get_query(context).\
                     filter_by(uuid=instance_id).\
                     first()
 
@@ -5055,9 +5191,8 @@ def get_ec2_instance_id_by_uuid(context, instance_id, session=None):
 
 
 @require_context
-def get_instance_uuid_by_ec2_id(context, ec2_id, session=None):
-    result = _ec2_instance_get_query(context,
-                                     session=session).\
+def get_instance_uuid_by_ec2_id(context, ec2_id):
+    result = _ec2_instance_get_query(context).\
                     filter_by(id=ec2_id).\
                     first()
 
@@ -5067,7 +5202,6 @@ def get_instance_uuid_by_ec2_id(context, ec2_id, session=None):
     return result['uuid']
 
 
-@require_context
 def _ec2_instance_get_query(context, session=None):
     return model_query(context,
                        models.InstanceIdMapping,
@@ -5075,7 +5209,6 @@ def _ec2_instance_get_query(context, session=None):
                        read_deleted='yes')
 
 
-@require_admin_context
 def _task_log_get_query(context, task_name, period_beginning,
                         period_ending, host=None, state=None, session=None):
     query = model_query(context, models.TaskLog, session=session).\

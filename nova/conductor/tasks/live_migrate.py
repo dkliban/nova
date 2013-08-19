@@ -20,6 +20,7 @@ from nova.compute import rpcapi as compute_rpcapi
 from nova import db
 from nova import exception
 from nova.image import glance
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova import servicegroup
 
@@ -133,8 +134,10 @@ class LiveMigrationTask(object):
     def _find_destination(self):
         #TODO(johngarbutt) this retry loop should be shared
         ignore_hosts = [self.source]
-        image = self.image_service.show(self.context,
-                                        self.instance['image_ref'])
+        image = None
+        if self.instance['image_ref']:
+            image = self.image_service.show(self.context,
+                                            self.instance['image_ref'])
         instance_type = flavors.extract_flavor(self.instance)
 
         host = None
@@ -156,8 +159,9 @@ class LiveMigrationTask(object):
     def _get_candidate_destination(self, image, instance_type, ignore_hosts):
         request_spec = {'instance_properties': self.instance,
                         'instance_type': instance_type,
-                        'instance_uuids': [self.instance['uuid']],
-                        'image': image}
+                        'instance_uuids': [self.instance['uuid']]}
+        if image:
+            request_spec['image'] = image
         filter_properties = {'ignore_hosts': ignore_hosts}
         #TODO(johngarbutt) this should be an rpc call to scheduler
         return self.select_hosts_callback(self.context, request_spec,

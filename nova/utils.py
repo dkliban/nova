@@ -43,6 +43,7 @@ from oslo.config import cfg
 
 from nova import exception
 from nova.openstack.common import excutils
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import importutils
 from nova.openstack.common import lockutils
 from nova.openstack.common import log as logging
@@ -76,7 +77,6 @@ utils_opts = [
                help='Path to the rootwrap configuration file to use for '
                     'running commands as root'),
     cfg.StrOpt('tempdir',
-               default=None,
                help='Explicitly specify the temporary working directory'),
 ]
 CONF = cfg.CONF

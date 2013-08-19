@@ -24,7 +24,6 @@ import nova.openstack.common.rpc.proxy
 CONF = cfg.CONF
 
 rpcapi_cap_opt = cfg.StrOpt('conductor',
-        default=None,
         help='Set a version cap for messages sent to conductor services')
 CONF.register_opt(rpcapi_cap_opt, 'upgrade_levels')
 
@@ -460,32 +459,24 @@ class ConductorAPI(nova.openstack.common.rpc.proxy.RpcProxy):
                             instance=instance_p, migration=migration_p)
         return self.call(context, msg, version='1.41')
 
-    def quota_commit(self, context, reservations, project_id=None):
+    def quota_commit(self, context, reservations, project_id=None,
+                     user_id=None):
         reservations_p = jsonutils.to_primitive(reservations)
         msg = self.make_msg('quota_commit', reservations=reservations_p,
-                            project_id=project_id)
+                            project_id=project_id, user_id=user_id)
         return self.call(context, msg, version='1.45')
 
-    def quota_rollback(self, context, reservations, project_id=None):
+    def quota_rollback(self, context, reservations, project_id=None,
+                       user_id=None):
         reservations_p = jsonutils.to_primitive(reservations)
         msg = self.make_msg('quota_rollback', reservations=reservations_p,
-                            project_id=project_id)
+                            project_id=project_id, user_id=user_id)
         return self.call(context, msg, version='1.45')
 
     def get_ec2_ids(self, context, instance):
         instance_p = jsonutils.to_primitive(instance)
         msg = self.make_msg('get_ec2_ids', instance=instance_p)
         return self.call(context, msg, version='1.42')
-
-    def compute_stop(self, context, instance, do_cast=True):
-        if not self.can_send_version('1.55'):
-            instance = jsonutils.to_primitive(
-                objects_base.obj_to_primitive(instance))
-            version = '1.43'
-        else:
-            version = '1.55'
-        msg = self.make_msg('compute_stop', instance=instance, do_cast=do_cast)
-        return self.call(context, msg, version=version)
 
     def compute_confirm_resize(self, context, instance, migration_ref):
         migration_p = jsonutils.to_primitive(migration_ref)
@@ -516,12 +507,6 @@ class ConductorAPI(nova.openstack.common.rpc.proxy.RpcProxy):
                             objmethod=objmethod, args=args, kwargs=kwargs)
         return self.call(context, msg, version='1.50')
 
-    def compute_reboot(self, context, instance, reboot_type):
-        instance_p = jsonutils.to_primitive(instance)
-        msg = self.make_msg('compute_reboot', instance=instance_p,
-                            reboot_type=reboot_type)
-        return self.call(context, msg, version='1.53')
-
 
 class ComputeTaskAPI(nova.openstack.common.rpc.proxy.RpcProxy):
     """Client side of the conductor 'compute' namespaced RPC API
@@ -532,6 +517,7 @@ class ComputeTaskAPI(nova.openstack.common.rpc.proxy.RpcProxy):
     1.1 - Added unified migrate_server call.
     1.2 - Added build_instances
     1.3 - Added unshelve_instance
+    1.4 - Added reservations to migrate_server.
     """
 
     BASE_RPC_API_VERSION = '1.0'
@@ -544,14 +530,15 @@ class ComputeTaskAPI(nova.openstack.common.rpc.proxy.RpcProxy):
                 serializer=objects_base.NovaObjectSerializer())
 
     def migrate_server(self, context, instance, scheduler_hint, live, rebuild,
-                  flavor, block_migration, disk_over_commit):
+                  flavor, block_migration, disk_over_commit,
+                  reservations=None):
         instance_p = jsonutils.to_primitive(instance)
         flavor_p = jsonutils.to_primitive(flavor)
         msg = self.make_msg('migrate_server', instance=instance_p,
             scheduler_hint=scheduler_hint, live=live, rebuild=rebuild,
             flavor=flavor_p, block_migration=block_migration,
-            disk_over_commit=disk_over_commit)
-        return self.call(context, msg, version='1.1')
+            disk_over_commit=disk_over_commit, reservations=reservations)
+        return self.call(context, msg, version='1.4')
 
     def build_instances(self, context, instances, image, filter_properties,
             admin_password, injected_files, requested_networks,

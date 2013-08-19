@@ -31,6 +31,7 @@ from nova.network import neutronv2
 from nova.network.neutronv2 import constants
 from nova.network.security_group import openstack_driver
 from nova.openstack.common import excutils
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
 from nova.openstack.common import uuidutils
@@ -81,6 +82,9 @@ neutron_opts = [
                 deprecated_name='quantum_extension_sync_interval',
                 help='Number of seconds before querying neutron for'
                      ' extensions'),
+    cfg.StrOpt('neutron_ca_certificates_file',
+                help='Location of ca certicates file to use for neutronclient'
+                     ' requests.'),
     ]
 
 CONF = cfg.CONF
@@ -227,7 +231,6 @@ class API(base.Base):
             if not name_match and not uuid_match:
                 raise exception.SecurityGroupNotFound(
                     security_group_id=security_group)
-                security_group_ids.append(name_match)
             elif name_match:
                 security_group_ids.append(name_match)
             elif uuid_match:
@@ -496,9 +499,13 @@ class API(base.Base):
 
         for (net_id, _i, port_id) in requested_networks:
             if port_id:
-                port = (neutronv2.get_client(context)
-                                 .show_port(port_id)
-                                 .get('port'))
+                try:
+                    port = (neutronv2.get_client(context)
+                                     .show_port(port_id)
+                                     .get('port'))
+                except neutronv2.exceptions.NeutronClientException as e:
+                    if e.status_code == 404:
+                        port = None
                 if not port:
                     raise exception.PortNotFound(port_id=port_id)
                 if port.get('device_id', None):

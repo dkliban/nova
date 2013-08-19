@@ -31,6 +31,7 @@ from nova.conductor import api as conductor_api
 from nova import db
 from nova import exception
 from nova import notifications
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
 from nova.openstack.common.notifier import api as notifier
@@ -142,13 +143,6 @@ class Scheduler(object):
         return [member['host']
                 for member in members
                 if member.get('host') is not None]
-
-    def schedule_prep_resize(self, context, image, request_spec,
-                             filter_properties, instance, instance_type,
-                             reservations):
-        """Must override schedule_prep_resize method for scheduler to work."""
-        msg = _("Driver must implement schedule_prep_resize")
-        raise NotImplementedError(msg)
 
     def schedule_run_instance(self, context, request_spec,
                               admin_password, injected_files,

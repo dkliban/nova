@@ -20,6 +20,8 @@
 Handle lease database updates from DHCP servers.
 """
 
+from __future__ import print_function
+
 import os
 import sys
 
@@ -29,6 +31,7 @@ from nova import config
 from nova import context
 from nova import db
 from nova.network import rpcapi as network_rpcapi
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import importutils
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
@@ -126,6 +129,6 @@ def main():
             LOG.error(_("Environment variable 'NETWORK_ID' must be set."))
             return(1)
 
-        print init_leases(network_id)
+        print(init_leases(network_id))
 
     rpc.cleanup()

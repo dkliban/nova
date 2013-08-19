@@ -57,12 +57,13 @@ QUOTAS = quota.QUOTAS
 class SchedulerManager(manager.Manager):
     """Chooses a host to run instances on."""
 
-    RPC_API_VERSION = '2.7'
+    RPC_API_VERSION = '2.8'
 
     def __init__(self, scheduler_driver=None, *args, **kwargs):
         if not scheduler_driver:
             scheduler_driver = CONF.scheduler_driver
         self.driver = importutils.import_object(scheduler_driver)
+        self.compute_rpcapi = compute_rpcapi.ComputeAPI()
         super(SchedulerManager, self).__init__(service_name='scheduler',
                                                *args, **kwargs)
 
@@ -162,6 +163,8 @@ class SchedulerManager(manager.Manager):
                                                   'task_state': None},
                                                   context, ex, request_spec)
 
+    # NOTE(timello): This method is deprecated and its functionality has
+    # been moved to conductor. This should be removed in RPC_API_VERSION 3.0.
     def prep_resize(self, context, image, request_spec, filter_properties,
                     instance, instance_type, reservations):
         """Tries to call schedule_prep_resize on the driver.
@@ -172,19 +175,27 @@ class SchedulerManager(manager.Manager):
         with compute_utils.EventReporter(context, conductor_api.LocalAPI(),
                                          'schedule', instance_uuid):
             try:
-                kwargs = {
-                    'context': context,
-                    'image': image,
-                    'request_spec': request_spec,
-                    'filter_properties': filter_properties,
-                    'instance': instance,
-                    'instance_type': instance_type,
-                    'reservations': reservations,
-                }
-                return self.driver.schedule_prep_resize(**kwargs)
+                request_spec['num_instances'] = len(
+                        request_spec['instance_uuids'])
+                hosts = self.driver.select_destinations(
+                        context, request_spec, filter_properties)
+                host_state = hosts[0]
+
+                scheduler_utils.populate_filter_properties(filter_properties,
+                                                           host_state)
+                # context is not serializable
+                filter_properties.pop('context', None)
+
+                (host, node) = (host_state['host'], host_state['nodename'])
+                self.compute_rpcapi.prep_resize(
+                    context, image, instance, instance_type, host,
+                    reservations, request_spec=request_spec,
+                    filter_properties=filter_properties, node=node)
+
             except exception.NoValidHost as ex:
+                vm_state = instance.get('vm_state', vm_states.ACTIVE)
                 self._set_vm_state_and_notify('prep_resize',
-                                             {'vm_state': vm_states.ACTIVE,
+                                             {'vm_state': vm_state,
                                               'task_state': None},
                                              context, ex, request_spec)
                 if reservations:

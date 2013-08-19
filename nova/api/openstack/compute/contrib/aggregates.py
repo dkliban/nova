@@ -20,6 +20,7 @@ from webob import exc
 from nova.api.openstack import extensions
 from nova.compute import api as compute_api
 from nova import exception
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 
 LOG = logging.getLogger(__name__)
@@ -158,10 +159,10 @@ class AggregateController(object):
                      {'host': host, 'id': id})
             raise exc.HTTPNotFound()
         except (exception.AggregateHostExists,
-                exception.InvalidAggregateAction):
+                exception.InvalidAggregateAction) as e:
             LOG.info(_('Cannot add host %(host)s in aggregate %(id)s'),
                      {'host': host, 'id': id})
-            raise exc.HTTPConflict()
+            raise exc.HTTPConflict(explanation=e.format_message())
         return self._marshall_aggregate(aggregate)
 
     @get_host_from_body

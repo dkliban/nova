@@ -38,12 +38,14 @@ A connection to the VMware ESX platform.
 :use_linked_clone:          Whether to use linked clone (default: True)
 """
 
+import re
 import time
 
 from eventlet import event
 from oslo.config import cfg
 
 from nova import exception
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
 from nova.openstack.common import loopingcall
@@ -61,21 +63,18 @@ LOG = logging.getLogger(__name__)
 
 vmwareapi_opts = [
     cfg.StrOpt('host_ip',
-               default=None,
                deprecated_name='vmwareapi_host_ip',
                deprecated_group='DEFAULT',
                help='URL for connection to VMware ESX/VC host. Required if '
                     'compute_driver is vmwareapi.VMwareESXDriver or '
                     'vmwareapi.VMwareVCDriver.'),
     cfg.StrOpt('host_username',
-               default=None,
                deprecated_name='vmwareapi_host_username',
                deprecated_group='DEFAULT',
                help='Username for connection to VMware ESX/VC host. '
                     'Used only if compute_driver is '
                     'vmwareapi.VMwareESXDriver or vmwareapi.VMwareVCDriver.'),
     cfg.StrOpt('host_password',
-               default=None,
                deprecated_name='vmwareapi_host_password',
                deprecated_group='DEFAULT',
                help='Password for connection to VMware ESX/VC host. '
@@ -83,10 +82,14 @@ vmwareapi_opts = [
                     'vmwareapi.VMwareESXDriver or vmwareapi.VMwareVCDriver.',
                secret=True),
     cfg.StrOpt('cluster_name',
-               default=None,
                deprecated_name='vmwareapi_cluster_name',
                deprecated_group='DEFAULT',
                help='Name of a VMware Cluster ComputeResource. '
+                    'Used only if compute_driver is '
+                    'vmwareapi.VMwareVCDriver.'),
+    cfg.StrOpt('datastore_regex',
+               default=None,
+               help='Regex to match the name of a datastore. '
                     'Used only if compute_driver is '
                     'vmwareapi.VMwareVCDriver.'),
     cfg.FloatOpt('task_poll_interval',
@@ -116,7 +119,6 @@ vmwareapi_opts = [
                deprecated_group='DEFAULT',
                help='Total number of VNC ports'),
     cfg.StrOpt('vnc_password',
-               default=None,
                deprecated_name='vnc_password',
                deprecated_group='DEFAULT',
                help='VNC password',
@@ -318,10 +320,10 @@ class VMwareESXDriver(driver.ComputeDriver):
                 'password': CONF.vmware.host_password}
 
     def get_available_resource(self, nodename):
-        """Retrieve resource info.
+        """Retrieve resource information.
 
         This method is called when nova-compute launches, and
-        as part of a periodic task.
+        as part of a periodic task that records the results in the DB.
 
         :returns: dictionary describing resources
 
@@ -339,7 +341,10 @@ class VMwareESXDriver(driver.ComputeDriver):
                'hypervisor_type': host_stats['hypervisor_type'],
                'hypervisor_version': host_stats['hypervisor_version'],
                'hypervisor_hostname': host_stats['hypervisor_hostname'],
-               'cpu_info': jsonutils.dumps(host_stats['cpu_info'])}
+               'cpu_info': jsonutils.dumps(host_stats['cpu_info']),
+               'supported_instances': jsonutils.dumps(
+                   host_stats['supported_instances']),
+               }
 
         return dic
 
@@ -405,10 +410,19 @@ class VMwareVCDriver(VMwareESXDriver):
             if self._cluster is None:
                 raise exception.NotFound(_("VMware Cluster %s is not found")
                                            % self._cluster_name)
+        self._datastore_regex = None
+        if CONF.vmware.datastore_regex:
+            try:
+                self._datastore_regex = re.compile(CONF.vmware.datastore_regex)
+            except re.error:
+                raise exception.InvalidInput(reason=
+                _("Invalid Regular Expression %s")
+                % CONF.vmware.datastore_regex)
         self._volumeops = volumeops.VMwareVolumeOps(self._session,
                                                     self._cluster)
         self._vmops = vmops.VMwareVMOps(self._session, self.virtapi,
-                                        self._volumeops, self._cluster)
+                                        self._volumeops, self._cluster,
+                                        self._datastore_regex)
         self._vc_state = None
 
     @property

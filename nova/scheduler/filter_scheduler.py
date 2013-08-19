@@ -27,6 +27,7 @@ from nova.compute import flavors
 from nova.compute import rpcapi as compute_rpcapi
 from nova import db
 from nova import exception
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova.openstack.common.notifier import api as notifier
 from nova.scheduler import driver
@@ -126,33 +127,6 @@ class FilterScheduler(driver.Scheduler):
 
         notifier.notify(context, notifier.publisher_id("scheduler"),
                         'scheduler.run_instance.end', notifier.INFO, payload)
-
-    def schedule_prep_resize(self, context, image, request_spec,
-                             filter_properties, instance, instance_type,
-                             reservations):
-        """Select a target for resize.
-
-        Selects a target host for the instance, post-resize, and casts
-        the prep_resize operation to it.
-        """
-
-        weighed_hosts = self._schedule(context, request_spec,
-                filter_properties, [instance['uuid']])
-        if not weighed_hosts:
-            raise exception.NoValidHost(reason="")
-        weighed_host = weighed_hosts.pop(0)
-
-        scheduler_utils.populate_filter_properties(filter_properties,
-                weighed_host.obj)
-
-        # context is not serializable
-        filter_properties.pop('context', None)
-
-        # Forward off to the host
-        self.compute_rpcapi.prep_resize(context, image, instance,
-                instance_type, weighed_host.obj.host, reservations,
-                request_spec=request_spec, filter_properties=filter_properties,
-                node=weighed_host.obj.nodename)
 
     def select_hosts(self, context, request_spec, filter_properties):
         """Selects a filtered set of hosts."""

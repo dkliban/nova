@@ -121,7 +121,7 @@ class BareMetalDriverWithDBTestCase(bm_db_base.BMDBTestCase):
                                 None, result['instance']),
                 injected_files=[('/fake/path', 'hello world')],
                 instance=result['instance'],
-                network_info=utils.get_test_network_info(),
+                network_info=utils.get_test_network_info(legacy_model=False),
             )
         result['destroy_params'] = dict(
                 instance=result['instance'],
@@ -270,6 +270,8 @@ class BareMetalDriverWithDBTestCase(bm_db_base.BMDBTestCase):
         self.assertEqual(resources['memory_mb'],
                          node['node_info']['memory_mb'])
         self.assertEqual(resources['memory_mb_used'], 0)
+        self.assertEqual(resources['supported_instances'],
+                '[["test", "baremetal", "baremetal"]]')
 
         self.driver.spawn(**node['spawn_params'])
         resources = self.driver.get_available_resource(node['node']['uuid'])

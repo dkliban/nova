@@ -755,6 +755,24 @@ class PowerVMDriverTestCase(test.TestCase):
         self.assertEquals(host_stats['supported_instances'][0][1], "powervm")
         self.assertEquals(host_stats['supported_instances'][0][2], "hvm")
 
+    def test_get_available_resource(self):
+        res = self.powervm_connection.get_available_resource(nodename='fake')
+        self.assertIsNotNone(res)
+        self.assertEquals(8.0, res.pop('vcpus'))
+        self.assertEquals(65536, res.pop('memory_mb'))
+        self.assertEquals((10168 / 1024), res.pop('local_gb'))
+        self.assertEquals(1.7, round(res.pop('vcpus_used'), 1))
+        self.assertEquals((65536 - 46336), res.pop('memory_mb_used'))
+        self.assertEquals(0, res.pop('local_gb_used'))
+        self.assertEquals('powervm', res.pop('hypervisor_type'))
+        self.assertEquals('7.1', res.pop('hypervisor_version'))
+        self.assertEquals('fake-powervm', res.pop('hypervisor_hostname'))
+        self.assertEquals('ppc64,powervm,3940', res.pop('cpu_info'))
+        self.assertEquals(10168, res.pop('disk_available_least'))
+        self.assertEquals('[["ppc64", "powervm", "hvm"]]',
+                res.pop('supported_instances'))
+        self.assertEquals(0, len(res), 'Did not test all keys.')
+
     def test_get_host_uptime(self):
         # Tests that the get_host_uptime method issues the proper sysstat
         # command and parses the output correctly.
@@ -772,6 +790,78 @@ class PowerVMDriverTestCase(test.TestCase):
         uptime = self.powervm_connection.get_host_uptime(None)
         self.assertEquals(output[0], uptime)
 
+    def test_add_to_aggregate(self):
+        # Simple test to make sure the unimplemented method passes.
+        self.powervm_connection.add_to_aggregate(context.get_admin_context(),
+                                                 aggregate={'name': 'foo'},
+                                                 host='fake')
+
+    def test_remove_from_aggregate(self):
+        # Simple test to make sure the unimplemented method passes.
+        self.powervm_connection.remove_from_aggregate(
+                    context.get_admin_context(), aggregate={'name': 'foo'},
+                    host='fake')
+
+    def test_undo_aggregate_operation(self):
+        # Simple test to make sure the unimplemented method passes.
+        def fake_operation(*args, **kwargs):
+            pass
+
+        self.powervm_connection.undo_aggregate_operation(
+                    context.get_admin_context(), op=fake_operation,
+                    aggregate={'name': 'foo'}, host='fake')
+
+    def test_plug_vifs(self):
+        # Check to make sure the method raises NotImplementedError.
+        self.assertRaises(NotImplementedError,
+                          self.powervm_connection.plug_vifs,
+                          instance=None, network_info=None)
+
+    def test_reboot(self):
+        # Check to make sure the method raises NotImplementedError.
+        self.assertRaises(NotImplementedError, self.powervm_connection.reboot,
+                          context=None, instance=None, network_info=None,
+                          reboot_type='SOFT')
+
+    def test_manage_image_cache(self):
+        # Check to make sure the method passes (does nothing) since
+        # it's not implemented in the powervm driver and it passes
+        # in the driver base class.
+        self.powervm_connection.manage_image_cache(context.get_admin_context(),
+                                                   True)
+
+    def test_init_host(self):
+        # Check to make sure the method passes (does nothing) since
+        # it simply passes in the powervm driver but it raises a
+        # NotImplementedError in the base driver class.
+        self.powervm_connection.init_host(host='fake')
+
+    def test_pause(self):
+        # Check to make sure the method raises NotImplementedError.
+        self.assertRaises(NotImplementedError, self.powervm_connection.pause,
+                          instance=None)
+
+    def test_unpause(self):
+        # Check to make sure the method raises NotImplementedError.
+        self.assertRaises(NotImplementedError, self.powervm_connection.unpause,
+                          instance=None)
+
+    def test_suspend(self):
+        # Check to make sure the method raises NotImplementedError.
+        self.assertRaises(NotImplementedError, self.powervm_connection.suspend,
+                          instance=None)
+
+    def test_resume(self):
+        # Check to make sure the method raises NotImplementedError.
+        self.assertRaises(NotImplementedError, self.powervm_connection.resume,
+                          instance=None, network_info=None)
+
+    def test_host_power_action(self):
+        # Check to make sure the method raises NotImplementedError.
+        self.assertRaises(NotImplementedError,
+                          self.powervm_connection.host_power_action,
+                          host='fake', action='die!')
+
 
 class PowerVMDriverLparTestCase(test.TestCase):
     """Unit tests for PowerVM connection calls."""
@@ -788,7 +878,8 @@ class PowerVMDriverLparTestCase(test.TestCase):
         exp_mac_str = mac[:-2].replace(':', '')
 
         exp_cmd = ('chsyscfg -r lpar -i "name=%(inst_name)s, '
-                   'virtual_eth_mac_base_value=%(exp_mac_str)s"') % locals()
+                'virtual_eth_mac_base_value=%(exp_mac_str)s"'
+                % {'inst_name': inst_name, 'exp_mac_str': exp_mac_str})
 
         fake_op = self.powervm_connection._powervm
         self.mox.StubOutWithMock(fake_op._operator, 'run_vios_command')

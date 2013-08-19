@@ -97,8 +97,31 @@ class LibvirtVolumeTestCase(test.TestCase):
         }
         conf = libvirt_driver.connect_volume(connection_info, self.disk_info)
         tree = conf.format_dom()
-        self.assertEqual(tree.get('type'), 'block')
-        self.assertEqual(tree.find('./serial').text, 'fake_serial')
+        self.assertEqual('block', tree.get('type'))
+        self.assertEqual('fake_serial', tree.find('./serial').text)
+        self.assertEqual(None, tree.find('./blockio'))
+
+    def test_libvirt_volume_driver_blockio(self):
+        libvirt_driver = volume.LibvirtVolumeDriver(self.fake_conn)
+        connection_info = {
+            'driver_volume_type': 'fake',
+            'data': {
+                'device_path': '/foo',
+                'logical_block_size': '4096',
+                'physical_block_size': '4096',
+                },
+            'serial': 'fake_serial',
+            }
+        disk_info = {
+            "bus": "virtio",
+            "dev": "vde",
+            "type": "disk",
+            }
+        conf = libvirt_driver.connect_volume(connection_info, disk_info)
+        tree = conf.format_dom()
+        blockio = tree.find('./blockio')
+        self.assertEqual('4096', blockio.get('logical_block_size'))
+        self.assertEqual('4096', blockio.get('physical_block_size'))
 
     def iscsi_connection(self, volume, location, iqn):
         return {
@@ -470,6 +493,32 @@ class LibvirtVolumeTestCase(test.TestCase):
              '-o', 'backupvolfile-server=192.168.1.2',
              export_string, export_mnt_base)]
         self.assertEqual(self.executes, expected_commands)
+
+    def test_libvirt_glusterfs_libgfapi(self):
+        self.flags(qemu_allowed_storage_drivers=['gluster'])
+        libvirt_driver = volume.LibvirtGlusterfsVolumeDriver(self.fake_conn)
+        export_string = '192.168.1.1:/volume-00001'
+        name = 'volume-00001'
+
+        connection_info = {'data': {'export': export_string, 'name': name}}
+
+        disk_info = {
+            "dev": "vde",
+            "type": "disk",
+            "bus": "virtio",
+        }
+
+        conf = libvirt_driver.connect_volume(connection_info, disk_info)
+        tree = conf.format_dom()
+        self.assertEqual(tree.get('type'), 'network')
+        self.assertEqual(tree.find('./driver').get('type'), 'raw')
+
+        source = tree.find('./source')
+        self.assertEqual(source.get('protocol'), 'gluster')
+        self.assertEqual(source.get('name'), 'volume-00001/volume-00001')
+        self.assertEqual(source.find('./host').get('name'), '192.168.1.1')
+
+        libvirt_driver.disconnect_volume(connection_info, "vde")
 
     def fibrechan_connection(self, volume, location, wwn):
         return {

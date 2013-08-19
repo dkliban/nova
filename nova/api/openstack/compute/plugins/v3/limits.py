@@ -31,6 +31,7 @@ from nova.api.openstack.compute.views import limits as limits_views
 from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import importutils
 from nova.openstack.common import jsonutils
 from nova import quota
@@ -213,7 +214,6 @@ DEFAULT_LIMITS = [
     Limit("GET", "*changes-since*", ".*changes-since.*", 3,
           utils.TIME_UNITS['MINUTE']),
     Limit("DELETE", "*", ".*", 100, utils.TIME_UNITS['MINUTE']),
-    Limit("GET", "*/os-fping", "^/os-fping", 12, utils.TIME_UNITS['HOUR']),
 ]
 
 
@@ -272,7 +272,7 @@ class RateLimitingMiddleware(base_wsgi.Middleware):
         if delay:
             msg = _("This request was rate-limited.")
             retry = time.time() + delay
-            return wsgi.OverLimitFault(msg, error, retry)
+            return wsgi.RateLimitFault(msg, error, retry)
 
         req.environ["nova.limits"] = self._limiter.get_limits(username)
 

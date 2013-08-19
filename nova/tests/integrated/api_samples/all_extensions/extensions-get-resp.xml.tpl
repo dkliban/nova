@@ -60,6 +60,9 @@
   <extension alias="os-baremetal-nodes" name="BareMetalNodes" namespace="http://docs.openstack.org/compute/ext/baremetal_nodes/api/v2" updated="%(timestamp)s">
     <description>%(text)s</description>
   </extension>
+  <extension alias="os-block-device-mapping-v2-boot" name="BlockDeviceMappingV2Boot" namespace="http://docs.openstack.org/compute/ext/block_device_mapping_v2_boot/api/v2" updated="%(timestamp)s">
+    <description>%(text)s</description>
+  </extension>
   <extension alias="os-cells" updated="%(timestamp)s" namespace="http://docs.openstack.org/compute/ext/cells/api/v1.1" name="Cells">
     <description>%(text)s</description>
   </extension>
@@ -172,6 +175,9 @@
     <description>%(text)s</description>
   </extension>
   <extension alias="os-quota-sets" updated="%(timestamp)s" namespace="http://docs.openstack.org/compute/ext/quotas-sets/api/v1.1" name="Quotas">
+    <description>%(text)s</description>
+  </extension>
+  <extension alias="os-user-quotas" updated="%(timestamp)s" namespace="http://docs.openstack.org/compute/ext/user_quotas/api/v1.1" name="UserQuotas">
     <description>%(text)s</description>
   </extension>
   <extension alias="os-rescue" updated="%(timestamp)s" namespace="http://docs.openstack.org/compute/ext/rescue/api/v1.1" name="Rescue">

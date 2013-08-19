@@ -24,6 +24,7 @@ from oslo.config import cfg
 from nova import exception
 from nova.openstack.common import excutils
 from nova.openstack.common import fileutils
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova import utils
 from nova.virt.disk import api as disk
@@ -38,7 +39,6 @@ __imagebackend_opts = [
                  ' default. If default is specified,'
                  ' then use_cow_images flag is used instead of this one.'),
     cfg.StrOpt('libvirt_images_volume_group',
-            default=None,
             help='LVM Volume Group that is used for VM images, when you'
                  ' specify libvirt_images_type=lvm.'),
     cfg.BoolOpt('libvirt_sparse_logical_volumes',
@@ -282,9 +282,13 @@ class Qcow2(Image):
         # NOTE(cfb): Having a flavor that sets the root size to 0 and having
         #            nova effectively ignore that size and use the size of the
         #            image is considered a feature at this time, not a bug.
-        if size and size < disk.get_disk_size(base):
-            LOG.error('%s virtual size larger than flavor root disk size %s' %
-                      (base, size))
+        disk_size = disk.get_disk_size(base)
+        if size and size < disk_size:
+            msg = _('%(base)s virtual size %(disk_size)s'
+                    'larger than flavor root disk size %(size)s')
+            LOG.error(msg % {'base': base,
+                              'disk_size': disk_size,
+                              'size': size})
             raise exception.InstanceTypeDiskTooSmall()
         if not os.path.exists(self.path):
             with fileutils.remove_path_on_error(self.path):

@@ -26,6 +26,7 @@ from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
 from nova.compute import api as compute_api
 from nova import exception
+from nova.openstack.common.gettextutils import _
 
 
 ALIAS = 'os-keypairs'
@@ -127,6 +128,7 @@ class KeypairController(object):
             raise webob.exc.HTTPNotFound()
         return {'keypair': keypair}
 
+    @extensions.expected_errors(())
     @wsgi.serializers(xml=KeypairsTemplate)
     def index(self, req):
         """

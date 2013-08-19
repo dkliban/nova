@@ -27,15 +27,18 @@ from nova.api.openstack.compute import ips
 from nova.api.openstack.compute.views import servers as views_servers
 from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
+from nova import block_device
 from nova import compute
 from nova.compute import flavors
 from nova import exception
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
 from nova.openstack.common.rpc import common as rpc_common
 from nova.openstack.common import strutils
 from nova.openstack.common import timeutils
 from nova.openstack.common import uuidutils
+from nova import policy
 from nova import utils
 
 
@@ -219,6 +222,11 @@ class CommonDeserializer(wsgi.MetadataXMLDeserializer):
         if block_device_mapping is not None:
             server["block_device_mapping"] = block_device_mapping
 
+        block_device_mapping_v2 = self._extract_block_device_mapping_v2(
+            server_node)
+        if block_device_mapping_v2 is not None:
+            server["block_device_mapping_v2"] = block_device_mapping_v2
+
         # NOTE(vish): Support this incorrect version because it was in the code
         #             base for a while and we don't want to accidentally break
         #             anyone that might be using it.
@@ -260,6 +268,21 @@ class CommonDeserializer(wsgi.MetadataXMLDeserializer):
             return block_device_mapping
         else:
             return None
+
+    def _extract_block_device_mapping_v2(self, server_node):
+        """Marshal the new block_device_mappings."""
+        node = self.find_first_child_named(server_node,
+                                           "block_device_mapping_v2")
+        if node:
+            block_device_mapping = []
+            for child in self.extract_elements(node):
+                if child.nodeName != "mapping":
+                    continue
+                block_device_mapping.append(
+                    dict((attr, child.getAttribute(attr))
+                        for attr in block_device.bdm_new_api_fields
+                        if child.getAttribute(attr)))
+            return block_device_mapping
 
     def _extract_scheduler_hints(self, server_node):
         """Marshal the scheduler hints attribute of a parsed request."""
@@ -580,21 +603,6 @@ class Controller(wsgi.Controller):
     def _validate_server_name(self, value):
         self._check_string_length(value, 'Server name', max_length=255)
 
-    def _validate_block_device(self, bd):
-        self._check_string_length(bd['device_name'],
-                'Device name', max_length=255)
-
-        if ' ' in bd['device_name']:
-            msg = _("Device name cannot include spaces.")
-            raise exc.HTTPBadRequest(explanation=msg)
-
-        if 'volume_size' in bd:
-            try:
-                bd['volume_size'] = utils.validate_integer(
-                    bd['volume_size'], 'volume_size', min_value=0)
-            except exception.InvalidInput as e:
-                raise exc.HTTPBadRequest(explanation=e.format_message())
-
     def _get_injected_files(self, personality):
         """Create a list of injected files from the personality attribute.
 
@@ -831,16 +839,52 @@ class Controller(wsgi.Controller):
             availability_zone = server_dict.get('availability_zone')
 
         block_device_mapping = None
+        block_device_mapping_v2 = None
+        legacy_bdm = True
         if self.ext_mgr.is_loaded('os-volumes'):
             block_device_mapping = server_dict.get('block_device_mapping', [])
             for bdm in block_device_mapping:
-                # Ignore empty volume size
-                if 'volume_size' in bdm and not bdm['volume_size']:
-                    del bdm['volume_size']
-                self._validate_block_device(bdm)
+                try:
+                    block_device.validate_device_name(bdm.get("device_name"))
+                    block_device.validate_and_default_volume_size(bdm)
+                except exception.InvalidBDMFormat as e:
+                    raise exc.HTTPBadRequest(explanation=e.format_message())
+
                 if 'delete_on_termination' in bdm:
                     bdm['delete_on_termination'] = strutils.bool_from_string(
                         bdm['delete_on_termination'])
+
+            if self.ext_mgr.is_loaded('os-block-device-mapping-v2-boot'):
+                # Consider the new data format for block device mapping
+                block_device_mapping_v2 = server_dict.get(
+                    'block_device_mapping_v2', [])
+                # NOTE (ndipanov):  Disable usage of both legacy and new
+                #                   block device format in the same request
+                if block_device_mapping and block_device_mapping_v2:
+                    expl = _('Using different block_device_mapping syntaxes '
+                             'is not allowed in the same request.')
+                    raise exc.HTTPBadRequest(explanation=expl)
+
+                # Assume legacy format
+                legacy_bdm = not bool(block_device_mapping_v2)
+
+                # NOTE (ndipanov) Don't allow empty device_name values
+                #                 for now until we can handle it on the
+                #                 compute side.
+                if any('device_name' not in bdm
+                       for bdm in block_device_mapping_v2):
+                    expl = _('Missing device_name in some block devices.')
+                    raise exc.HTTPBadRequest(explanation=expl)
+
+                try:
+                    block_device_mapping_v2 = [
+                        block_device.BlockDeviceDict.from_api(bdm_dict)
+                        for bdm_dict in block_device_mapping_v2]
+                except exception.InvalidBDMFormat as e:
+                    raise exc.HTTPBadRequest(explanation=e.format_message())
+
+        block_device_mapping = (block_device_mapping or
+                                block_device_mapping_v2)
 
         ret_resv_id = False
         # min_count and max_count are optional.  If they exist, they may come
@@ -898,7 +942,8 @@ class Controller(wsgi.Controller):
                             config_drive=config_drive,
                             block_device_mapping=block_device_mapping,
                             auto_disk_config=auto_disk_config,
-                            scheduler_hints=scheduler_hints)
+                            scheduler_hints=scheduler_hints,
+                            legacy_bdm=legacy_bdm)
         except exception.QuotaError as error:
             raise exc.HTTPRequestEntityTooLarge(
                 explanation=error.format_message(),
@@ -931,6 +976,7 @@ class Controller(wsgi.Controller):
                 exception.InstanceTypeNotFound,
                 exception.InvalidMetadata,
                 exception.InvalidRequest,
+                exception.PortNotFound,
                 exception.SecurityGroupNotFound) as error:
             raise exc.HTTPBadRequest(explanation=error.format_message())
         except exception.PortInUse as error:
@@ -1003,6 +1049,7 @@ class Controller(wsgi.Controller):
             instance = self.compute_api.get(ctxt, id,
                                             want_objects=True)
             req.cache_db_instance(instance)
+            policy.enforce(ctxt, 'compute:update', instance)
             instance.update(update_dict)
             instance.save()
         except exception.NotFound:
@@ -1145,8 +1192,12 @@ class Controller(wsgi.Controller):
         """
         image_ref = data['server'].get('imageRef')
         bdm = data['server'].get('block_device_mapping')
+        bdm_v2 = data['server'].get('block_device_mapping_v2')
 
-        if not image_ref and bdm and self.ext_mgr.is_loaded('os-volumes'):
+        if (not image_ref and (
+                (bdm and self.ext_mgr.is_loaded('os-volumes')) or
+                (bdm_v2 and
+                 self.ext_mgr.is_loaded('os-block-device-mapping-v2-boot')))):
             return ''
         else:
             image_href = self._image_ref_from_req_data(data)

@@ -22,6 +22,7 @@ import urlparse
 from oslo.config import cfg
 
 from nova.cells import driver
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import rpc
 from nova.openstack.common.rpc import dispatcher as rpc_dispatcher
 from nova.openstack.common.rpc import proxy as rpc_proxy
@@ -39,7 +40,6 @@ CONF.import_opt('call_timeout', 'nova.cells.opts', group='cells')
 CONF.import_opt('rpc_backend', 'nova.openstack.common.rpc')
 
 rpcapi_cap_opt = cfg.StrOpt('intercell',
-        default=None,
         help='Set a version cap for messages sent between cells services')
 CONF.register_opt(rpcapi_cap_opt, 'upgrade_levels')
 

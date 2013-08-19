@@ -31,6 +31,7 @@ from nova.compute import power_state
 from nova.compute import task_states
 from nova import db
 from nova import exception
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova.virt import driver
 from nova.virt import virtapi
@@ -89,21 +90,17 @@ class FakeDriver(driver.ComputeDriver):
         super(FakeDriver, self).__init__(virtapi)
         self.instances = {}
         self.host_status_base = {
-          'host_name-description': 'Fake Host',
-          'host_hostname': CONF.host,
-          'host_memory_total': 8000000000,
-          'host_memory_overhead': 10000000,
-          'host_memory_free': 7900000000,
-          'host_memory_free_computed': 7900000000,
-          'host_other_config': {},
-          'host_ip_address': '192.168.1.109',
-          'host_cpu_info': {},
-          'disk_available': 500000000000,
-          'disk_total': 600000000000,
-          'disk_used': 100000000000,
-          'host_uuid': 'cedb9b39-9388-41df-8891-c5c9a0c0fe5f',
-          'host_name_label': 'fake-host',
+          'vcpus': 100000,
+          'memory_mb': 8000000000,
+          'local_gb': 600000000000,
+          'vcpus_used': 0,
+          'memory_mb_used': 0,
+          'local_gb_used': 100000000000,
+          'hypervisor_type': 'fake',
+          'hypervisor_version': '1.0',
           'hypervisor_hostname': CONF.host,
+          'cpu_info': {},
+          'disk_available_least': 500000000000,
           }
         self._mounts = {}
         self._interfaces = {}
@@ -353,6 +350,7 @@ class FakeDriver(driver.ComputeDriver):
                'hypervisor_type': 'fake',
                'hypervisor_version': '1.0',
                'hypervisor_hostname': nodename,
+               'disk_available_least': 0,
                'cpu_info': '?'}
         return dic
 
@@ -442,7 +440,7 @@ class FakeDriver(driver.ComputeDriver):
     def get_volume_connector(self, instance):
         return {'ip': '127.0.0.1', 'initiator': 'fake', 'host': 'fakehost'}
 
-    def get_available_nodes(self):
+    def get_available_nodes(self, refresh=False):
         return _FAKE_NODES
 
     def instance_on_disk(self, instance):

@@ -27,6 +27,7 @@ from nova import context
 from nova.db import base
 from nova import exception
 from nova.openstack.common import fileutils
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
 from nova.openstack.common import timeutils
@@ -37,7 +38,6 @@ cell_state_manager_opts = [
                 default=60,
                 help='Seconds between getting fresh cell info from db.'),
         cfg.StrOpt('cells_config',
-                   default=None,
                    help='Configuration file from which to read cells '
                    'configuration.  If given, overrides reading cells '
                    'from the database.'),

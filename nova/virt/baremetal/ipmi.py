@@ -28,6 +28,7 @@ import tempfile
 from oslo.config import cfg
 
 from nova import exception
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova.openstack.common import loopingcall
 from nova import paths
@@ -41,7 +42,6 @@ opts = [
                default='shellinaboxd',
                help='path to baremetal terminal program'),
     cfg.StrOpt('terminal_cert_dir',
-               default=None,
                help='path to baremetal terminal SSL cert(PEM)'),
     cfg.StrOpt('terminal_pid_dir',
                default=paths.state_path_def('baremetal/console'),

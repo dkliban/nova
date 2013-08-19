@@ -30,6 +30,7 @@ import copy
 import os
 import shutil
 import sys
+import tempfile
 import uuid
 
 import fixtures
@@ -60,8 +61,9 @@ test_opts = [
 
 CONF = cfg.CONF
 CONF.register_opts(test_opts)
-CONF.import_opt('sql_connection',
-                'nova.openstack.common.db.sqlalchemy.session')
+CONF.import_opt('connection',
+                'nova.openstack.common.db.sqlalchemy.session',
+                group='database')
 CONF.import_opt('sqlite_db', 'nova.openstack.common.db.sqlalchemy.session')
 CONF.import_opt('enabled', 'nova.api.openstack', group='osapi_v3')
 CONF.set_override('use_stderr', False)
@@ -121,7 +123,7 @@ class SampleNetworks(fixtures.Fixture):
         bridge_interface = CONF.flat_interface or CONF.vlan_interface
         network.create_networks(ctxt,
                                 label='test',
-                                cidr=CONF.fixed_range,
+                                cidr='10.0.0.0/8',
                                 multi_host=CONF.multi_host,
                                 num_networks=CONF.num_networks,
                                 network_size=CONF.network_size,
@@ -228,9 +230,9 @@ class TestCase(testtools.TestCase):
             global _DB_CACHE
             if not _DB_CACHE:
                 _DB_CACHE = Database(session, migration,
-                                        sql_connection=CONF.sql_connection,
-                                        sqlite_db=CONF.sqlite_db,
-                                        sqlite_clean_db=CONF.sqlite_clean_db)
+                        sql_connection=CONF.database.connection,
+                        sqlite_db=CONF.sqlite_db,
+                        sqlite_clean_db=CONF.sqlite_clean_db)
 
             self.useFixture(_DB_CACHE)
 
@@ -251,6 +253,8 @@ class TestCase(testtools.TestCase):
         CONF.set_override('fatal_exception_format_errors', True)
         CONF.set_override('enabled', True, 'osapi_v3')
         CONF.set_override('force_dhcp_release', False)
+        # This will be cleaned up by the NestedTempfile fixture
+        CONF.set_override('lock_path', tempfile.mkdtemp())
 
     def _restore_obj_registry(self):
         objects_base.NovaObject._obj_classes = self._base_test_obj_backup

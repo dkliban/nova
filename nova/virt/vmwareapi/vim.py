@@ -29,6 +29,8 @@ except ImportError:
 
 from oslo.config import cfg
 
+from nova.openstack.common.gettextutils import _
+from nova import utils
 from nova.virt.vmwareapi import error_util
 
 RESP_NOT_XML_ERROR = 'Response is "text/html", not "text/xml"'
@@ -36,7 +38,6 @@ CONN_ABORT_ERROR = 'Software caused connection abort'
 ADDRESS_IN_USE_ERROR = 'Address already in use'
 
 vmwareapi_wsdl_loc_opt = cfg.StrOpt('wsdl_location',
-        default=None,
         deprecated_name='vmwareapi_wsdl_loc',
         deprecated_group='DEFAULT',
         help='Optional VIM Service WSDL Location '
@@ -107,11 +108,11 @@ class Vim:
         :return: string to WSDL location for vSphere WS Management API
         """
         # optional WSDL location over-ride for work-arounds
-        wsdl_url = CONF.vmware.wsdl_location
-        if wsdl_url is None:
-            # calculate default WSDL location if no override supplied
-            wsdl_url = '%s://%s/sdk/vimService.wsdl' % (protocol, host_name)
-        return wsdl_url
+        if CONF.vmware.wsdl_location:
+            return CONF.vmware.wsdl_location
+
+        # calculate default WSDL location if no override supplied
+        return Vim.get_soap_url(protocol, host_name) + "/vimService.wsdl"
 
     @staticmethod
     def get_soap_url(protocol, host_name):
@@ -124,6 +125,8 @@ class Vim:
         :param host_name: localhost or other vSphere server name
         :return: the url to the active vSphere WS Management API
         """
+        if utils.is_valid_ipv6(host_name):
+            return '%s://[%s]/sdk' % (protocol, host_name)
         return '%s://%s/sdk' % (protocol, host_name)
 
     def get_service_content(self):

@@ -17,7 +17,7 @@
 """
 Handling of block device information and mapping.
 
-This module contains helper methods for intepreting the block
+This module contains helper methods for interpreting the block
 device information and determining the suitable mapping to
 guest devices and libvirt XML.
 
@@ -35,7 +35,7 @@ variables / types used
       'disk.swap' -> disk_info
       'disk.config' -> disk_info
 
-   If any of the default disks are overriden by the block
+   If any of the default disks are overridden by the block
    device info mappings, the hash value will be None
 
    For any ephemeral device there will also be a dict entry
@@ -70,6 +70,7 @@ from oslo.config import cfg
 from nova import block_device
 from nova.compute import flavors
 from nova import exception
+from nova.openstack.common.gettextutils import _
 from nova.virt import configdrive
 from nova.virt import driver
 
@@ -238,14 +239,14 @@ def get_disk_bus_for_device_type(virt_type,
 
 
 def get_disk_bus_for_disk_dev(virt_type, disk_dev):
-    """Determine the disk bus for a disk dev.
+    """Determine the disk bus for a disk device.
 
-       Given a disk devi like 'hda', 'sdf', 'xvdb', etc
+       Given a disk device like 'hda', 'sdf', 'xvdb', etc
        guess what the most appropriate disk bus is for
        the currently configured virtualization technology
 
        Returns the disk bus, or raises an Exception if
-       the disk dev prefix is unknown.
+       the disk device prefix is unknown.
     """
 
     if disk_dev[:2] == 'hd':
@@ -294,6 +295,26 @@ def get_eph_disk(ephemeral):
     return 'disk.eph' + str(ephemeral['num'])
 
 
+def get_config_drive_type():
+    """Determine the type of config drive.
+
+       If config_drive_format is set to iso9660 then the config drive will
+       be 'cdrom', otherwise 'disk'.
+
+       Returns a string indicating the config drive type.
+    """
+
+    if CONF.config_drive_format == 'iso9660':
+        config_drive_type = 'cdrom'
+    elif CONF.config_drive_format == 'vfat':
+        config_drive_type = 'disk'
+    else:
+        raise exception.ConfigDriveUnknownFormat(
+            format=CONF.config_drive_format)
+
+    return config_drive_type
+
+
 def get_disk_mapping(virt_type, instance,
                      disk_bus, cdrom_bus,
                      block_device_info=None,
@@ -302,7 +323,7 @@ def get_disk_mapping(virt_type, instance,
 
        This is about figuring out whether the default 'disk',
        'disk.local', 'disk.swap' and 'disk.config' images have
-       been overriden by the block device mapping.
+       been overridden by the block device mapping.
 
        Returns the guest disk mapping for the devices.
     """
@@ -412,8 +433,13 @@ def get_disk_mapping(virt_type, instance,
                                         'type': 'disk'}
 
     if configdrive.required_by(instance):
+        device_type = get_config_drive_type()
+        disk_bus = get_disk_bus_for_device_type(virt_type,
+                                                image_meta,
+                                                device_type)
         config_info = get_next_disk_info(mapping,
                                          disk_bus,
+                                         device_type,
                                          last_device=True)
         mapping['disk.config'] = config_info
 

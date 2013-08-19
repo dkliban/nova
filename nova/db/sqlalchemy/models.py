@@ -21,7 +21,7 @@
 SQLAlchemy models for nova data.
 """
 
-from sqlalchemy import Column, Index, Integer, BigInteger, String, schema
+from sqlalchemy import Column, Index, Integer, BigInteger, Enum, String, schema
 from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy import ForeignKey, DateTime, Boolean, Text, Float
@@ -86,7 +86,7 @@ class ComputeNode(BASE, NovaBase):
     vcpus_used = Column(Integer, nullable=False)
     memory_mb_used = Column(Integer, nullable=False)
     local_gb_used = Column(Integer, nullable=False)
-    hypervisor_type = Column(Text, nullable=False)
+    hypervisor_type = Column(MediumText(), nullable=False)
     hypervisor_version = Column(Integer, nullable=False)
     hypervisor_hostname = Column(String(255), nullable=True)
 
@@ -97,7 +97,6 @@ class ComputeNode(BASE, NovaBase):
     free_disk_gb = Column(Integer, nullable=True)
     current_workload = Column(Integer, nullable=True)
     running_vms = Column(Integer, nullable=True)
-
     # Note(masumotok): Expected Strings example:
     #
     # '{"arch":"x86_64",
@@ -108,8 +107,10 @@ class ComputeNode(BASE, NovaBase):
     # Points are "json translatable" and it must have all dictionary keys
     # above, since it is copied from <cpu> tag of getCapabilities()
     # (See libvirt.virtConnection).
-    cpu_info = Column(Text, nullable=True)
+    cpu_info = Column(MediumText(), nullable=False)
     disk_available_least = Column(Integer, nullable=True)
+    host_ip = Column(types.IPAddress())
+    supported_instances = Column(Text)
 
 
 class ComputeNodeStat(BASE, NovaBase):
@@ -124,8 +125,8 @@ class ComputeNodeStat(BASE, NovaBase):
     )
 
     id = Column(Integer, primary_key=True)
-    key = Column(String(511), nullable=False)
-    value = Column(String(255), nullable=False)
+    key = Column(String(255), nullable=False)
+    value = Column(String(255), nullable=True)
     compute_node_id = Column(Integer, ForeignKey('compute_nodes.id'),
                              nullable=False)
 
@@ -156,6 +157,8 @@ class Instance(BASE, NovaBase):
     """Represents a guest VM."""
     __tablename__ = 'instances'
     __table_args__ = (
+        Index('uuid', 'uuid', unique=True),
+        Index('project_id', 'project_id'),
         Index('instances_host_deleted_idx',
               'host', 'deleted'),
         Index('instances_reservation_id_idx',
@@ -167,7 +170,9 @@ class Instance(BASE, NovaBase):
         Index('instances_task_state_updated_at_idx',
               'task_state', 'updated_at'),
         Index('instances_host_node_deleted_idx',
-              'host', 'node', 'deleted')
+              'host', 'node', 'deleted'),
+        Index('instances_host_deleted_cleaned_idx',
+              'host', 'deleted', 'cleaned'),
     )
     injected_files = []
 
@@ -208,7 +213,7 @@ class Instance(BASE, NovaBase):
 
     launch_index = Column(Integer, nullable=True)
     key_name = Column(String(255), nullable=True)
-    key_data = Column(Text)
+    key_data = Column(MediumText())
 
     power_state = Column(Integer, nullable=True)
     vm_state = Column(String(255), nullable=True)
@@ -229,7 +234,7 @@ class Instance(BASE, NovaBase):
     # *not* flavorid, this is the internal primary_key
     instance_type_id = Column(Integer, nullable=True)
 
-    user_data = Column(Text, nullable=True)
+    user_data = Column(MediumText(), nullable=True)
 
     reservation_id = Column(String(255), nullable=True)
 
@@ -245,13 +250,17 @@ class Instance(BASE, NovaBase):
 
     # To remember on which host an instance booted.
     # An instance may have moved to another host by live migration.
-    launched_on = Column(Text, nullable=True)
+    launched_on = Column(MediumText(), nullable=True)
+
+    # NOTE(jdillaman): locked deprecated in favor of locked_by,
+    # to be removed in Icehouse
     locked = Column(Boolean, nullable=True)
+    locked_by = Column(Enum('owner', 'admin'), nullable=True)
 
     os_type = Column(String(255), nullable=True)
     architecture = Column(String(255), nullable=True)
     vm_mode = Column(String(255), nullable=True)
-    uuid = Column(String(36), unique=True)
+    uuid = Column(String(36))
 
     root_device_name = Column(String(255), nullable=True)
     default_ephemeral_device = Column(String(255), nullable=True)
@@ -279,6 +288,10 @@ class Instance(BASE, NovaBase):
     # OpenStack compute cell name.  This will only be set at the top of
     # the cells tree and it'll be a full cell name such as 'api!hop1!hop2'
     cell_name = Column(String(255), nullable=True)
+    internal_id = Column(Integer, nullable=True)
+
+    # Records whether an instance has been deleted from disk
+    cleaned = Column(Integer, default=0)
 
 
 class InstanceInfoCache(BASE, NovaBase):
@@ -293,10 +306,10 @@ class InstanceInfoCache(BASE, NovaBase):
     id = Column(Integer, primary_key=True, autoincrement=True)
 
     # text column used for storing a json object of network data for api
-    network_info = Column(Text)
+    network_info = Column(MediumText())
 
     instance_uuid = Column(String(36), ForeignKey('instances.uuid'),
-                           nullable=False, unique=True)
+                           nullable=False)
     instance = relationship(Instance,
                             backref=backref('info_cache', uselist=False),
                             foreign_keys=instance_uuid,
@@ -399,6 +412,28 @@ class Quota(BASE, NovaBase):
     hard_limit = Column(Integer, nullable=True)
 
 
+class ProjectUserQuota(BASE, NovaBase):
+    """Represents a single quota override for a user with in a project."""
+
+    __tablename__ = 'project_user_quotas'
+    uniq_name = "uniq_project_user_quotas0user_id0project_id0resource0deleted"
+    __table_args__ = (
+        schema.UniqueConstraint("user_id", "project_id", "resource", "deleted",
+                                name=uniq_name),
+        Index('project_user_quotas_project_id_deleted_idx',
+              'project_id', 'deleted'),
+        Index('project_user_quotas_user_id_deleted_idx',
+              'user_id', 'deleted')
+    )
+    id = Column(Integer, primary_key=True, nullable=False)
+
+    project_id = Column(String(255), nullable=False)
+    user_id = Column(String(255), nullable=False)
+
+    resource = Column(String(255), nullable=False)
+    hard_limit = Column(Integer, nullable=True)
+
+
 class QuotaClass(BASE, NovaBase):
     """Represents a single quota override for a quota class.
 
@@ -429,7 +464,8 @@ class QuotaUsage(BASE, NovaBase):
     id = Column(Integer, primary_key=True)
 
     project_id = Column(String(255), nullable=True)
-    resource = Column(String(255), nullable=True)
+    user_id = Column(String(255), nullable=True)
+    resource = Column(String(255), nullable=False)
 
     in_use = Column(Integer, nullable=False)
     reserved = Column(Integer, nullable=False)
@@ -447,6 +483,7 @@ class Reservation(BASE, NovaBase):
     __tablename__ = 'reservations'
     __table_args__ = (
         Index('ix_reservations_project_id', 'project_id'),
+        Index('reservations_uuid_idx', 'uuid'),
     )
     id = Column(Integer, primary_key=True, nullable=False)
     uuid = Column(String(36), nullable=False)
@@ -454,6 +491,7 @@ class Reservation(BASE, NovaBase):
     usage_id = Column(Integer, ForeignKey('quota_usages.id'), nullable=False)
 
     project_id = Column(String(255))
+    user_id = Column(String(255))
     resource = Column(String(255))
 
     delta = Column(Integer, nullable=False)
@@ -587,7 +625,10 @@ class SecurityGroupInstanceAssociation(BASE, NovaBase):
 class SecurityGroup(BASE, NovaBase):
     """Represents a security group."""
     __tablename__ = 'security_groups'
-    __table_args__ = ()
+    __table_args__ = (
+        Index('uniq_security_groups0project_id0name0deleted', 'project_id',
+              'name', 'deleted'),
+    )
     id = Column(Integer, primary_key=True)
 
     name = Column(String(255))
@@ -665,7 +706,7 @@ class KeyPair(BASE, NovaBase):
     """Represents a public key pair for ssh."""
     __tablename__ = 'key_pairs'
     __table_args__ = (
-        schema.UniqueConstraint("name", "user_id", "deleted",
+        schema.UniqueConstraint("user_id", "name", "deleted",
                                 name="uniq_key_pairs0user_id0name0deleted"),
     )
     id = Column(Integer, primary_key=True, nullable=False)
@@ -991,7 +1032,7 @@ class Cell(BASE, NovaBase):
     """
     __tablename__ = 'cells'
     __table_args__ = (schema.UniqueConstraint(
-        "name", "deleted", name="uniq_cell_name0deleted"
+        "name", "deleted", name="uniq_cells0name0deleted"
         ),
     )
     id = Column(Integer, primary_key=True)
@@ -1287,7 +1328,10 @@ class InstanceGroup(BASE, NovaBase):
     """
 
     __tablename__ = 'instance_groups'
-    __table_args__ = (schema.UniqueConstraint("uuid", "deleted"), )
+    __table_args__ = (
+        schema.UniqueConstraint("uuid", "deleted",
+                                 name="uniq_instance_groups0uuid0deleted"),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(String(255))

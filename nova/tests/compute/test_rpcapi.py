@@ -213,7 +213,7 @@ class ComputeRpcAPITestCase(test.TestCase):
 
     def test_pause_instance(self):
         self._test_compute_api('pause_instance', 'cast',
-                instance=self.fake_instance)
+                               instance=self.fake_instance, version='2.36')
 
     def test_power_off_instance(self):
         self._test_compute_api('power_off_instance', 'cast',
@@ -227,7 +227,7 @@ class ComputeRpcAPITestCase(test.TestCase):
         self._test_compute_api('soft_delete_instance', 'cast',
                 instance=self.fake_instance,
                 reservations=['uuid1', 'uuid2'],
-                version='2.27')
+                version='2.35')
 
     def test_swap_volume(self):
         self._test_compute_api('swap_volume', 'cast',
@@ -387,12 +387,27 @@ class ComputeRpcAPITestCase(test.TestCase):
         self._test_compute_api('terminate_instance', 'cast',
                 instance=self.fake_instance, bdms=[],
                 reservations=['uuid1', 'uuid2'],
-                version='2.27')
+                version='2.35')
 
     def test_unpause_instance(self):
         self._test_compute_api('unpause_instance', 'cast',
-                instance=self.fake_instance)
+                               instance=self.fake_instance,
+                               version='2.36')
 
     def test_unrescue_instance(self):
         self._test_compute_api('unrescue_instance', 'cast',
                 instance=self.fake_instance)
+
+    def test_shelve_instance(self):
+        self._test_compute_api('shelve_instance', 'cast',
+                instance=self.fake_instance, image_id='image_id',
+                version='2.31')
+
+    def test_shelve_offload_instance(self):
+        self._test_compute_api('shelve_offload_instance', 'cast',
+                instance=self.fake_instance, version='2.31')
+
+    def test_unshelve_instance(self):
+        self._test_compute_api('unshelve_instance', 'cast',
+                instance=self.fake_instance, host='host', image='image',
+                version='2.31')

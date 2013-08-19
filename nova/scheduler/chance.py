@@ -27,6 +27,7 @@ from oslo.config import cfg
 
 from nova.compute import rpcapi as compute_rpcapi
 from nova import exception
+from nova.openstack.common.gettextutils import _
 from nova.scheduler import driver
 
 CONF = cfg.CONF
@@ -115,12 +116,3 @@ class ChanceScheduler(driver.Scheduler):
                 #             error properly
                 driver.handle_schedule_error(context, ex, instance_uuid,
                                              request_spec)
-
-    def schedule_prep_resize(self, context, image, request_spec,
-                             filter_properties, instance, instance_type,
-                             reservations):
-        """Select a target for resize."""
-        host = self._schedule(context, CONF.compute_topic, request_spec,
-                              filter_properties)
-        self.compute_rpcapi.prep_resize(context, image, instance,
-                instance_type, host, reservations)

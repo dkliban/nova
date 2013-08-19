@@ -110,12 +110,19 @@ class _FakeDriverBackendTestCase(object):
                                         block_device_info=None):
             return '[]'
 
+        def fake_delete_instance_files(_self, _instance):
+            pass
+
         self.stubs.Set(nova.virt.libvirt.driver.LibvirtDriver,
                        'get_instance_disk_info',
                        fake_get_instance_disk_info)
 
         self.stubs.Set(nova.virt.libvirt.driver.disk,
                        'extend', fake_extend)
+
+        self.stubs.Set(nova.virt.libvirt.driver.LibvirtDriver,
+                       '_delete_instance_files',
+                       fake_delete_instance_files)
 
         # Like the existing fakelibvirt.migrateToURI, do nothing,
         # but don't fail for these tests.
@@ -197,7 +204,9 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
 
     def _get_running_instance(self):
         instance_ref = test_utils.get_test_instance()
-        network_info = test_utils.get_test_network_info()
+        network_info = test_utils.get_test_network_info(legacy_model=False)
+        network_info[0]['network']['subnets'][0]['meta']['dhcp_server'] = \
+            '1.1.1.1'
         image_info = test_utils.get_test_image_info(None, instance_ref)
         self.connection.spawn(self.ctxt, instance_ref, image_info,
                               [], 'herp', network_info=network_info)
@@ -389,7 +398,7 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
     def test_destroy_instance_nonexistent(self):
         fake_instance = {'id': 42, 'name': 'I just made this up!',
                          'uuid': 'bda5fb9e-b347-40e8-8256-42397848cb00'}
-        network_info = test_utils.get_test_network_info()
+        network_info = test_utils.get_test_network_info(legacy_model=False)
         self.connection.destroy(fake_instance, network_info)
 
     @catch_notimplementederror
@@ -543,14 +552,14 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
     @catch_notimplementederror
     def test_ensure_filtering_for_instance(self):
         instance_ref = test_utils.get_test_instance()
-        network_info = test_utils.get_test_network_info()
+        network_info = test_utils.get_test_network_info(legacy_model=False)
         self.connection.ensure_filtering_rules_for_instance(instance_ref,
                                                             network_info)
 
     @catch_notimplementederror
     def test_unfilter_instance(self):
         instance_ref = test_utils.get_test_instance()
-        network_info = test_utils.get_test_network_info()
+        network_info = test_utils.get_test_network_info(legacy_model=False)
         self.connection.unfilter_instance(instance_ref, network_info)
 
     @catch_notimplementederror
@@ -560,16 +569,23 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
                                        lambda *a: None, lambda *a: None)
 
     @catch_notimplementederror
-    def _check_host_status_fields(self, host_status):
-        self.assertIn('disk_total', host_status)
-        self.assertIn('disk_used', host_status)
-        self.assertIn('host_memory_total', host_status)
-        self.assertIn('host_memory_free', host_status)
+    def _check_available_resouce_fields(self, host_status):
+        keys = ['vcpus', 'memory_mb', 'local_gb', 'vcpus_used',
+                'memory_mb_used', 'hypervisor_type', 'hypervisor_version',
+                'hypervisor_hostname', 'cpu_info', 'disk_available_least']
+        for key in keys:
+            self.assertIn(key, host_status)
 
     @catch_notimplementederror
     def test_get_host_stats(self):
         host_status = self.connection.get_host_stats()
-        self._check_host_status_fields(host_status)
+        self._check_available_resouce_fields(host_status)
+
+    @catch_notimplementederror
+    def test_get_available_resource(self):
+        available_resource = self.connection.get_available_resource(
+                'myhostname')
+        self._check_available_resouce_fields(available_resource)
 
     @catch_notimplementederror
     def test_set_host_enabled(self):
@@ -675,6 +691,7 @@ class AbstractDriverTestCase(_VirtDriverTestCase, test.TestCase):
 class FakeConnectionTestCase(_VirtDriverTestCase, test.TestCase):
     def setUp(self):
         self.driver_module = 'nova.virt.fake.FakeDriver'
+        fake.set_nodes(['myhostname'])
         super(FakeConnectionTestCase, self).setUp()
 
 

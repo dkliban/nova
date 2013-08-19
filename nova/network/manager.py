@@ -64,6 +64,7 @@ from nova.network import model as network_model
 from nova.network import rpcapi as network_rpcapi
 from nova.network.security_group import openstack_driver
 from nova.openstack.common import excutils
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import importutils
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
@@ -83,7 +84,6 @@ QUOTAS = quota.QUOTAS
 
 network_opts = [
     cfg.StrOpt('flat_network_bridge',
-               default=None,
                help='Bridge for simple network instances'),
     cfg.StrOpt('flat_network_dns',
                default='8.8.4.4',
@@ -92,13 +92,11 @@ network_opts = [
                 default=False,
                 help='Whether to attempt to inject network setup into guest'),
     cfg.StrOpt('flat_interface',
-               default=None,
                help='FlatDhcp will bridge into this interface if set'),
     cfg.IntOpt('vlan_start',
                default=100,
                help='First VLAN for private networks'),
     cfg.StrOpt('vlan_interface',
-               default=None,
                help='vlans will bridge into this interface if set'),
     cfg.IntOpt('num_networks',
                default=1,
@@ -112,20 +110,12 @@ network_opts = [
     cfg.IntOpt('network_size',
                default=256,
                help='Number of addresses in each private subnet'),
-    # TODO(mathrock): Deprecate in Grizzly, remove in Havana
-    cfg.StrOpt('fixed_range',
-               default='10.0.0.0/8',
-               help='DEPRECATED - Fixed IP address block.'
-                    'If set to an empty string, the subnet range(s) will be '
-                    'automatically determined and configured.'),
     cfg.StrOpt('fixed_range_v6',
                default='fd00::/48',
                help='Fixed IPv6 address block'),
     cfg.StrOpt('gateway',
-               default=None,
                help='Default IPv4 gateway'),
     cfg.StrOpt('gateway_v6',
-               default=None,
                help='Default IPv6 gateway'),
     cfg.IntOpt('cnt_vpn_clients',
                default=0,
@@ -308,7 +298,7 @@ class NetworkManager(manager.Manager):
         l3_lib = kwargs.get("l3_lib", CONF.l3_lib)
         self.l3driver = importutils.import_object(l3_lib)
 
-        super(NetworkManager, self).__init__(service_name='cells',
+        super(NetworkManager, self).__init__(service_name='network',
                                              *args, **kwargs)
 
     def _import_ipam_lib(self, ipam_lib):
@@ -1606,12 +1596,9 @@ class FlatDHCPManager(RPCAllocateFixedIP, floating_ips.FloatingIP,
         """Do any initialization that needs to be run if this is a
         standalone service.
         """
-        if not CONF.fixed_range:
-            ctxt = context.get_admin_context()
-            networks = self.db.network_get_all_by_host(ctxt, self.host)
-            self.l3driver.initialize(fixed_range=False, networks=networks)
-        else:
-            self.l3driver.initialize(fixed_range=CONF.fixed_range)
+        ctxt = context.get_admin_context()
+        networks = self.db.network_get_all_by_host(ctxt, self.host)
+        self.l3driver.initialize(fixed_range=False, networks=networks)
         super(FlatDHCPManager, self).init_host()
         self.init_host_floating_ips()
 
@@ -1619,8 +1606,7 @@ class FlatDHCPManager(RPCAllocateFixedIP, floating_ips.FloatingIP,
         """Sets up network on this host."""
         network['dhcp_server'] = self._get_dhcp_ip(context, network)
 
-        if not CONF.fixed_range:
-            self.l3driver.initialize_network(network.get('cidr'))
+        self.l3driver.initialize_network(network.get('cidr'))
         self.l3driver.initialize_gateway(network)
 
         if not CONF.fake_network:
@@ -1684,12 +1670,9 @@ class VlanManager(RPCAllocateFixedIP, floating_ips.FloatingIP, NetworkManager):
         standalone service.
         """
 
-        if not CONF.fixed_range:
-            ctxt = context.get_admin_context()
-            networks = self.db.network_get_all_by_host(ctxt, self.host)
-            self.l3driver.initialize(fixed_range=False, networks=networks)
-        else:
-            self.l3driver.initialize(fixed_range=CONF.fixed_range)
+        ctxt = context.get_admin_context()
+        networks = self.db.network_get_all_by_host(ctxt, self.host)
+        self.l3driver.initialize(fixed_range=False, networks=networks)
         NetworkManager.init_host(self)
         self.init_host_floating_ips()
 
@@ -1834,8 +1817,7 @@ class VlanManager(RPCAllocateFixedIP, floating_ips.FloatingIP, NetworkManager):
             address = network['vpn_public_address']
         network['dhcp_server'] = self._get_dhcp_ip(context, network)
 
-        if not CONF.fixed_range:
-            self.l3driver.initialize_network(network.get('cidr'))
+        self.l3driver.initialize_network(network.get('cidr'))
         self.l3driver.initialize_gateway(network)
 
         # NOTE(vish): only ensure this forward if the address hasn't been set

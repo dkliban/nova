@@ -37,12 +37,14 @@ from nova.cells import rpcapi as cells_rpcapi
 from nova.cells import state
 from nova.cloudpipe import pipelib
 from nova.compute import api as compute_api
+from nova.compute import cells_api as cells_api
 from nova.compute import manager as compute_manager
 from nova import context
 from nova import db
 from nova.db.sqlalchemy import models
 from nova import exception
 from nova.network import api as network_api
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import importutils
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
@@ -74,6 +76,7 @@ CONF.import_opt('vpn_image_id', 'nova.cloudpipe.pipelib')
 CONF.import_opt('osapi_compute_link_prefix', 'nova.api.openstack.common')
 CONF.import_opt('osapi_glance_link_prefix', 'nova.api.openstack.common')
 CONF.import_opt('enable', 'nova.cells.opts', group='cells')
+CONF.import_opt('cell_type', 'nova.cells.opts', group='cells')
 CONF.import_opt('db_check_interval', 'nova.cells.state', group='cells')
 LOG = logging.getLogger(__name__)
 
@@ -182,7 +185,7 @@ class ApiSampleTestBase(integrated_helpers._IntegratedTestBase):
         if isinstance(expected, dict):
             if not isinstance(result, dict):
                 raise NoMatch(_('%(result_str)s: %(result)s is not a dict.')
-                              % locals())
+                        % {'result_str': result_str, 'result': result})
             ex_keys = sorted(expected.keys())
             res_keys = sorted(result.keys())
             if ex_keys != res_keys:
@@ -197,8 +200,9 @@ class ApiSampleTestBase(integrated_helpers._IntegratedTestBase):
                 raise NoMatch(
                         _('Dictionary key mismatch:\n'
                         'Extra key(s) in template:\n%(ex_delta)s\n'
-                        'Extra key(s) in %(result_str)s:\n%(res_delta)s\n')
-                        % locals())
+                        'Extra key(s) in %(result_str)s:\n%(res_delta)s\n') %
+                        {'ex_delta': ex_delta, 'result_str': result_str,
+                           'res_delta': res_delta})
             for key in ex_keys:
                 res = self._compare_result(subs, expected[key], result[key],
                                            result_str)
@@ -206,7 +210,8 @@ class ApiSampleTestBase(integrated_helpers._IntegratedTestBase):
         elif isinstance(expected, list):
             if not isinstance(result, list):
                 raise NoMatch(
-                     _('%(result_str)s: %(result)s is not a list.') % locals())
+                        _('%(result_str)s: %(result)s is not a list.') %
+                        {'result_str': result_str, 'result': result})
 
             expected = expected[:]
             extra = []
@@ -229,8 +234,8 @@ class ApiSampleTestBase(integrated_helpers._IntegratedTestBase):
                 error.extend([repr(o) for o in expected])
 
             if extra:
-                error.append(_('Extra list items in %(result_str)s:')
-                             % locals())
+                error.append(_('Extra list items in %(result_str)s:') %
+                        {'result_str': result_str})
                 error.extend([repr(o) for o in extra])
 
             if error:
@@ -251,8 +256,9 @@ class ApiSampleTestBase(integrated_helpers._IntegratedTestBase):
             if not match:
                 raise NoMatch(
                     _('Values do not match:\n'
-                    'Template: %(expected)s\n%(result_str)s: %(result)s')
-                    % locals())
+                    'Template: %(expected)s\n%(result_str)s: %(result)s') %
+                    {'expected': expected, 'result_str': result_str,
+                        'result': result})
             try:
                 matched_value = match.group('id')
             except IndexError:
@@ -266,8 +272,10 @@ class ApiSampleTestBase(integrated_helpers._IntegratedTestBase):
             if expected != result:
                 raise NoMatch(
                         _('Values do not match:\n'
-                        'Template: %(expected)s\n%(result_str)s: %(result)s')
-                        % locals())
+                        'Template: %(expected)s\n%(result_str)s: '
+                        '%(result)s') % {'expected': expected,
+                                         'result_str': result_str,
+                                         'result': result})
         return matched_value
 
     def generalize_subs(self, subs, vanilla_regexes):
@@ -2095,12 +2103,17 @@ class SimpleTenantUsageSampleJsonTest(ServersSampleBase):
     def setUp(self):
         """setUp method for simple tenant usage."""
         super(SimpleTenantUsageSampleJsonTest, self).setUp()
+
+        started = timeutils.utcnow()
+        now = started + datetime.timedelta(hours=1)
+
+        timeutils.set_time_override(started)
         self._post_server()
-        timeutils.set_time_override(timeutils.utcnow() +
-                                    datetime.timedelta(hours=1))
+        timeutils.set_time_override(now)
+
         self.query = {
-            'start': str(timeutils.utcnow() - datetime.timedelta(hours=1)),
-            'end': str(timeutils.utcnow())
+            'start': str(started),
+            'end': str(now)
         }
 
     def tearDown(self):
@@ -2400,6 +2413,39 @@ class ExtendedQuotasSampleJsonTests(ApiSampleTestBase):
 
 
 class ExtendedQuotasSampleXmlTests(ExtendedQuotasSampleJsonTests):
+    ctype = "xml"
+
+
+class UserQuotasSampleJsonTests(ApiSampleTestBase):
+    extends_name = "nova.api.openstack.compute.contrib.quotas.Quotas"
+    extension_name = ("nova.api.openstack.compute.contrib"
+                      ".user_quotas.User_quotas")
+
+    def fake_load(self, *args):
+        return True
+
+    def test_show_quotas_for_user(self):
+        # Get api sample to show quotas for user.
+        response = self._do_get('os-quota-sets/fake_tenant?user_id=1')
+        self._verify_response('user-quotas-show-get-resp', {}, response, 200)
+
+    def test_delete_quotas_for_user(self):
+        # Get api sample to delete quota for user.
+        self.stubs.Set(ext_mgr, "is_loaded", self.fake_load)
+        response = self._do_delete('os-quota-sets/fake_tenant?user_id=1')
+        self.assertEqual(response.status, 202)
+        self.assertEqual(response.read(), '')
+
+    def test_update_quotas_for_user(self):
+        # Get api sample to update quotas for user.
+        response = self._do_put('os-quota-sets/fake_tenant?user_id=1',
+                                'user-quotas-update-post-req',
+                                {})
+        return self._verify_response('user-quotas-update-post-resp', {},
+                                     response, 200)
+
+
+class UserQuotasSampleXmlTests(UserQuotasSampleJsonTests):
     ctype = "xml"
 
 
@@ -3084,6 +3130,30 @@ class BareMetalNodesXmlTest(BareMetalNodesJsonTest):
     ctype = 'xml'
 
 
+class BlockDeviceMappingV2BootJsonTest(ServersSampleBase):
+    extension_name = ('nova.api.openstack.compute.contrib.'
+                      'block_device_mapping_v2_boot.'
+                      'Block_device_mapping_v2_boot')
+
+    def _get_flags(self):
+        f = super(BlockDeviceMappingV2BootJsonTest, self)._get_flags()
+        f['osapi_compute_extension'] = CONF.osapi_compute_extension[:]
+        # We need the volumes extension as well
+        f['osapi_compute_extension'].append(
+            'nova.api.openstack.compute.contrib.volumes.Volumes')
+        return f
+
+    def test_servers_post_with_bdm_v2(self):
+        self.stubs.Set(cinder.API, 'get', fakes.stub_volume_get)
+        self.stubs.Set(cinder.API, 'check_attach',
+                       fakes.stub_volume_check_attach)
+        return self._post_server()
+
+
+class BlockDeviceMappingV2BootXmlTest(BlockDeviceMappingV2BootJsonTest):
+    ctype = 'xml'
+
+
 class FloatingIPPoolsSampleJsonTests(ApiSampleTestBase):
     extension_name = ("nova.api.openstack.compute.contrib.floating_ip_pools."
                       "Floating_ip_pools")
@@ -3279,8 +3349,18 @@ class EvacuateJsonTest(ServersSampleBase):
             """Simulate validation of instance host is down."""
             return False
 
+        def fake_service_get_by_compute_host(self, context, host):
+            """Simulate that given host is a valid host."""
+            return {
+                    'host_name': host,
+                    'service': 'compute',
+                    'zone': 'nova'
+                    }
+
         self.stubs.Set(service_group_api.API, 'service_is_up',
                        fake_service_is_up)
+        self.stubs.Set(compute_api.HostAPI, 'service_get_by_compute_host',
+                       fake_service_get_by_compute_host)
 
         response = self._do_post('servers/%s/action' % uuid,
                                  'server-evacuate-req', req_subs)
@@ -3626,6 +3706,40 @@ class HypervisorsSampleJsonTests(ApiSampleTestBase):
 
 
 class HypervisorsSampleXmlTests(HypervisorsSampleJsonTests):
+    ctype = "xml"
+
+
+class HypervisorsCellsSampleJsonTests(ApiSampleTestBase):
+    extension_name = ("nova.api.openstack.compute.contrib.hypervisors."
+                      "Hypervisors")
+
+    def setUp(self):
+        self.flags(enable=True, cell_type='api', group='cells')
+        super(HypervisorsCellsSampleJsonTests, self).setUp()
+
+    def test_hypervisor_uptime(self):
+        fake_hypervisor = {'service': {'host': 'fake-mini'}, 'id': 1,
+                           'hypervisor_hostname': 'fake-mini'}
+
+        def fake_get_host_uptime(self, context, hyp):
+            return (" 08:32:11 up 93 days, 18:25, 12 users,  load average:"
+                    " 0.20, 0.12, 0.14")
+
+        def fake_compute_node_get(self, context, hyp):
+            return fake_hypervisor
+
+        self.stubs.Set(cells_api.HostAPI, 'compute_node_get',
+                       fake_compute_node_get)
+
+        self.stubs.Set(cells_api.HostAPI,
+                       'get_host_uptime', fake_get_host_uptime)
+        hypervisor_id = fake_hypervisor['id']
+        response = self._do_get('os-hypervisors/%s/uptime' % hypervisor_id)
+        subs = {'hypervisor_id': hypervisor_id}
+        self._verify_response('hypervisors-uptime-resp', subs, response, 200)
+
+
+class HypervisorsCellsSampleXmlTests(HypervisorsCellsSampleJsonTests):
     ctype = "xml"
 
 

@@ -30,6 +30,7 @@ from nova.compute import task_states
 from nova.compute import utils as compute_utils
 from nova.compute import vm_states
 from nova import exception
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova import quota
 
@@ -39,11 +40,9 @@ osapi_opts = [
                help='the maximum number of items returned in a single '
                     'response from a collection resource'),
     cfg.StrOpt('osapi_compute_link_prefix',
-               default=None,
                help='Base URL that will be presented to users in links '
                     'to the OpenStack Compute API'),
     cfg.StrOpt('osapi_glance_link_prefix',
-               default=None,
                help='Base URL that will be presented to users in links '
                     'to glance resources'),
 ]

@@ -28,6 +28,7 @@ from nova.compute import api as compute_api
 from nova import context
 from nova import crypto
 from nova import exception
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
 from nova.openstack.common import strutils
@@ -194,7 +195,7 @@ class XenAPIBasedAgent(object):
 
     def _save_instance_password_if_sshkey_present(self, new_pass):
         sshkey = self.instance.get('key_data')
-        if sshkey:
+        if sshkey and sshkey.startswith("ssh-rsa"):
             ctxt = context.get_admin_context()
             enc = crypto.ssh_encrypt_text(sshkey, new_pass)
             sys_meta = utils.instance_sys_meta(self.instance)
@@ -330,23 +331,12 @@ class SimpleDH(object):
         return self._private
 
     def get_public(self):
-        self._public = self.mod_exp(self._base, self._private, self._prime)
+        self._public = pow(self._base, self._private, self._prime)
         return self._public
 
     def compute_shared(self, other):
-        self._shared = self.mod_exp(other, self._private, self._prime)
+        self._shared = pow(other, self._private, self._prime)
         return self._shared
-
-    @staticmethod
-    def mod_exp(num, exp, mod):
-        """Efficient implementation of (num ** exp) % mod."""
-        result = 1
-        while exp > 0:
-            if (exp & 1) == 1:
-                result = (result * num) % mod
-            exp = exp >> 1
-            num = (num * num) % mod
-        return result
 
     def _run_ssl(self, text, decrypt=False):
         cmd = ['openssl', 'aes-128-cbc', '-A', '-a', '-pass',

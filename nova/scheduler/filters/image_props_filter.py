@@ -15,6 +15,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova.scheduler import filters
 
@@ -31,7 +32,7 @@ class ImagePropertiesFilter(filters.BaseHostFilter):
     contained in the image dictionary in the request_spec.
     """
 
-    # Image Properites and Compute Capabilites do not change within
+    # Image Properties and Compute Capabilities do not change within
     # a request
     run_filter_once_per_request = True
 

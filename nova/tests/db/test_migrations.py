@@ -61,6 +61,7 @@ import sqlalchemy.exc
 from nova.db.sqlalchemy import api as db
 import nova.db.sqlalchemy.migrate_repo
 from nova.db.sqlalchemy import utils as db_utils
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova.openstack.common import timeutils
 from nova.openstack.common import uuidutils
@@ -85,8 +86,7 @@ def _get_connect_string(backend, user, passwd, database):
     else:
         raise Exception("Unrecognized backend: '%s'" % backend)
 
-    return ("%(backend)s://%(user)s:%(passwd)s@localhost/%(database)s"
-            % locals())
+    return ("%s://%s:%s@localhost/%s" % (backend, user, passwd, database))
 
 
 def _is_backend_avail(backend, user, passwd, database):
@@ -261,13 +261,14 @@ class BaseMigrationTestCase(test.TestCase):
         # operations there is a special database template1.
         sqlcmd = ("psql -w -U %(user)s -h %(host)s -c"
                   " '%(sql)s' -d template1")
+        sqldict = {'user': user, 'host': host}
 
-        sql = ("drop database if exists %(database)s;") % locals()
-        droptable = sqlcmd % locals()
+        sqldict['sql'] = ("drop database if exists %s;") % database
+        droptable = sqlcmd % sqldict
         self.execute_cmd(droptable)
 
-        sql = ("create database %(database)s;") % locals()
-        createtable = sqlcmd % locals()
+        sqldict['sql'] = ("create database %s;") % database
+        createtable = sqlcmd % sqldict
         self.execute_cmd(createtable)
 
         os.unsetenv('PGPASSWORD')
@@ -293,9 +294,11 @@ class BaseMigrationTestCase(test.TestCase):
                 (user, password, database, host) = \
                         get_mysql_connection_info(conn_pieces)
                 sql = ("drop database if exists %(database)s; "
-                        "create database %(database)s;") % locals()
+                        "create database %(database)s;"
+                        % {'database': database})
                 cmd = ("mysql -u \"%(user)s\" %(password)s -h %(host)s "
-                       "-e \"%(sql)s\"") % locals()
+                       "-e \"%(sql)s\"" % {'user': user,
+                           'password': password, 'host': host, 'sql': sql})
                 self.execute_cmd(cmd)
             elif conn_string.startswith('postgresql'):
                 self._reset_pg(conn_pieces)
@@ -323,7 +326,7 @@ class BaseMigrationTestCase(test.TestCase):
         total = connection.execute("SELECT count(*) "
                                    "from information_schema.TABLES "
                                    "where TABLE_SCHEMA='%(database)s'" %
-                                   locals())
+                                   {'database': database})
         self.assertTrue(total.scalar() > 0, "No tables found. Wrong schema?")
 
         noninnodb = connection.execute("SELECT count(*) "
@@ -331,7 +334,7 @@ class BaseMigrationTestCase(test.TestCase):
                                        "where TABLE_SCHEMA='%(database)s' "
                                        "and ENGINE!='InnoDB' "
                                        "and TABLE_NAME!='migrate_version'" %
-                                       locals())
+                                       {'database': database})
         count = noninnodb.scalar()
         self.assertEqual(count, 0, "%d non InnoDB tables created" % count)
         connection.close()
@@ -476,6 +479,31 @@ class TestNovaMigrations(BaseMigrationTestCase, CommonTestsMixIn):
                     globals(), locals(), ['versioning_api'], -1)
             self.migration_api = temp.versioning_api
 
+    def assertColumnExists(self, engine, table, column):
+        t = db_utils.get_table(engine, table)
+        self.assertIn(column, t.c)
+
+    def assertColumnNotExists(self, engine, table, column):
+        t = db_utils.get_table(engine, table)
+        self.assertNotIn(column, t.c)
+
+    def assertIndexExists(self, engine, table, index):
+        t = db_utils.get_table(engine, table)
+        index_names = [idx.name for idx in t.indexes]
+        self.assertIn(index, index_names)
+
+    def assertIndexMembers(self, engine, table, index, members):
+        self.assertIndexExists(engine, table, index)
+
+        t = db_utils.get_table(engine, table)
+        index_columns = None
+        for idx in t.indexes:
+            if idx.name == index:
+                index_columns = idx.columns.keys()
+                break
+
+        self.assertEqual(sorted(members), sorted(index_columns))
+
     def _pre_upgrade_134(self, engine):
         now = timeutils.utcnow()
         data = [{
@@ -574,8 +602,7 @@ class TestNovaMigrations(BaseMigrationTestCase, CommonTestsMixIn):
                 aggregate_md.c.key == 'availability_zone').execute().scalar()
         self.assertEqual(0, num_azs)
 
-    # migration 147, availability zone transition for services
-    def _pre_upgrade_147(self, engine):
+    def _upgrade_147_test_data(self):
         az = 'test_zone'
         host1 = 'compute-host1'
         host2 = 'compute-host2'
@@ -592,6 +619,11 @@ class TestNovaMigrations(BaseMigrationTestCase, CommonTestsMixIn):
              'report_count': 0, 'availability_zone': az},
             ]
 
+        return data
+
+    # migration 147, availability zone transition for services
+    def _pre_upgrade_147(self, engine):
+        data = self._upgrade_147_test_data()
         services = db_utils.get_table(engine, 'services')
         engine.execute(services.insert(), data)
         self._pre_upgrade_147_no_duplicate_aggregate_hosts(engine)
@@ -644,6 +676,19 @@ class TestNovaMigrations(BaseMigrationTestCase, CommonTestsMixIn):
             ).execute().fetchall()]
         self.assertEqual(['compute-host3'], agg1_hosts)
 
+    def _post_downgrade_147(self, engine):
+        # Test that availability_zone is back on the services table.
+        services = db_utils.get_table(engine, 'services')
+        record_list = list(services.select().execute())
+        test_data = self._upgrade_147_test_data()
+
+        availability_zones = [x['availability_zone'] for x in test_data]
+        # Append the default availability_zone
+        availability_zones.append('nova')
+
+        for row in record_list:
+            self.assertIn(row['availability_zone'], availability_zones)
+
     # migration 149, changes IPAddr storage format
     def _pre_upgrade_149(self, engine):
         provider_fw_rules = db_utils.get_table(engine, 'provider_fw_rules')
@@ -652,19 +697,26 @@ class TestNovaMigrations(BaseMigrationTestCase, CommonTestsMixIn):
             'provider_fw_rules':
                 [
                 {'protocol': 'tcp', 'from_port': 1234,
-                 'to_port': 1234, 'cidr': "127.0.0.1/30"},
+                 'to_port': 1234, 'cidr': str(netaddr.IPNetwork(
+                                              "127.0.0.1/30"))},
                 {'protocol': 'tcp', 'from_port': 1234,
-                 'to_port': 1234, 'cidr': "128.128.128.128/16"},
+                 'to_port': 1234, 'cidr': str(netaddr.IPNetwork(
+                                              "128.128.128.128/16"))},
                 {'protocol': 'tcp', 'from_port': 1234,
-                 'to_port': 1234, 'cidr': "128.128.128.128/32"},
+                 'to_port': 1234, 'cidr': str(netaddr.IPNetwork(
+                                              "128.128.128.128/32"))},
                 {'protocol': 'tcp', 'from_port': 1234,
-                 'to_port': 1234, 'cidr': "2001:db8::1:2/48"},
+                 'to_port': 1234, 'cidr': str(netaddr.IPNetwork(
+                                              "2001:db8::1:2/48"))},
                 {'protocol': 'tcp', 'from_port': 1234,
-                 'to_port': 1234, 'cidr': "::1/64"},
+                 'to_port': 1234, 'cidr': str(netaddr.IPNetwork(
+                                              "::1/64"))},
                 {'protocol': 'tcp', 'from_port': 1234, 'to_port': 1234,
-                 'cidr': "0000:0000:0000:2013:0000:6535:abcd:ef11/64"},
+                 'cidr': str(netaddr.IPNetwork(
+                             "0000:0000:0000:2013:0000:6535:abcd:ef11/64"))},
                 {'protocol': 'tcp', 'from_port': 1234, 'to_port': 1234,
-                 'cidr': "0000:1020:0000:2013:0000:6535:abcd:ef11/128"},
+                 'cidr': str(netaddr.IPNetwork(
+                             "0000:1020:0000:2013:0000:6535:abcd:ef11/128"))},
                 ],
             'console_pools':
                 [
@@ -887,19 +939,26 @@ class TestNovaMigrations(BaseMigrationTestCase, CommonTestsMixIn):
             'provider_fw_rules':
                 [
                 {'protocol': 'tcp', 'from_port': 1234,
-                 'to_port': 1234, 'cidr': "127.0.0.1/30"},
+                 'to_port': 1234, 'cidr': str(netaddr.IPNetwork(
+                                              "127.0.0.1/30"))},
                 {'protocol': 'tcp', 'from_port': 1234,
-                 'to_port': 1234, 'cidr': "128.128.128.128/16"},
+                 'to_port': 1234, 'cidr': str(netaddr.IPNetwork(
+                                              "128.128.128.128/16"))},
                 {'protocol': 'tcp', 'from_port': 1234,
-                 'to_port': 1234, 'cidr': "128.128.128.128/32"},
+                 'to_port': 1234, 'cidr': str(netaddr.IPNetwork(
+                                              "128.128.128.128/32"))},
                 {'protocol': 'tcp', 'from_port': 1234,
-                 'to_port': 1234, 'cidr': "2001:db8::1:2/48"},
+                 'to_port': 1234, 'cidr': str(netaddr.IPNetwork(
+                                              "2001:db8::1:2/48"))},
                 {'protocol': 'tcp', 'from_port': 1234,
-                 'to_port': 1234, 'cidr': "::1/64"},
+                 'to_port': 1234, 'cidr': str(netaddr.IPNetwork(
+                                              "::1/64"))},
                 {'protocol': 'tcp', 'from_port': 1234, 'to_port': 1234,
-                 'cidr': "0000:0000:0000:2013:0000:6535:abcd:ef11/64"},
+                 'cidr': str(netaddr.IPNetwork(
+                             "0000:0000:0000:2013:0000:6535:abcd:ef11/64"))},
                 {'protocol': 'tcp', 'from_port': 1234, 'to_port': 1234,
-                 'cidr': "0000:1020:0000:2013:0000:6535:abcd:ef11/128"},
+                 'cidr': str(netaddr.IPNetwork(
+                             "0000:1020:0000:2013:0000:6535:abcd:ef11/128"))},
                 ],
             'console_pools':
                 [
@@ -2351,6 +2410,189 @@ class TestNovaMigrations(BaseMigrationTestCase, CommonTestsMixIn):
                           specs.insert().execute,
                           {'instance_type_id': 35, 'key': 'key1',
                            'deleted': 0})
+
+    # migration 203 - make user quotas key and value
+    def _pre_upgrade_203(self, engine):
+        quota_usages = db_utils.get_table(engine, 'quota_usages')
+        reservations = db_utils.get_table(engine, 'reservations')
+        fake_quota_usages = {'id': 5,
+                             'resource': 'instances',
+                             'in_use': 1,
+                             'reserved': 1}
+        fake_reservations = {'id': 6,
+                             'uuid': 'fake_reservationo_uuid',
+                             'usage_id': 5,
+                             'resource': 'instances',
+                             'delta': 1,
+                             'expire': timeutils.utcnow()}
+        quota_usages.insert().execute(fake_quota_usages)
+        reservations.insert().execute(fake_reservations)
+
+    def _check_203(self, engine, data):
+        project_user_quotas = db_utils.get_table(engine, 'project_user_quotas')
+        fake_quotas = {'id': 4,
+                       'project_id': 'fake_project',
+                       'user_id': 'fake_user',
+                       'resource': 'instances',
+                       'hard_limit': 10}
+        project_user_quotas.insert().execute(fake_quotas)
+        quota_usages = db_utils.get_table(engine, 'quota_usages')
+        reservations = db_utils.get_table(engine, 'reservations')
+        # Get the record
+        quota = project_user_quotas.select().execute().first()
+        quota_usage = quota_usages.select().execute().first()
+        reservation = reservations.select().execute().first()
+
+        self.assertEqual(quota['id'], 4)
+        self.assertEqual(quota['project_id'], 'fake_project')
+        self.assertEqual(quota['user_id'], 'fake_user')
+        self.assertEqual(quota['resource'], 'instances')
+        self.assertEqual(quota['hard_limit'], 10)
+        self.assertEqual(quota_usage['user_id'], None)
+        self.assertEqual(reservation['user_id'], None)
+
+    def _post_downgrade_203(self, engine):
+        try:
+            table_exist = True
+            db_utils.get_table(engine, 'project_user_quotas')
+        except Exception:
+            table_exist = False
+        quota_usages = db_utils.get_table(engine, 'quota_usages')
+        reservations = db_utils.get_table(engine, 'reservations')
+
+        # Get the record
+        quota_usage = quota_usages.select().execute().first()
+        reservation = reservations.select().execute().first()
+
+        self.assertFalse('user_id' in quota_usage)
+        self.assertFalse('user_id' in reservation)
+        self.assertFalse(table_exist)
+
+    def _check_204(self, engine, data):
+        if engine.name != 'sqlite':
+            return
+
+        meta = sqlalchemy.MetaData()
+        meta.bind = engine
+        reservations = sqlalchemy.Table('reservations', meta, autoload=True)
+
+        index_data = [(idx.name, idx.columns.keys())
+                      for idx in reservations.indexes]
+
+        if engine.name == "postgresql":
+            # we can not get correct order of columns in index
+            # definition to postgresql using sqlalchemy. So we sort
+            # columns list before compare
+            # bug http://www.sqlalchemy.org/trac/ticket/2767
+            self.assertIn(
+                ('reservations_uuid_idx', sorted(['uuid'])),
+                ([(idx[0], sorted(idx[1])) for idx in index_data])
+            )
+        else:
+            self.assertIn(('reservations_uuid_idx', ['uuid']), index_data)
+
+    def _pre_upgrade_205(self, engine):
+        fake_instances = [dict(uuid='m205-uuid1', locked=True),
+                          dict(uuid='m205-uuid2', locked=False)]
+        for table_name in ['instances', 'shadow_instances']:
+            table = db_utils.get_table(engine, table_name)
+            engine.execute(table.insert(), fake_instances)
+
+    def _check_205(self, engine, data):
+        for table_name in ['instances', 'shadow_instances']:
+            table = db_utils.get_table(engine, table_name)
+            rows = table.select().\
+                where(table.c.uuid.in_(['m205-uuid1', 'm205-uuid2'])).\
+                order_by(table.c.uuid).execute().fetchall()
+            self.assertEqual(rows[0]['locked_by'], 'admin')
+            self.assertEqual(rows[1]['locked_by'], None)
+
+    def _post_downgrade_205(self, engine):
+        for table_name in ['instances', 'shadow_instances']:
+            table = db_utils.get_table(engine, table_name)
+            rows = table.select().execute().fetchall()
+            self.assertFalse('locked_by' in rows[0])
+
+    def _pre_upgrade_206(self, engine):
+        instances = db_utils.get_table(engine, 'instances')
+        shadow_instances = db_utils.get_table(engine, 'shadow_instances')
+
+        data = [
+            {
+                'id': 650,
+                'deleted': 0,
+            },
+            {
+                'id': 651,
+                'deleted': 2,
+            },
+        ]
+        for item in data:
+            instances.insert().values(item).execute()
+            shadow_instances.insert().values(item).execute()
+        return data
+
+    def _check_206(self, engine, data):
+        self.assertColumnExists(engine, 'instances', 'cleaned')
+        self.assertColumnExists(engine, 'shadow_instances', 'cleaned')
+        self.assertIndexMembers(engine, 'instances',
+                                'instances_host_deleted_cleaned_idx',
+                                ['host', 'deleted', 'cleaned'])
+
+        instances = db_utils.get_table(engine, 'instances')
+        shadow_instances = db_utils.get_table(engine, 'shadow_instances')
+
+        def get_(table, ident):
+            return table.select().\
+                where(table.c.id == ident).\
+                execute().\
+                first()
+
+        for table in (instances, shadow_instances):
+            id_1 = get_(instances, 650)
+            self.assertEqual(0, id_1['deleted'])
+            self.assertEqual(0, id_1['cleaned'])
+
+            id_2 = get_(instances, 651)
+            self.assertEqual(2, id_2['deleted'])
+            self.assertEqual(1, id_2['cleaned'])
+
+    def _post_downgrade_206(self, engine):
+        self.assertColumnNotExists(engine, 'instances', 'cleaned')
+        self.assertColumnNotExists(engine, 'shadow_instances', 'cleaned')
+
+    def _207(self, engine, upgrade=False):
+        uniq_names = ['uniq_cell_name0deleted',
+                      'uniq_cells0name0deleted']
+        if upgrade:
+            uniq_names = uniq_names[::-1]
+        cells = db_utils.get_table(engine, 'cells')
+        values = {'name': 'name',
+                  'deleted': 0,
+                  'transport_url': 'fake_transport_url'}
+        cells.insert().values(values).execute()
+        values['deleted'] = 1
+        cells.insert().values(values).execute()
+        values['deleted'] = 0
+        self.assertRaises(sqlalchemy.exc.IntegrityError,
+                          cells.insert().execute,
+                          values)
+        cells.delete().execute()
+        indexes = dict((i.name, i) for i in cells.indexes)
+        if indexes:
+            check_index_old = indexes.get(uniq_names[0])
+            check_index_new = indexes.get(uniq_names[1])
+            self.assertTrue(bool(check_index_old))
+            self.assertFalse(bool(check_index_new))
+
+    def _pre_upgrade_207(self, engine):
+        self._207(engine)
+
+    def _check_207(self, engine, data):
+        self._207(engine, upgrade=True)
+
+    def _post_downgrade_207(self, engine):
+        self._207(engine)
 
 
 class TestBaremetalMigrations(BaseMigrationTestCase, CommonTestsMixIn):

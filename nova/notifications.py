@@ -30,6 +30,7 @@ from nova.image import glance
 from nova import network
 from nova.network import model as network_model
 from nova.openstack.common import excutils
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log
 from nova.openstack.common.notifier import api as notifier_api
 from nova.openstack.common import timeutils
@@ -38,7 +39,7 @@ from nova import utils
 LOG = log.getLogger(__name__)
 
 notify_opts = [
-    cfg.StrOpt('notify_on_state_change', default=None,
+    cfg.StrOpt('notify_on_state_change',
         help='If set, send compute.instance.update notifications on instance '
              'state changes.  Valid values are None for no notifications, '
              '"vm_state" for notifications on VM state changes, or '

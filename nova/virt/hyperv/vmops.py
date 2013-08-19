@@ -26,16 +26,15 @@ from oslo.config import cfg
 from nova.api.metadata import base as instance_metadata
 from nova import exception
 from nova.openstack.common import excutils
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
 from nova.openstack.common import processutils
 from nova import utils
 from nova.virt import configdrive
 from nova.virt.hyperv import constants
-from nova.virt.hyperv import hostutils
 from nova.virt.hyperv import imagecache
-from nova.virt.hyperv import pathutils
-from nova.virt.hyperv import vhdutils
+from nova.virt.hyperv import utilsfactory
 from nova.virt.hyperv import vmutils
 from nova.virt.hyperv import volumeops
 
@@ -74,10 +73,9 @@ class VMOps(object):
     }
 
     def __init__(self):
-        self._hostutils = hostutils.HostUtils()
-        self._vmutils = vmutils.VMUtils()
-        self._vhdutils = vhdutils.VHDUtils()
-        self._pathutils = pathutils.PathUtils()
+        self._vmutils = utilsfactory.get_vmutils()
+        self._vhdutils = utilsfactory.get_vhdutils()
+        self._pathutils = utilsfactory.get_pathutils()
         self._volumeops = volumeops.VolumeOps()
         self._imagecache = imagecache.ImageCache()
         self._vif_driver = None
