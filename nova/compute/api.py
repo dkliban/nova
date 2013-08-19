@@ -428,10 +428,10 @@ class API(base.Base):
         self.network_api.validate_networks(context, requested_networks)
 
     @staticmethod
-    def _handle_kernel_and_ramdisk(context, kernel_id, ramdisk_id, image):
-        """Choose kernel and ramdisk appropriate for the instance.
+    def _handle_kernel_and_ramdisk_and_cmdline(context, kernel_id, ramdisk_id, cmdline, image):
+        """Choose kernel, ramdisk, and kernel command line appropriate for the instance.
 
-        The kernel and ramdisk can be chosen in one of three ways:
+        The kernel, ramdisk, and command line can be chosen in one of three ways:
 
             1. Passed in with create-instance request.
 
@@ -448,10 +448,14 @@ class API(base.Base):
         if ramdisk_id is None:
             ramdisk_id = image_properties.get('ramdisk_id')
 
+        if cmdline is None:
+            cmdline = image_properties.get('command_line')
+
         # Force to None if using null_kernel
         if kernel_id == str(CONF.null_kernel):
             kernel_id = None
             ramdisk_id = None
+            cmdline = None
 
         # Verify kernel and ramdisk exist (fail-fast)
         if kernel_id is not None:
@@ -464,7 +468,7 @@ class API(base.Base):
                 context, ramdisk_id)
             image_service.show(context, ramdisk_id)
 
-        return kernel_id, ramdisk_id
+        return kernel_id, ramdisk_id, cmdline
 
     @staticmethod
     def _handle_availability_zone(availability_zone):
@@ -598,7 +602,7 @@ class API(base.Base):
 
     def _validate_and_build_base_options(self, context, instance_type,
                                          boot_meta, image_href, image_id,
-                                         kernel_id, ramdisk_id, min_count,
+                                         kernel_id, ramdisk_id, cmdline, min_count,
                                          max_count, display_name,
                                          display_description, key_name,
                                          key_data, security_groups,
@@ -645,9 +649,8 @@ class API(base.Base):
 
         self._check_requested_secgroups(context, security_groups)
         self._check_requested_networks(context, requested_networks)
-
-        kernel_id, ramdisk_id = self._handle_kernel_and_ramdisk(
-                context, kernel_id, ramdisk_id, boot_meta)
+        kernel_id, ramdisk_id, cmdline = self._handle_kernel_and_ramdisk_and_cmdline(
+                context, kernel_id, ramdisk_id, cmdline, boot_meta)
 
         config_drive = self._check_config_drive(config_drive)
 
@@ -667,6 +670,7 @@ class API(base.Base):
             'image_ref': image_href,
             'kernel_id': kernel_id or '',
             'ramdisk_id': ramdisk_id or '',
+            'cmdline': cmdline or '',
             'power_state': power_state.NOSTATE,
             'vm_state': vm_states.BUILDING,
             'config_drive': config_drive,
@@ -772,7 +776,7 @@ class API(base.Base):
         return None
 
     def _create_instance(self, context, instance_type,
-               image_href, kernel_id, ramdisk_id,
+               image_href, kernel_id, ramdisk_id, cmdline,
                min_count, max_count,
                display_name, display_description,
                key_name, key_data, security_groups,
@@ -811,7 +815,7 @@ class API(base.Base):
                                                             availability_zone)
 
         base_options = self._validate_and_build_base_options(context,
-                instance_type, boot_meta, image_href, image_id, kernel_id,
+                instance_type, boot_meta, image_href, image_id, kernel_id, cmdline,
                 ramdisk_id, min_count, max_count, display_name,
                 display_description, key_name, key_data, security_groups,
                 availability_zone, forced_host, user_data, metadata,
@@ -1102,7 +1106,7 @@ class API(base.Base):
 
     @hooks.add_hook("create_instance")
     def create(self, context, instance_type,
-               image_href, kernel_id=None, ramdisk_id=None,
+               image_href, kernel_id=None, ramdisk_id=None, cmdline=None,
                min_count=None, max_count=None,
                display_name=None, display_description=None,
                key_name=None, key_data=None, security_group=None,
@@ -1133,7 +1137,7 @@ class API(base.Base):
 
         return self._create_instance(
                                context, instance_type,
-                               image_href, kernel_id, ramdisk_id,
+                               image_href, kernel_id, ramdisk_id, cmdline,
                                min_count, max_count,
                                display_name, display_description,
                                key_name, key_data, security_group,
@@ -1143,6 +1147,7 @@ class API(base.Base):
                                requested_networks, config_drive,
                                block_device_mapping, auto_disk_config,
                                scheduler_hints=scheduler_hints)
+
 
     def trigger_provider_fw_rules_refresh(self, context):
         """Called when a rule is added/removed from a provider firewall."""
@@ -1960,8 +1965,8 @@ class API(base.Base):
         self._checks_for_create_and_rebuild(context, image_id, image,
                 instance_type, metadata, files_to_inject)
 
-        kernel_id, ramdisk_id = self._handle_kernel_and_ramdisk(
-                context, None, None, image)
+        kernel_id, ramdisk_id, cmdline = self._handle_kernel_and_ramdisk_and_cmdline(
+                context, None, None, None, image)
 
         def _reset_image_metadata():
             """

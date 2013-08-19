@@ -2292,7 +2292,6 @@ class LibvirtDriver(driver.ComputeDriver):
             'ramdisk_id' if a ramdisk is needed for the rescue image and
             'kernel_id' if a kernel is needed for the rescue image.
         """
-
         inst_type = self.virtapi.instance_type_get(
             nova_context.get_admin_context(read_deleted='yes'),
             instance['instance_type_id'])
@@ -2387,6 +2386,9 @@ class LibvirtDriver(driver.ComputeDriver):
                     guest.os_initrd = os.path.join(inst_path, "ramdisk")
             else:
                 guest.os_boot_dev = "hd"
+
+            if instance['cmdline']:
+                guest.os_cmdline = instance['cmdline']
 
         if CONF.libvirt_type != "lxc" and CONF.libvirt_type != "uml":
             guest.acpi = True

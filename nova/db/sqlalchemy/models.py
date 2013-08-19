@@ -209,6 +209,7 @@ class Instance(BASE, NovaBase):
     image_ref = Column(String(255), nullable=True)
     kernel_id = Column(String(255), nullable=True)
     ramdisk_id = Column(String(255), nullable=True)
+    cmdline = Column(String(255), nullable=True)
     hostname = Column(String(255), nullable=True)
 
     launch_index = Column(Integer, nullable=True)

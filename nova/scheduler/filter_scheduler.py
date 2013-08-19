@@ -164,7 +164,6 @@ class FilterScheduler(driver.Scheduler):
         notifier.notify(context, notifier.publisher_id("scheduler"),
                         'scheduler.run_instance.scheduled', notifier.INFO,
                         payload)
-
         # Update the metadata if necessary
         scheduler_hints = filter_properties.get('scheduler_hints') or {}
         group = scheduler_hints.get('group', None)
