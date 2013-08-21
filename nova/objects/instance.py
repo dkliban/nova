@@ -61,6 +61,7 @@ class Instance(base.NovaObject):
         'image_ref': obj_utils.str_or_none,
         'kernel_id': obj_utils.str_or_none,
         'ramdisk_id': obj_utils.str_or_none,
+        'cmdline': obj_utils.str_or_none,
         'hostname': obj_utils.str_or_none,
 
         'launch_index': obj_utils.int_or_none,
