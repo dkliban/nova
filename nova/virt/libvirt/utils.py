@@ -25,6 +25,8 @@ import platform
 from lxml import etree
 from oslo.config import cfg
 
+from nova import exception
+from nova.objects import virt_properties as virt_properties_obj
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common.gettextutils import _LI
 from nova.openstack.common.gettextutils import _LW
@@ -493,7 +495,7 @@ def get_instance_path(instance, forceold=False, relative=False):
     return os.path.join(CONF.instances_path, instance['uuid'])
 
 
-def get_arch(image_meta):
+def get_arch(context, image_meta):
     """Determine the architecture of the guest (or host).
 
     This method determines the CPU architecture that must be supported by
@@ -506,9 +508,12 @@ def get_arch(image_meta):
     :returns: guest (or host) architecture
     """
     if image_meta:
-        arch = image_meta.get('properties', {}).get('architecture')
-        if arch is not None:
-            return arch
+        virt_props = virt_properties_obj.VirtProperties.get_from_metadata(
+                    context, image_meta)
+        if virt_props.obj_attr_is_set('hw_architecture'):
+            arch = virt_props.hw_architecture
+            if arch is not None:
+                return arch
 
     return platform.processor()
 

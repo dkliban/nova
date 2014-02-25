@@ -61,6 +61,7 @@ from nova import objects
 from nova.objects import flavor as flavor_obj
 from nova.objects import instance as instance_obj
 from nova.objects import service as service_obj
+from nova.objects import virt_properties as virt_properties_obj
 from nova.openstack.common import excutils
 from nova.openstack.common import fileutils
 from nova.openstack.common.gettextutils import _
@@ -1196,7 +1197,8 @@ class LibvirtDriver(driver.ComputeDriver):
                         "required.") % ver
                 raise exception.Invalid(msg)
 
-        disk_info = blockinfo.get_info_from_bdm(CONF.libvirt.virt_type, bdm)
+        disk_info = blockinfo.get_info_from_bdm(context,
+                                                CONF.libvirt.virt_type, bdm)
         conf = self.volume_driver_method('connect_volume',
                                          connection_info,
                                          disk_info)
@@ -1311,13 +1313,14 @@ class LibvirtDriver(driver.ComputeDriver):
                     if child.get('dev') == device:
                         return etree.tostring(node)
 
-    def _get_existing_domain_xml(self, instance, network_info,
+    def _get_existing_domain_xml(self, context, instance, network_info,
                                  block_device_info=None):
         try:
             virt_dom = self._lookup_by_name(instance['name'])
             xml = virt_dom.XMLDesc(0)
         except exception.InstanceNotFound:
-            disk_info = blockinfo.get_disk_info(CONF.libvirt.virt_type,
+            disk_info = blockinfo.get_disk_info(context,
+                                            CONF.libvirt.virt_type,
                                                 instance,
                                                 block_device_info)
             xml = self.to_xml(nova_context.get_admin_context(),
@@ -2055,7 +2058,8 @@ class LibvirtDriver(driver.ComputeDriver):
                                                           image_ref,
                                                           instance)
 
-        disk_info = blockinfo.get_disk_info(CONF.libvirt.virt_type,
+        disk_info = blockinfo.get_disk_info(context,
+                                            CONF.libvirt.virt_type,
                                             instance,
                                             block_device_info,
                                             image_meta)
@@ -2127,7 +2131,7 @@ class LibvirtDriver(driver.ComputeDriver):
 
     def resume(self, context, instance, network_info, block_device_info=None):
         """resume the specified instance."""
-        xml = self._get_existing_domain_xml(instance, network_info,
+        xml = self._get_existing_domain_xml(context, instance, network_info,
                                             block_device_info)
         dom = self._create_domain_and_network(context, xml, instance,
                            network_info, block_device_info=block_device_info,
@@ -2170,7 +2174,8 @@ class LibvirtDriver(driver.ComputeDriver):
 
         """
         instance_dir = libvirt_utils.get_instance_path(instance)
-        unrescue_xml = self._get_existing_domain_xml(instance, network_info)
+        unrescue_xml = self._get_existing_domain_xml(context, instance,
+                                                     network_info)
         unrescue_xml_path = os.path.join(instance_dir, 'unrescue.xml')
         libvirt_utils.write_to_file(unrescue_xml_path, unrescue_xml)
 
@@ -2187,7 +2192,8 @@ class LibvirtDriver(driver.ComputeDriver):
             'ramdisk_id': (CONF.libvirt.rescue_ramdisk_id or
                            instance['ramdisk_id']),
         }
-        disk_info = blockinfo.get_disk_info(CONF.libvirt.virt_type,
+        disk_info = blockinfo.get_disk_info(context,
+                                            CONF.libvirt.virt_type,
                                             instance,
                                             None,
                                             image_meta,
@@ -2233,7 +2239,8 @@ class LibvirtDriver(driver.ComputeDriver):
     # for xenapi(tr3buchet)
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, network_info=None, block_device_info=None):
-        disk_info = blockinfo.get_disk_info(CONF.libvirt.virt_type,
+        disk_info = blockinfo.get_disk_info(context,
+                                            CONF.libvirt.virt_type,
                                             instance,
                                             block_device_info,
                                             image_meta)
@@ -3084,7 +3091,7 @@ class LibvirtDriver(driver.ComputeDriver):
 
         return dev
 
-    def get_guest_config(self, instance, network_info, image_meta,
+    def get_guest_config(self, instance, network_info, image_meta, context,
                          disk_info, rescue=None, block_device_info=None):
         """Get config data for parameters.
 
@@ -3209,6 +3216,11 @@ class LibvirtDriver(driver.ComputeDriver):
                         guest.os_cmdline = img_props.get('os_command_line')
             else:
                 guest.os_boot_dev = blockinfo.get_boot_order(disk_info)
+        if image_meta:
+            virt_props = virt_properties_obj.VirtProperties.get_from_metadata(
+                    context, image_meta)
+            if virt_props.obj_attr_is_set('hw_os_command_line'):
+                guest.os_cmdline = virt_props.hw_os_command_line
 
 <<<<<<< HEAD
 <<<<<<< HEAD
@@ -3364,8 +3376,10 @@ class LibvirtDriver(driver.ComputeDriver):
             elif CONF.spice.enabled:
                 video.type = 'qxl'
 
-            if img_meta_prop.get('hw_video_model'):
-                video.type = img_meta_prop.get('hw_video_model')
+            meta_prop = virt_properties_obj.VirtProperties.get_from_metadata(
+                    context, image_meta)
+            if meta_prop.obj_attr_is_set('hw_video_model'):
+                video.type = meta_prop.get('hw_video_model')
                 if (video.type not in VALID_VIDEO_DEVICES):
                     raise exception.InvalidVideoMode(model=video.type)
 
@@ -3383,12 +3397,17 @@ class LibvirtDriver(driver.ComputeDriver):
         # Qemu guest agent only support 'qemu' and 'kvm' hypervisor
         if CONF.libvirt.virt_type in ('qemu', 'kvm'):
             qga_enabled = False
-            # Enable qga only if the 'hw_qemu_guest_agent' is equal to yes
-            hw_qga = img_meta_prop.get('hw_qemu_guest_agent', 'no')
-            if hw_qga.lower() == 'yes':
-                LOG.debug("Qemu guest agent is enabled through image "
-                          "metadata", instance=instance)
-                qga_enabled = True
+            # Enable qga only if the 'hw_qemu_guest_agent' property is set
+            if image_meta:
+                virt_props = \
+                        virt_properties_obj.VirtProperties.get_from_metadata(
+                                context, image_meta)
+                if virt_props.obj_attr_is_set('hw_qemu_guest_agent'):
+                    hw_qga = virt_props.hw_qemu_guest_agent
+                    if hw_qga.lower() == 'yes':
+                        LOG.debug(_("Qemu guest agent is enabled through image"
+                                    " metadata"), instance=instance)
+                        qga_enabled = True
 
             if qga_enabled:
                 qga = vconfig.LibvirtConfigGuestChannel()
@@ -3463,7 +3482,7 @@ class LibvirtDriver(driver.ComputeDriver):
         # need to sanitize the password in the message.
         LOG.debug(logging.mask_password(msg), instance=instance)
         conf = self.get_guest_config(instance, network_info, image_meta,
-                                     disk_info, rescue, block_device_info)
+                context, disk_info, rescue, block_device_info)
         xml = conf.to_xml()
 
         if write_to_disk:
@@ -3627,7 +3646,7 @@ class LibvirtDriver(driver.ComputeDriver):
 
         for vol in block_device_mapping:
             connection_info = vol['connection_info']
-            disk_info = blockinfo.get_info_from_bdm(
+            disk_info = blockinfo.get_info_from_bdm(context,
                 CONF.libvirt.virt_type, vol)
             conf = self.volume_driver_method('connect_volume',
                                              connection_info,
@@ -4605,7 +4624,7 @@ class LibvirtDriver(driver.ComputeDriver):
             block_device_info)
         for vol in block_device_mapping:
             connection_info = vol['connection_info']
-            disk_info = blockinfo.get_info_from_bdm(
+            disk_info = blockinfo.get_info_from_bdm(context,
                 CONF.libvirt.virt_type, vol)
             self.volume_driver_method('connect_volume',
                                       connection_info,
@@ -4722,7 +4741,7 @@ class LibvirtDriver(driver.ComputeDriver):
         if instance["name"] not in dom_list:
             # In case of block migration, destination does not have
             # libvirt.xml
-            disk_info = blockinfo.get_disk_info(
+            disk_info = blockinfo.get_disk_info(context,
                 CONF.libvirt.virt_type, instance, block_device_info)
             xml = self.to_xml(context, instance, network_info, disk_info,
                               block_device_info=block_device_info,
@@ -5092,7 +5111,8 @@ class LibvirtDriver(driver.ComputeDriver):
             size = self._disk_size_from_instance(instance, info)
             self._disk_resize(info, size)
 
-        disk_info = blockinfo.get_disk_info(CONF.libvirt.virt_type,
+        disk_info = blockinfo.get_disk_info(context,
+                                            CONF.libvirt.virt_type,
                                             instance,
                                             block_device_info,
                                             image_meta)
@@ -5138,7 +5158,8 @@ class LibvirtDriver(driver.ComputeDriver):
             self._cleanup_failed_migration(inst_base)
             utils.execute('mv', inst_base_resize, inst_base)
 
-        disk_info = blockinfo.get_disk_info(CONF.libvirt.virt_type,
+        disk_info = blockinfo.get_disk_info(context,
+                                            CONF.libvirt.virt_type,
                                             instance,
                                             block_device_info)
         xml = self.to_xml(context, instance, network_info, disk_info,
@@ -5278,13 +5299,14 @@ class LibvirtDriver(driver.ComputeDriver):
     def need_legacy_block_device_info(self):
         return False
 
-    def default_root_device_name(self, instance, image_meta, root_bdm):
+    def default_root_device_name(self, context, instance, image_meta,
+                                 root_bdm):
 
-        disk_bus = blockinfo.get_disk_bus_for_device_type(
+        disk_bus = blockinfo.get_disk_bus_for_device_type(context,
             CONF.libvirt.virt_type, image_meta, "disk")
-        cdrom_bus = blockinfo.get_disk_bus_for_device_type(
+        cdrom_bus = blockinfo.get_disk_bus_for_device_type(context,
             CONF.libvirt.virt_type, image_meta, "cdrom")
-        root_info = blockinfo.get_root_info(
+        root_info = blockinfo.get_root_info(context,
             CONF.libvirt.virt_type, image_meta, root_bdm, disk_bus,
             cdrom_bus)
         return block_device.prepend_dev(root_info['dev'])

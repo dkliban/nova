@@ -148,7 +148,7 @@ class LibvirtBlockInfoTest(test.TestCase):
         user_context = context.RequestContext(self.user_id, self.project_id)
         instance_ref = db.instance_create(user_context, self.test_instance)
 
-        mapping = blockinfo.get_disk_mapping("kvm", instance_ref,
+        mapping = blockinfo.get_disk_mapping(self.context, "kvm", instance_ref,
                                              "virtio", "ide")
 
         expect = {
@@ -169,7 +169,7 @@ class LibvirtBlockInfoTest(test.TestCase):
             'root_device_name': '/dev/sda'
             }
 
-        mapping = blockinfo.get_disk_mapping("kvm", instance_ref,
+        mapping = blockinfo.get_disk_mapping(self.context, "kvm", instance_ref,
                                              "virtio", "ide",
                                              block_device_info)
 
@@ -188,7 +188,7 @@ class LibvirtBlockInfoTest(test.TestCase):
         user_context = context.RequestContext(self.user_id, self.project_id)
         instance_ref = db.instance_create(user_context, self.test_instance)
 
-        mapping = blockinfo.get_disk_mapping("kvm", instance_ref,
+        mapping = blockinfo.get_disk_mapping(self.context, "kvm", instance_ref,
                                              "virtio", "ide",
                                              rescue=True)
 
@@ -207,7 +207,7 @@ class LibvirtBlockInfoTest(test.TestCase):
         user_context = context.RequestContext(self.user_id, self.project_id)
         instance_ref = db.instance_create(user_context, self.test_instance)
 
-        mapping = blockinfo.get_disk_mapping("lxc", instance_ref,
+        mapping = blockinfo.get_disk_mapping(self.context, "lxc", instance_ref,
                                              "lxc", "lxc",
                                              None)
         expect = {
@@ -225,7 +225,7 @@ class LibvirtBlockInfoTest(test.TestCase):
         instance_ref = db.instance_create(user_context, self.test_instance)
         image_meta = {'disk_format': 'iso'}
 
-        mapping = blockinfo.get_disk_mapping("kvm", instance_ref,
+        mapping = blockinfo.get_disk_mapping(self.context, "kvm", instance_ref,
                                              "virtio", "ide",
                                              None,
                                              image_meta)
@@ -246,7 +246,7 @@ class LibvirtBlockInfoTest(test.TestCase):
         self.test_instance['system_metadata']['instance_type_swap'] = 5
         instance_ref = db.instance_create(user_context, self.test_instance)
 
-        mapping = blockinfo.get_disk_mapping("kvm", instance_ref,
+        mapping = blockinfo.get_disk_mapping(self.context, "kvm", instance_ref,
                                              "virtio", "ide")
 
         expect = {
@@ -267,7 +267,7 @@ class LibvirtBlockInfoTest(test.TestCase):
         user_context = context.RequestContext(self.user_id, self.project_id)
         instance_ref = db.instance_create(user_context, self.test_instance)
 
-        mapping = blockinfo.get_disk_mapping("kvm", instance_ref,
+        mapping = blockinfo.get_disk_mapping(self.context, "kvm", instance_ref,
                                              "virtio", "ide")
 
         expect = {
@@ -289,7 +289,7 @@ class LibvirtBlockInfoTest(test.TestCase):
         user_context = context.RequestContext(self.user_id, self.project_id)
         instance_ref = db.instance_create(user_context, self.test_instance)
 
-        mapping = blockinfo.get_disk_mapping("kvm", instance_ref,
+        mapping = blockinfo.get_disk_mapping(self.context, "kvm", instance_ref,
                                              "virtio", "ide")
 
         expect = {
@@ -311,7 +311,7 @@ class LibvirtBlockInfoTest(test.TestCase):
         user_context = context.RequestContext(self.user_id, self.project_id)
         instance_ref = db.instance_create(user_context, self.test_instance)
 
-        mapping = blockinfo.get_disk_mapping("kvm", instance_ref,
+        mapping = blockinfo.get_disk_mapping(self.context, "kvm", instance_ref,
                                              "virtio", "ide")
 
         expect = {
@@ -340,7 +340,7 @@ class LibvirtBlockInfoTest(test.TestCase):
                  'device_name': '/dev/vdd', 'size': 10},
                 ]
             }
-        mapping = blockinfo.get_disk_mapping("kvm", instance_ref,
+        mapping = blockinfo.get_disk_mapping(self.context, "kvm", instance_ref,
                                              "virtio", "ide",
                                              block_device_info)
 
@@ -367,7 +367,7 @@ class LibvirtBlockInfoTest(test.TestCase):
             'swap': {'device_name': '/dev/vdb',
                      'swap_size': 10},
             }
-        mapping = blockinfo.get_disk_mapping("kvm", instance_ref,
+        mapping = blockinfo.get_disk_mapping(self.context, "kvm", instance_ref,
                                              "virtio", "ide",
                                              block_device_info)
 
@@ -394,7 +394,7 @@ class LibvirtBlockInfoTest(test.TestCase):
                  'delete_on_termination': True},
                 ]
             }
-        mapping = blockinfo.get_disk_mapping("kvm", instance_ref,
+        mapping = blockinfo.get_disk_mapping(self.context, "kvm", instance_ref,
                                              "virtio", "ide",
                                              block_device_info)
 
@@ -420,7 +420,7 @@ class LibvirtBlockInfoTest(test.TestCase):
                  'delete_on_termination': True},
                 ]
             }
-        mapping = blockinfo.get_disk_mapping("kvm", instance_ref,
+        mapping = blockinfo.get_disk_mapping(self.context, "kvm", instance_ref,
                                              "virtio", "ide",
                                              block_device_info)
 
@@ -456,7 +456,7 @@ class LibvirtBlockInfoTest(test.TestCase):
                  'delete_on_termination': True},
                 ]
             }
-        mapping = blockinfo.get_disk_mapping("kvm", instance_ref,
+        mapping = blockinfo.get_disk_mapping(self.context, "kvm", instance_ref,
                                              "virtio", "ide",
                                              block_device_info)
 
@@ -492,7 +492,7 @@ class LibvirtBlockInfoTest(test.TestCase):
                  'delete_on_termination': True},
                 ]
             }
-        mapping = blockinfo.get_disk_mapping("kvm", instance_ref,
+        mapping = blockinfo.get_disk_mapping(self.context, "kvm", instance_ref,
                                              "virtio", "ide",
                                              block_device_info)
 
@@ -539,7 +539,7 @@ class LibvirtBlockInfoTest(test.TestCase):
                         'disk_bus': 'virtio',
                         'delete_on_termination': True}
 
-        blockinfo.get_disk_mapping("kvm", instance_ref,
+        blockinfo.get_disk_mapping(self.context, "kvm", instance_ref,
                                    "virtio", "ide", block_device_info)
 
         self.assertEqual(expected_swap, block_device_info['swap'])
@@ -562,8 +562,8 @@ class LibvirtBlockInfoTest(test.TestCase):
             with mock.patch.object(blockinfo.libvirt_utils,
                                    'get_arch',
                                    return_value=arch):
-                bus = blockinfo.get_disk_bus_for_device_type('kvm',
-                            device_type=dev)
+                bus = blockinfo.get_disk_bus_for_device_type(self.context,
+                            'kvm', device_type=dev)
                 self.assertEqual(res, bus)
 
         expected = (
@@ -574,7 +574,7 @@ class LibvirtBlockInfoTest(test.TestCase):
         for dbus, cbus, dev, res in expected:
             image_meta = {'properties': {'hw_disk_bus': dbus,
                                          'hw_cdrom_bus': cbus}}
-            bus = blockinfo.get_disk_bus_for_device_type('kvm',
+            bus = blockinfo.get_disk_bus_for_device_type(self.context, 'kvm',
                                                      image_meta,
                                                      device_type=dev)
             self.assertEqual(res, bus)
@@ -582,7 +582,7 @@ class LibvirtBlockInfoTest(test.TestCase):
         image_meta = {'properties': {'hw_disk_bus': 'xen'}}
         self.assertRaises(exception.UnsupportedHardware,
                           blockinfo.get_disk_bus_for_device_type,
-                          'kvm',
+                          self.context, 'kvm',
                           image_meta)
 
     def test_success_get_disk_bus_for_disk_dev(self):
@@ -651,13 +651,14 @@ class LibvirtBlockInfoTest(test.TestCase):
 
         for bdm, expected in zip(bdms, expected):
             self.assertEqual(expected,
-                             blockinfo.get_info_from_bdm('kvm', bdm, {}))
+                             blockinfo.get_info_from_bdm(self.context, 'kvm',
+                                 bdm, {}))
 
         # Test that passed bus and type are considered
         bdm = {'device_name': '/dev/vda'}
         expected = {'dev': 'vda', 'type': 'disk', 'bus': 'ide'}
         self.assertEqual(
-            expected, blockinfo.get_info_from_bdm('kvm', bdm, {},
+            expected, blockinfo.get_info_from_bdm(self.context, 'kvm', bdm, {},
                                                   disk_bus='ide',
                                                   dev_type='disk'))
 
@@ -666,8 +667,8 @@ class LibvirtBlockInfoTest(test.TestCase):
         with mock.patch.object(blockinfo,
                                'get_disk_bus_for_device_type',
                                return_value='ide') as get_bus:
-            blockinfo.get_info_from_bdm('kvm', bdm, {})
-            get_bus.assert_called_once_with('kvm', None, 'cdrom')
+            blockinfo.get_info_from_bdm(self.context, 'kvm', bdm, {})
+            get_bus.assert_called_once_with(self.context, 'kvm', None, 'cdrom')
 
         # Test that missing device is defaulted as expected
         bdm = {'disk_bus': 'ide', 'device_type': 'cdrom'}
@@ -677,7 +678,8 @@ class LibvirtBlockInfoTest(test.TestCase):
                                'find_disk_dev_for_disk_bus',
                                return_value='vdd') as find_dev:
             got = blockinfo.get_info_from_bdm(
-                'kvm', bdm, mapping, assigned_devices=['vdb', 'vdc'])
+                self.context, 'kvm', bdm, mapping,
+                assigned_devices=['vdb', 'vdc'])
             find_dev.assert_called_once_with(
                 {'root': {'dev': 'vda'},
                  'vdb': {'dev': 'vdb'},
@@ -709,11 +711,12 @@ class LibvirtBlockInfoTest(test.TestCase):
     @mock.patch('nova.virt.libvirt.blockinfo.get_disk_bus_for_disk_dev',
                 return_value='virtio')
     def test_get_root_info_no_bdm(self, mock_get_bus, mock_find_dev):
-        blockinfo.get_root_info('kvm', None, None, 'virtio', 'ide')
+        blockinfo.get_root_info(self.context, 'kvm', None, None, 'virtio',
+                'ide')
         mock_find_dev.assert_called_once_with({}, 'virtio')
 
-        blockinfo.get_root_info('kvm', None, None, 'virtio', 'ide',
-                                 root_device_name='/dev/vda')
+        blockinfo.get_root_info(self.context, 'kvm', None, None, 'virtio',
+                'ide', root_device_name='/dev/vda')
         mock_get_bus.assert_called_once_with('kvm', '/dev/vda')
 
     @mock.patch('nova.virt.libvirt.blockinfo.get_info_from_bdm')
@@ -722,19 +725,22 @@ class LibvirtBlockInfoTest(test.TestCase):
                     'disk_bus': 'scsi',
                     'device_type': 'disk'}
         # No root_device_name
-        blockinfo.get_root_info('kvm', None, root_bdm, 'virtio', 'ide')
-        mock_get_info.assert_called_once_with('kvm', root_bdm, {}, 'virtio')
+        blockinfo.get_root_info(self.context, 'kvm', None, root_bdm, 'virtio',
+                'ide')
+        mock_get_info.assert_called_once_with(self.context, 'kvm', root_bdm,
+                {}, 'virtio')
         mock_get_info.reset_mock()
         # Both device names
-        blockinfo.get_root_info('kvm', None, root_bdm, 'virtio', 'ide',
-                                root_device_name='sda')
-        mock_get_info.assert_called_once_with('kvm', root_bdm, {}, 'virtio')
+        blockinfo.get_root_info(self.context, 'kvm', None, root_bdm, 'virtio',
+                'ide', root_device_name='sda')
+        mock_get_info.assert_called_once_with(self.context, 'kvm', root_bdm,
+                {}, 'virtio')
         mock_get_info.reset_mock()
         # Missing device names
         del root_bdm['mount_device']
-        blockinfo.get_root_info('kvm', None, root_bdm, 'virtio', 'ide',
-                                root_device_name='sda')
-        mock_get_info.assert_called_once_with('kvm',
+        blockinfo.get_root_info(self.context, 'kvm', None, root_bdm, 'virtio',
+                'ide', root_device_name='sda')
+        mock_get_info.assert_called_once_with(self.context, 'kvm',
                                               {'device_name': 'sda',
                                                'disk_bus': 'scsi',
                                                'device_type': 'disk'},
