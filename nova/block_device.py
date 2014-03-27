@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 Isaku Yamahata <yamahata@valinux co jp>
 # All Rights Reserved.
 #
@@ -88,7 +86,7 @@ class BlockDeviceDict(dict):
         self.update(
             dict((field, None)
                  for field in self._fields - do_not_default))
-        self.update(bdm_dict)
+        self.update(list(bdm_dict.iteritems()))
 
     def _validate(self, bdm_dict):
         """Basic data format validations."""
@@ -203,6 +201,7 @@ class BlockDeviceDict(dict):
             for field in copy_over_fields if field in self)
 
         source_type = self.get('source_type')
+        destination_type = self.get('destination_type')
         no_device = self.get('no_device')
         if source_type == 'blank':
             if self['guest_format'] == 'swap':
@@ -214,11 +213,21 @@ class BlockDeviceDict(dict):
         elif source_type in ('volume', 'snapshot') or no_device:
             legacy_block_device['virtual_name'] = None
         elif source_type == 'image':
-            # NOTE(ndipanov): Image bdms have no meaning in
-            # the legacy format - raise
-            raise exception.InvalidBDMForLegacy()
+            if destination_type != 'volume':
+            # NOTE(ndipanov): Image bdms with local destination
+            # have no meaning in the legacy format - raise
+                raise exception.InvalidBDMForLegacy()
+            legacy_block_device['virtual_name'] = None
 
         return legacy_block_device
+
+    def get_image_mapping(self):
+        drop_fields = (set(['connection_info', 'device_name']) |
+                       self._db_only_fields)
+        mapping_dict = dict(self)
+        for fld in drop_fields:
+            mapping_dict.pop(fld, None)
+        return mapping_dict
 
 
 def is_safe_for_update(block_device_dict):
@@ -249,6 +258,18 @@ def create_image_bdm(image_ref, boot_index=0):
          'destination_type': 'local'})
 
 
+def snapshot_from_bdm(snapshot_id, template):
+    """Create a basic volume snapshot BDM from a given template bdm."""
+
+    copy_from_template = ['disk_bus', 'device_type', 'boot_index']
+    snapshot_dict = {'source_type': 'snapshot',
+                     'destination_type': 'volume',
+                     'snapshot_id': snapshot_id}
+    for key in copy_from_template:
+        snapshot_dict[key] = template.get(key)
+    return BlockDeviceDict(snapshot_dict)
+
+
 def legacy_mapping(block_device_mapping):
     """Transform a list of block devices of an instance back to the
     legacy data format.
@@ -271,6 +292,49 @@ def legacy_mapping(block_device_mapping):
         dev['virtual_name'] = dev['virtual_name'][:-1] + str(i)
 
     return legacy_block_device_mapping
+
+
+def from_legacy_mapping(legacy_block_device_mapping, image_uuid='',
+                        root_device_name=None, no_root=False):
+    """Transform a legacy list of block devices to the new data format."""
+
+    new_bdms = [BlockDeviceDict.from_legacy(legacy_bdm)
+                for legacy_bdm in legacy_block_device_mapping]
+    # NOTE (ndipanov): We will not decide which device is root here - we assume
+    # that it will be supplied later. This is useful for having the root device
+    # as part of the image defined mappings that are already in the v2 format.
+    if no_root:
+        for bdm in new_bdms:
+            bdm['boot_index'] = -1
+        return new_bdms
+
+    image_bdm = None
+    volume_backed = False
+
+    # Try to assign boot_device
+    if not root_device_name and not image_uuid:
+        # NOTE (ndipanov): If there is no root_device, pick the first non
+        #                  blank one.
+        non_blank = [bdm for bdm in new_bdms if bdm['source_type'] != 'blank']
+        if non_blank:
+            non_blank[0]['boot_index'] = 0
+    else:
+        for bdm in new_bdms:
+            if (bdm['source_type'] in ('volume', 'snapshot', 'image') and
+                    root_device_name is not None and
+                    (strip_dev(bdm.get('device_name')) ==
+                     strip_dev(root_device_name))):
+                bdm['boot_index'] = 0
+                volume_backed = True
+            elif not bdm['no_device']:
+                bdm['boot_index'] = -1
+            else:
+                bdm['boot_index'] = None
+
+        if not volume_backed and image_uuid:
+            image_bdm = create_image_bdm(image_uuid, boot_index=0)
+
+    return ([image_bdm] if image_bdm else []) + new_bdms
 
 
 def properties_root_device_name(properties):
@@ -335,6 +399,28 @@ def is_swap_or_ephemeral(device_name):
             (device_name == 'swap' or is_ephemeral(device_name)))
 
 
+def new_format_is_swap(bdm):
+    if (bdm.get('source_type') == 'blank' and
+            bdm.get('destination_type') == 'local' and
+            bdm.get('guest_format') == 'swap'):
+        return True
+    return False
+
+
+def new_format_is_ephemeral(bdm):
+    if (bdm.get('source_type') == 'blank' and not
+            new_format_is_swap(bdm)):
+        return True
+    return False
+
+
+def get_root_bdm(bdms):
+    try:
+        return (bdm for bdm in bdms if bdm.get('boot_index', -1) == 0).next()
+    except StopIteration:
+        return None
+
+
 def mappings_prepend_dev(mappings):
     """Prepend '/dev/' to 'device' entry of swap/ephemeral virtual type."""
     for m in mappings:
@@ -351,6 +437,11 @@ _dev = re.compile('^/dev/')
 def strip_dev(device_name):
     """remove leading '/dev/'."""
     return _dev.sub('', device_name) if device_name else device_name
+
+
+def prepend_dev(device_name):
+    """Make sure there is a leading '/dev/'."""
+    return device_name and '/dev/' + strip_dev(device_name)
 
 
 _pref = re.compile('^((x?v|s)d)')
@@ -381,33 +472,34 @@ def instance_block_mapping(instance, bdms):
     if default_swap_device:
         mappings['swap'] = default_swap_device
     ebs_devices = []
+    blanks = []
 
     # 'ephemeralN', 'swap' and ebs
     for bdm in bdms:
-        if bdm['no_device']:
-            continue
-
         # ebs volume case
-        if (bdm['volume_id'] or bdm['snapshot_id']):
-            ebs_devices.append(bdm['device_name'])
+        if bdm.destination_type == 'volume':
+            ebs_devices.append(bdm.device_name)
             continue
 
-        virtual_name = bdm['virtual_name']
-        if not virtual_name:
-            continue
-
-        if is_swap_or_ephemeral(virtual_name):
-            mappings[virtual_name] = bdm['device_name']
+        if bdm.source_type == 'blank':
+            blanks.append(bdm)
 
     # NOTE(yamahata): I'm not sure how ebs device should be numbered.
     #                 Right now sort by device name for deterministic
     #                 result.
     if ebs_devices:
-        nebs = 0
         ebs_devices.sort()
-        for ebs in ebs_devices:
+        for nebs, ebs in enumerate(ebs_devices):
             mappings['ebs%d' % nebs] = ebs
-            nebs += 1
+
+    swap = [bdm for bdm in blanks if bdm.guest_format == 'swap']
+    if swap:
+        mappings['swap'] = swap.pop().device_name
+
+    ephemerals = [bdm for bdm in blanks if bdm.guest_format != 'swap']
+    if ephemerals:
+        for num, eph in enumerate(ephemerals):
+            mappings['ephemeral%d' % num] = eph.device_name
 
     return mappings
 

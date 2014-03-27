@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 Michael Still and Canonical Inc
 # All Rights Reserved.
 #
@@ -27,7 +25,7 @@ from nova import utils
 from nova.virt import configdrive
 
 
-class ConfigDriveTestCase(test.TestCase):
+class ConfigDriveTestCase(test.NoDBTestCase):
 
     def test_create_configdrive_iso(self):
         imagefile = None

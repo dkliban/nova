@@ -1,5 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
+# Copyright 2013 IBM Corp.
 # Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -21,13 +20,16 @@ import time
 from xml.dom import minidom
 
 from lxml import etree
+import six
 import webob
 
 from nova.api.openstack import xmlutil
 from nova import exception
+from nova.openstack.common import gettextutils
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
+from nova import utils
 from nova import wsgi
 
 
@@ -37,14 +39,6 @@ XMLNS_V11 = 'http://docs.openstack.org/compute/api/v1.1'
 XMLNS_ATOM = 'http://www.w3.org/2005/Atom'
 
 LOG = logging.getLogger(__name__)
-
-# The vendor content types should serialize identically to the non-vendor
-# content types. So to avoid littering the code with both options, we
-# map the vendor to the other when looking up the type
-_CONTENT_TYPE_MAP = {
-    'application/vnd.openstack.compute+json': 'application/json',
-    'application/vnd.openstack.compute+xml': 'application/xml',
-}
 
 SUPPORTED_CONTENT_TYPES = (
     'application/json',
@@ -70,6 +64,11 @@ _ROUTES_METHODS = [
     'update',
 ]
 
+_METHODS_WITH_BODY = [
+    'POST',
+    'PUT',
+]
+
 
 class Request(webob.Request):
     """Add some OpenStack API-specific logic to the base webob.Request."""
@@ -79,8 +78,7 @@ class Request(webob.Request):
         self._extension_data = {'db_items': {}}
 
     def cache_db_items(self, key, items, item_key='id'):
-        """
-        Allow API methods to store objects from a DB query to be
+        """Allow API methods to store objects from a DB query to be
         used by API extensions within the same API request.
 
         An instance of this class only lives for the lifetime of a
@@ -92,8 +90,7 @@ class Request(webob.Request):
             db_items[item[item_key]] = item
 
     def get_db_items(self, key):
-        """
-        Allow an API extension to get previously stored objects within
+        """Allow an API extension to get previously stored objects within
         the same API request.
 
         Note that the object data will be slightly stale.
@@ -101,8 +98,7 @@ class Request(webob.Request):
         return self._extension_data['db_items'][key]
 
     def get_db_item(self, key, item_key):
-        """
-        Allow an API extension to get a previously stored object
+        """Allow an API extension to get a previously stored object
         within the same API request.
 
         Note that the object data will be slightly stale.
@@ -132,6 +128,18 @@ class Request(webob.Request):
 
     def get_db_flavor(self, flavorid):
         return self.get_db_item('flavors', flavorid)
+
+    def cache_db_compute_nodes(self, compute_nodes):
+        self.cache_db_items('compute_nodes', compute_nodes, 'id')
+
+    def cache_db_compute_node(self, compute_node):
+        self.cache_db_items('compute_nodes', [compute_node], 'id')
+
+    def get_db_compute_nodes(self):
+        return self.get_db_items('compute_nodes')
+
+    def get_db_compute_node(self, id):
+        return self.get_db_item('compute_nodes', id)
 
     def best_match_content_type(self):
         """Determine the requested response content-type."""
@@ -176,6 +184,17 @@ class Request(webob.Request):
 
         return content_type
 
+    def best_match_language(self):
+        """Determine the best available language for the request.
+
+        :returns: the best language match or None if the 'Accept-Language'
+                  header was not available in the request.
+        """
+        if not self.accept_language:
+            return None
+        return self.accept_language.best_match(
+                gettextutils.get_available_languages('nova'))
+
 
 class ActionDispatcher(object):
     """Maps method name to local methods through action name."""
@@ -216,9 +235,8 @@ class JSONDeserializer(TextDeserializer):
 class XMLDeserializer(TextDeserializer):
 
     def __init__(self, metadata=None):
-        """
-        :param metadata: information needed to deserialize xml into
-                         a dictionary.
+        """:param metadata: information needed to deserialize xml into
+           a dictionary.
         """
         super(XMLDeserializer, self).__init__()
         self.metadata = metadata or {}
@@ -335,10 +353,9 @@ class JSONDictSerializer(DictSerializer):
 class XMLDictSerializer(DictSerializer):
 
     def __init__(self, metadata=None, xmlns=None):
-        """
-        :param metadata: information needed to deserialize xml into
-                         a dictionary.
-        :param xmlns: XML namespace to include with serialized xml
+        """:param metadata: information needed to deserialize xml into
+           a dictionary.
+           :param xmlns: XML namespace to include with serialized xml
         """
         super(XMLDictSerializer, self).__init__()
         self.metadata = metadata or {}
@@ -598,8 +615,8 @@ class ResponseObject(object):
         response = webob.Response()
         response.status_int = self.code
         for hdr, value in self._headers.items():
-            response.headers[hdr] = str(value)
-        response.headers['Content-Type'] = content_type
+            response.headers[hdr] = utils.utf8(str(value))
+        response.headers['Content-Type'] = utils.utf8(content_type)
         if self.obj is not None:
             response.body = serializer.serialize(self.obj)
 
@@ -705,14 +722,15 @@ class Resource(wsgi.Application):
 
     def __init__(self, controller, action_peek=None, inherits=None,
                  **deserializers):
-        """
-        :param controller: object that implement methods created by routes lib
-        :param action_peek: dictionary of routines for peeking into an action
-                            request body to determine the desired action
-        :param inherits: another resource object that this resource should
-                         inherit extensions from. Any action extensions that
-                         are applied to the parent resource will also apply
-                         to this resource.
+        """:param controller: object that implement methods created by routes
+                              lib
+           :param action_peek: dictionary of routines for peeking into an
+                               action request body to determine the
+                               desired action
+           :param inherits: another resource object that this resource should
+                            inherit extensions from. Any action extensions that
+                            are applied to the parent resource will also apply
+                            to this resource.
         """
 
         self.controller = controller
@@ -797,14 +815,6 @@ class Resource(wsgi.Application):
             LOG.debug(_("Unrecognized Content-Type provided in request"))
             return None, ''
 
-        if not content_type:
-            LOG.debug(_("No Content-Type provided in request"))
-            return None, ''
-
-        if len(request.body) <= 0:
-            LOG.debug(_("Empty body provided in request"))
-            return None, ''
-
         return content_type, request.body
 
     def deserialize(self, meth, content_type, body):
@@ -884,6 +894,9 @@ class Resource(wsgi.Application):
 
         return None
 
+    def _should_have_body(self, request):
+        return request.method in _METHODS_WITH_BODY
+
     @webob.dec.wsgify(RequestClass=Request)
     def __call__(self, request):
         """WSGI method that controls (de)serialization and method dispatch."""
@@ -924,15 +937,22 @@ class Resource(wsgi.Application):
             msg = _("Action: '%(action)s', body: "
                     "%(body)s") % {'action': action,
                                    'body': unicode(body, 'utf-8')}
-            LOG.debug(msg)
-        LOG.debug(_("Calling method %s") % meth)
+            LOG.debug(logging.mask_password(msg))
+        LOG.debug(_("Calling method '%(meth)s' (Content-type='%(ctype)s', "
+                    "Accept='%(accept)s')"),
+                  {'meth': str(meth),
+                   'ctype': content_type,
+                   'accept': accept})
 
         # Now, deserialize the request body...
         try:
-            if content_type:
-                contents = self.deserialize(meth, content_type, body)
-            else:
-                contents = {}
+            contents = {}
+            if self._should_have_body(request):
+                #allow empty body with PUT and POST
+                if request.content_length == 0:
+                    contents = {'body': None}
+                else:
+                    contents = self.deserialize(meth, content_type, body)
         except exception.InvalidContentType:
             msg = _("Unsupported Content-Type")
             return Fault(webob.exc.HTTPBadRequest(explanation=msg))
@@ -992,8 +1012,14 @@ class Resource(wsgi.Application):
                 response = resp_obj.serialize(request, accept,
                                               self.default_serializers)
 
-        if context and hasattr(response, 'headers'):
-            response.headers.add('x-compute-request-id', context.request_id)
+        if hasattr(response, 'headers'):
+            if context:
+                response.headers.add('x-compute-request-id',
+                                     context.request_id)
+
+            for hdr, val in response.headers.items():
+                # Headers must be utf-8 strings
+                response.headers[hdr] = utils.utf8(str(val))
 
         return response
 
@@ -1120,10 +1146,9 @@ class ControllerMetaclass(type):
                                                        cls_dict)
 
 
+@six.add_metaclass(ControllerMetaclass)
 class Controller(object):
     """Default controller."""
-
-    __metaclass__ = ControllerMetaclass
 
     _view_builder_class = None
 
@@ -1180,6 +1205,8 @@ class Fault(webob.exc.HTTPException):
     @webob.dec.wsgify(RequestClass=Request)
     def __call__(self, req):
         """Generate a WSGI response based on the exception passed to ctor."""
+
+        user_locale = req.best_match_language()
         # Replace the body with fault details.
         code = self.wrapped_exc.status_int
         fault_name = self._fault_names.get(code, "computeFault")
@@ -1187,6 +1214,8 @@ class Fault(webob.exc.HTTPException):
         LOG.debug(_("Returning %(code)s to user: %(explanation)s"),
                   {'code': code, 'explanation': explanation})
 
+        explanation = gettextutils.translate(explanation,
+                                                         user_locale)
         fault_data = {
             fault_name: {
                 'code': code,
@@ -1218,14 +1247,10 @@ class Fault(webob.exc.HTTPException):
 
 
 class RateLimitFault(webob.exc.HTTPException):
-    """
-    Rate-limited request response.
-    """
+    """Rate-limited request response."""
 
     def __init__(self, message, details, retry_time):
-        """
-        Initialize new `RateLimitFault` with relevant information.
-        """
+        """Initialize new `RateLimitFault` with relevant information."""
         hdrs = RateLimitFault._retry_after(retry_time)
         self.wrapped_exc = webob.exc.HTTPTooManyRequests(headers=hdrs)
         self.content = {
@@ -1246,12 +1271,21 @@ class RateLimitFault(webob.exc.HTTPException):
 
     @webob.dec.wsgify(RequestClass=Request)
     def __call__(self, request):
+        """Return the wrapped exception with a serialized body conforming
+        to our error format.
         """
-        Return the wrapped exception with a serialized body conforming to our
-        error format.
-        """
+        user_locale = request.best_match_language()
         content_type = request.best_match_content_type()
         metadata = {"attributes": {"overLimit": ["code", "retryAfter"]}}
+
+        self.content['overLimit']['message'] = \
+                gettextutils.translate(
+                        self.content['overLimit']['message'],
+                        user_locale)
+        self.content['overLimit']['details'] = \
+                gettextutils.translate(
+                        self.content['overLimit']['details'],
+                        user_locale)
 
         xml_serializer = XMLDictSerializer(metadata, XMLNS_V11)
         serializer = {

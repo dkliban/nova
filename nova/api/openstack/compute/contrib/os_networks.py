@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 Grid Dynamics
 # Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
@@ -77,7 +75,12 @@ class NetworkController(wsgi.Controller):
         try:
             self.network_api.associate(context, id, host=None, project=None)
         except exception.NetworkNotFound:
-            raise exc.HTTPNotFound(_("Network not found"))
+            msg = _("Network not found")
+            raise exc.HTTPNotFound(explanation=msg)
+        except NotImplementedError:
+            msg = _('Disassociate network is not implemented by the '
+                    'configured Network API')
+            raise exc.HTTPNotImplemented(explanation=msg)
         return exc.HTTPAccepted()
 
     def show(self, req, id):
@@ -87,7 +90,8 @@ class NetworkController(wsgi.Controller):
         try:
             network = self.network_api.get(context, id)
         except exception.NetworkNotFound:
-            raise exc.HTTPNotFound(_("Network not found"))
+            msg = _("Network not found")
+            raise exc.HTTPNotFound(explanation=msg)
         return {'network': network_dict(context, network)}
 
     def delete(self, req, id):
@@ -97,7 +101,8 @@ class NetworkController(wsgi.Controller):
         try:
             self.network_api.delete(context, id)
         except exception.NetworkNotFound:
-            raise exc.HTTPNotFound(_("Network not found"))
+            msg = _("Network not found")
+            raise exc.HTTPNotFound(explanation=msg)
         return exc.HTTPAccepted()
 
     def create(self, req, body):

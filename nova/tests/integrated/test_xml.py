@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 Justin Santa Barbara
 # All Rights Reserved.
 #
@@ -28,6 +26,8 @@ LOG = logging.getLogger(__name__)
 
 class XmlTests(integrated_helpers._IntegratedTestBase):
     """"Some basic XML sanity checks."""
+
+    _api_version = 'v2'
 
     def test_namespace_limits(self):
         headers = {}

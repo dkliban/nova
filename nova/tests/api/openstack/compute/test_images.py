@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -21,9 +19,9 @@ and as a WSGI layer
 """
 
 import copy
-import urlparse
 
 from lxml import etree
+import six.moves.urllib.parse as urlparse
 import webob
 
 from nova.api.openstack.compute import images
@@ -40,9 +38,8 @@ ATOMNS = "{http://www.w3.org/2005/Atom}"
 NOW_API_FORMAT = "2010-10-11T10:30:22Z"
 
 
-class ImagesControllerTest(test.TestCase):
-    """
-    Test of the OpenStack API /images application controller w/Glance.
+class ImagesControllerTest(test.NoDBTestCase):
+    """Test of the OpenStack API /images application controller w/Glance.
     """
 
     def setUp(self):
@@ -275,6 +272,25 @@ class ImagesControllerTest(test.TestCase):
         self.assertThat({'limit': ['2'], 'marker': ['124']},
                         matchers.DictMatches(params))
 
+    def test_get_image_details_with_limit_and_page_size(self):
+        request = fakes.HTTPRequest.blank(
+            '/v2/fake/images/detail?limit=2&page_size=1')
+        response = self.controller.detail(request)
+        response_list = response["images"]
+        response_links = response["images_links"]
+
+        expected = [self.expected_image_123["image"],
+                    self.expected_image_124["image"]]
+
+        self.assertThat(expected, matchers.DictListMatches(response_list))
+
+        href_parts = urlparse.urlparse(response_links[0]['href'])
+        self.assertEqual('/v2/fake/images', href_parts.path)
+        params = urlparse.parse_qs(href_parts.query)
+
+        self.assertThat({'limit': ['2'], 'page_size': ['1'],
+                         'marker': ['124']}, matchers.DictMatches(params))
+
     def _detail_request(self, filters, request):
         context = request.environ['nova.context']
         self.image_service.detail(context, filters=filters).AndReturn([])
@@ -374,7 +390,7 @@ class ImagesControllerTest(test.TestCase):
                           self.controller.delete, request, '300')
 
 
-class ImageXMLSerializationTest(test.TestCase):
+class ImageXMLSerializationTest(test.NoDBTestCase):
 
     TIMESTAMP = "2010-10-11T10:30:22Z"
     SERVER_UUID = 'aa640691-d1a7-4a67-9d3c-d35ee6b3cc74'
@@ -672,7 +688,7 @@ class ImageXMLSerializationTest(test.TestCase):
             self.assertEqual(str(metadata_elem.text).strip(), str(meta_value))
 
         server_root = root.find('{0}server'.format(NS))
-        self.assertEqual(server_root, None)
+        self.assertIsNone(server_root)
 
     def test_show_with_min_ram(self):
         serializer = images.ImageTemplate()

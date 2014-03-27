@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
@@ -14,40 +12,41 @@
 
 import mox
 
-from nova.compute import flavors
 from nova.compute import power_state
+from nova.compute import utils as compute_utils
 from nova.conductor.tasks import live_migrate
 from nova import db
 from nova import exception
+from nova.objects import instance as instance_obj
+from nova.scheduler import utils as scheduler_utils
 from nova import test
+from nova.tests import fake_instance
 
 
-class LiveMigrationTaskTestCase(test.TestCase):
+class LiveMigrationTaskTestCase(test.NoDBTestCase):
     def setUp(self):
         super(LiveMigrationTaskTestCase, self).setUp()
         self.context = "context"
         self.instance_host = "host"
         self.instance_uuid = "uuid"
         self.instance_image = "image_ref"
-        self.instance = {
-            "host": self.instance_host,
-            "uuid": self.instance_uuid,
-            "power_state": power_state.RUNNING,
-            "memory_mb": 512,
-            "image_ref": self.instance_image}
+        db_instance = fake_instance.fake_db_instance(
+                host=self.instance_host,
+                uuid=self.instance_uuid,
+                power_state=power_state.RUNNING,
+                memory_mb=512,
+                image_ref=self.instance_image)
+        self.instance = instance_obj.Instance._from_db_object(
+                self.context, instance_obj.Instance(), db_instance)
         self.destination = "destination"
         self.block_migration = "bm"
         self.disk_over_commit = "doc"
-        self.select_hosts_callback = self._select_hosts_callback
         self._generate_task()
 
     def _generate_task(self):
         self.task = live_migrate.LiveMigrationTask(self.context,
             self.instance, self.destination, self.block_migration,
-            self.disk_over_commit, self.select_hosts_callback)
-
-    def _select_hosts_callback(self, *args):
-        return ["host1"]
+            self.disk_over_commit)
 
     def test_execute_with_destination(self):
         self.mox.StubOutWithMock(self.task, '_check_host_is_up')
@@ -69,7 +68,7 @@ class LiveMigrationTaskTestCase(test.TestCase):
     def test_execute_without_destination(self):
         self.destination = None
         self._generate_task()
-        self.assertEqual(None, self.task.destination)
+        self.assertIsNone(self.task.destination)
 
         self.mox.StubOutWithMock(self.task, '_check_host_is_up')
         self.mox.StubOutWithMock(self.task, '_find_destination')
@@ -230,15 +229,22 @@ class LiveMigrationTaskTestCase(test.TestCase):
                           self.task._check_requested_destination)
 
     def test_find_destination_works(self):
-        self.mox.StubOutWithMock(self.task.image_service, 'show')
-        self.mox.StubOutWithMock(flavors, 'extract_flavor')
+        self.mox.StubOutWithMock(compute_utils, 'get_image_metadata')
+        self.mox.StubOutWithMock(scheduler_utils, 'build_request_spec')
+        self.mox.StubOutWithMock(self.task.scheduler_rpcapi,
+                                 'select_destinations')
         self.mox.StubOutWithMock(self.task,
                 '_check_compatible_with_source_hypervisor')
         self.mox.StubOutWithMock(self.task, '_call_livem_checks_on_host')
 
-        self.task.image_service.show(self.context,
-                                     self.instance_image).AndReturn("image")
-        flavors.extract_flavor(self.instance).AndReturn("inst_type")
+        compute_utils.get_image_metadata(self.context,
+                self.task.image_service, self.instance_image,
+                self.instance).AndReturn("image")
+        scheduler_utils.build_request_spec(self.context, mox.IgnoreArg(),
+                                           mox.IgnoreArg()).AndReturn({})
+        self.task.scheduler_rpcapi.select_destinations(self.context,
+                mox.IgnoreArg(), mox.IgnoreArg()).AndReturn(
+                        [{'host': 'host1'}])
         self.task._check_compatible_with_source_hypervisor("host1")
         self.task._call_livem_checks_on_host("host1")
 
@@ -248,20 +254,18 @@ class LiveMigrationTaskTestCase(test.TestCase):
     def test_find_destination_no_image_works(self):
         self.instance['image_ref'] = ''
 
-        self.mox.StubOutWithMock(flavors, 'extract_flavor')
-        self.mox.StubOutWithMock(self.task, 'select_hosts_callback')
+        self.mox.StubOutWithMock(scheduler_utils, 'build_request_spec')
+        self.mox.StubOutWithMock(self.task.scheduler_rpcapi,
+                                 'select_destinations')
         self.mox.StubOutWithMock(self.task,
                 '_check_compatible_with_source_hypervisor')
         self.mox.StubOutWithMock(self.task, '_call_livem_checks_on_host')
 
-        flavors.extract_flavor(self.instance).AndReturn("inst_type")
-        # request_spec with no image set
-        request_spec = {'instance_properties': self.instance,
-                        'instance_type': "inst_type",
-                        'instance_uuids': [self.instance['uuid']]}
-        self.task.select_hosts_callback(self.context,
-            request_spec, mox.IgnoreArg()).AndReturn(["host1"])
-
+        scheduler_utils.build_request_spec(self.context, None,
+                                           mox.IgnoreArg()).AndReturn({})
+        self.task.scheduler_rpcapi.select_destinations(self.context,
+                mox.IgnoreArg(), mox.IgnoreArg()).AndReturn(
+                        [{'host': 'host1'}])
         self.task._check_compatible_with_source_hypervisor("host1")
         self.task._call_livem_checks_on_host("host1")
 
@@ -269,23 +273,33 @@ class LiveMigrationTaskTestCase(test.TestCase):
         self.assertEqual("host1", self.task._find_destination())
 
     def _test_find_destination_retry_hypervisor_raises(self, error):
-        self.mox.StubOutWithMock(self.task.image_service, 'show')
-        self.mox.StubOutWithMock(flavors, 'extract_flavor')
+        self.mox.StubOutWithMock(compute_utils, 'get_image_metadata')
+        self.mox.StubOutWithMock(scheduler_utils, 'build_request_spec')
+        self.mox.StubOutWithMock(self.task.scheduler_rpcapi,
+                                 'select_destinations')
         self.mox.StubOutWithMock(self.task,
                 '_check_compatible_with_source_hypervisor')
         self.mox.StubOutWithMock(self.task, '_call_livem_checks_on_host')
 
-        self.task.image_service.show(self.context,
-                                     self.instance_image).AndReturn("image")
-        flavors.extract_flavor(self.instance).AndReturn("inst_type")
+        compute_utils.get_image_metadata(self.context,
+                self.task.image_service, self.instance_image,
+                self.instance).AndReturn("image")
+        scheduler_utils.build_request_spec(self.context, mox.IgnoreArg(),
+                                           mox.IgnoreArg()).AndReturn({})
+        self.task.scheduler_rpcapi.select_destinations(self.context,
+                mox.IgnoreArg(), mox.IgnoreArg()).AndReturn(
+                        [{'host': 'host1'}])
         self.task._check_compatible_with_source_hypervisor("host1")\
                 .AndRaise(error)
 
-        self.task._check_compatible_with_source_hypervisor("host1")
-        self.task._call_livem_checks_on_host("host1")
+        self.task.scheduler_rpcapi.select_destinations(self.context,
+                mox.IgnoreArg(), mox.IgnoreArg()).AndReturn(
+                        [{'host': 'host2'}])
+        self.task._check_compatible_with_source_hypervisor("host2")
+        self.task._call_livem_checks_on_host("host2")
 
         self.mox.ReplayAll()
-        self.assertEqual("host1", self.task._find_destination())
+        self.assertEqual("host2", self.task._find_destination())
 
     def test_find_destination_retry_with_old_hypervisor(self):
         self._test_find_destination_retry_hypervisor_raises(
@@ -296,38 +310,72 @@ class LiveMigrationTaskTestCase(test.TestCase):
                 exception.InvalidHypervisorType)
 
     def test_find_destination_retry_with_invalid_livem_checks(self):
-        self.mox.StubOutWithMock(self.task.image_service, 'show')
-        self.mox.StubOutWithMock(flavors, 'extract_flavor')
+        self.flags(migrate_max_retries=1)
+        self.mox.StubOutWithMock(compute_utils, 'get_image_metadata')
+        self.mox.StubOutWithMock(scheduler_utils, 'build_request_spec')
+        self.mox.StubOutWithMock(self.task.scheduler_rpcapi,
+                                 'select_destinations')
         self.mox.StubOutWithMock(self.task,
                 '_check_compatible_with_source_hypervisor')
         self.mox.StubOutWithMock(self.task, '_call_livem_checks_on_host')
 
-        self.task.image_service.show(self.context,
-                                     self.instance_image).AndReturn("image")
-        flavors.extract_flavor(self.instance).AndReturn("inst_type")
+        compute_utils.get_image_metadata(self.context,
+                self.task.image_service, self.instance_image,
+                self.instance).AndReturn("image")
+        scheduler_utils.build_request_spec(self.context, mox.IgnoreArg(),
+                                           mox.IgnoreArg()).AndReturn({})
+        self.task.scheduler_rpcapi.select_destinations(self.context,
+                mox.IgnoreArg(), mox.IgnoreArg()).AndReturn(
+                        [{'host': 'host1'}])
         self.task._check_compatible_with_source_hypervisor("host1")
         self.task._call_livem_checks_on_host("host1")\
                 .AndRaise(exception.Invalid)
 
-        self.task._check_compatible_with_source_hypervisor("host1")
-        self.task._call_livem_checks_on_host("host1")
+        self.task.scheduler_rpcapi.select_destinations(self.context,
+                mox.IgnoreArg(), mox.IgnoreArg()).AndReturn(
+                        [{'host': 'host2'}])
+        self.task._check_compatible_with_source_hypervisor("host2")
+        self.task._call_livem_checks_on_host("host2")
 
         self.mox.ReplayAll()
-        self.assertEqual("host1", self.task._find_destination())
+        self.assertEqual("host2", self.task._find_destination())
 
     def test_find_destination_retry_exceeds_max(self):
-        self.flags(scheduler_max_attempts=1)
-        self.mox.StubOutWithMock(self.task.image_service, 'show')
-        self.mox.StubOutWithMock(flavors, 'extract_flavor')
+        self.flags(migrate_max_retries=0)
+        self.mox.StubOutWithMock(compute_utils, 'get_image_metadata')
+        self.mox.StubOutWithMock(scheduler_utils, 'build_request_spec')
+        self.mox.StubOutWithMock(self.task.scheduler_rpcapi,
+                                 'select_destinations')
         self.mox.StubOutWithMock(self.task,
                 '_check_compatible_with_source_hypervisor')
-        self.mox.StubOutWithMock(self.task, '_call_livem_checks_on_host')
 
-        self.task.image_service.show(self.context,
-                                     self.instance_image).AndReturn("image")
-        flavors.extract_flavor(self.instance).AndReturn("inst_type")
+        compute_utils.get_image_metadata(self.context,
+                self.task.image_service, self.instance_image,
+                self.instance).AndReturn("image")
+        scheduler_utils.build_request_spec(self.context, mox.IgnoreArg(),
+                                           mox.IgnoreArg()).AndReturn({})
+        self.task.scheduler_rpcapi.select_destinations(self.context,
+                mox.IgnoreArg(), mox.IgnoreArg()).AndReturn(
+                        [{'host': 'host1'}])
         self.task._check_compatible_with_source_hypervisor("host1")\
                 .AndRaise(exception.DestinationHypervisorTooOld)
+
+        self.mox.ReplayAll()
+        self.assertRaises(exception.NoValidHost, self.task._find_destination)
+
+    def test_find_destination_when_runs_out_of_hosts(self):
+        self.mox.StubOutWithMock(compute_utils, 'get_image_metadata')
+        self.mox.StubOutWithMock(scheduler_utils, 'build_request_spec')
+        self.mox.StubOutWithMock(self.task.scheduler_rpcapi,
+                                 'select_destinations')
+        compute_utils.get_image_metadata(self.context,
+                self.task.image_service, self.instance_image,
+                self.instance).AndReturn("image")
+        scheduler_utils.build_request_spec(self.context, mox.IgnoreArg(),
+                                           mox.IgnoreArg()).AndReturn({})
+        self.task.scheduler_rpcapi.select_destinations(self.context,
+                mox.IgnoreArg(), mox.IgnoreArg()).AndRaise(
+                        exception.NoValidHost(reason=""))
 
         self.mox.ReplayAll()
         self.assertRaises(exception.NoValidHost, self.task._find_destination)

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -26,6 +24,8 @@ import xml.dom.minidom as minidom
 
 from nova.api.openstack import common
 from nova.api.openstack import xmlutil
+from nova.compute import task_states
+from nova.compute import vm_states
 from nova import exception
 from nova import test
 from nova.tests import utils
@@ -36,10 +36,9 @@ ATOMNS = "{http://www.w3.org/2005/Atom}"
 
 
 class LimiterTest(test.TestCase):
-    """
-    Unit tests for the `nova.api.openstack.common.limited` method which takes
-    in a list of items and, depending on the 'offset' and 'limit' GET params,
-    returns a subset or complete set of the given items.
+    """Unit tests for the `nova.api.openstack.common.limited` method which
+    takes in a list of items and, depending on the 'offset' and 'limit' GET
+    params, returns a subset or complete set of the given items.
     """
 
     def setUp(self):
@@ -160,8 +159,7 @@ class LimiterTest(test.TestCase):
 
 
 class PaginationParamsTest(test.TestCase):
-    """
-    Unit tests for the `nova.api.openstack.common.get_pagination_params`
+    """Unit tests for the `nova.api.openstack.common.get_pagination_params`
     method which takes in a request object and returns 'marker' and 'limit'
     GET params.
     """
@@ -195,6 +193,24 @@ class PaginationParamsTest(test.TestCase):
         req = webob.Request.blank('/?limit=20&marker=%s' % marker)
         self.assertEqual(common.get_pagination_params(req),
                          {'marker': marker, 'limit': 20})
+
+    def test_valid_page_size(self):
+        # Test valid page_size param.
+        req = webob.Request.blank('/?page_size=10')
+        self.assertEqual(common.get_pagination_params(req),
+                         {'page_size': 10})
+
+    def test_invalid_page_size(self):
+        # Test invalid page_size param.
+        req = webob.Request.blank('/?page_size=-2')
+        self.assertRaises(
+            webob.exc.HTTPBadRequest, common.get_pagination_params, req)
+
+    def test_valid_limit_and_page_size(self):
+        # Test valid limit and page_size parameters.
+        req = webob.Request.blank('/?limit=20&page_size=5')
+        self.assertEqual(common.get_pagination_params(req),
+                         {'page_size': 5, 'limit': 20})
 
 
 class MiscFunctionsTest(test.TestCase):
@@ -300,15 +316,15 @@ class MiscFunctionsTest(test.TestCase):
         ctxt = utils.get_test_admin_context()
         metadata1 = {"key": "value"}
         actual = common.check_img_metadata_properties_quota(ctxt, metadata1)
-        self.assertEqual(actual, None)
+        self.assertIsNone(actual)
 
         metadata2 = {"key": "v" * 260}
         actual = common.check_img_metadata_properties_quota(ctxt, metadata2)
-        self.assertEqual(actual, None)
+        self.assertIsNone(actual)
 
         metadata3 = {"key": ""}
         actual = common.check_img_metadata_properties_quota(ctxt, metadata3)
-        self.assertEqual(actual, None)
+        self.assertIsNone(actual)
 
     def test_check_img_metadata_properties_quota_inv_metadata(self):
         ctxt = utils.get_test_admin_context()
@@ -324,6 +340,40 @@ class MiscFunctionsTest(test.TestCase):
         self.assertRaises(webob.exc.HTTPBadRequest,
                 common.check_img_metadata_properties_quota, ctxt, metadata3)
 
+        metadata4 = None
+        self.assertIsNone(common.check_img_metadata_properties_quota(ctxt,
+                                                        metadata4))
+        metadata5 = {}
+        self.assertIsNone(common.check_img_metadata_properties_quota(ctxt,
+                                                        metadata5))
+
+    def test_status_from_state(self):
+        for vm_state in (vm_states.ACTIVE, vm_states.STOPPED):
+            for task_state in (task_states.RESIZE_PREP,
+                               task_states.RESIZE_MIGRATING,
+                               task_states.RESIZE_MIGRATED,
+                               task_states.RESIZE_FINISH):
+                actual = common.status_from_state(vm_state, task_state)
+                expected = 'RESIZE'
+                self.assertEqual(expected, actual)
+
+    def test_task_and_vm_state_from_status(self):
+        fixture1 = 'reboot'
+        actual = common.task_and_vm_state_from_status(fixture1)
+        expected = [vm_states.ACTIVE], [task_states.REBOOT_PENDING,
+                                        task_states.REBOOT_STARTED,
+                                        task_states.REBOOTING]
+        self.assertEqual(expected, actual)
+
+        fixture2 = 'resize'
+        actual = common.task_and_vm_state_from_status(fixture2)
+        expected = ([vm_states.ACTIVE, vm_states.STOPPED],
+                    [task_states.RESIZE_FINISH,
+                     task_states.RESIZE_MIGRATED,
+                     task_states.RESIZE_MIGRATING,
+                     task_states.RESIZE_PREP])
+        self.assertEqual(expected, actual)
+
 
 class MetadataXMLDeserializationTest(test.TestCase):
 
@@ -337,14 +387,14 @@ class MetadataXMLDeserializationTest(test.TestCase):
         </metadata>"""
         output = self.deserializer.deserialize(request_body, 'create')
         expected = {"body": {"metadata": {"123": "asdf", "567": "jkl;"}}}
-        self.assertEquals(output, expected)
+        self.assertEqual(output, expected)
 
     def test_create_empty(self):
         request_body = """
         <metadata xmlns="http://docs.openstack.org/compute/api/v1.1"/>"""
         output = self.deserializer.deserialize(request_body, 'create')
         expected = {"body": {"metadata": {}}}
-        self.assertEquals(output, expected)
+        self.assertEqual(output, expected)
 
     def test_update_all(self):
         request_body = """
@@ -354,7 +404,7 @@ class MetadataXMLDeserializationTest(test.TestCase):
         </metadata>"""
         output = self.deserializer.deserialize(request_body, 'update_all')
         expected = {"body": {"metadata": {"123": "asdf", "567": "jkl;"}}}
-        self.assertEquals(output, expected)
+        self.assertEqual(output, expected)
 
     def test_update(self):
         request_body = """
@@ -362,7 +412,7 @@ class MetadataXMLDeserializationTest(test.TestCase):
               key='123'>asdf</meta>"""
         output = self.deserializer.deserialize(request_body, 'update')
         expected = {"body": {"meta": {"123": "asdf"}}}
-        self.assertEquals(output, expected)
+        self.assertEqual(output, expected)
 
 
 class MetadataXMLSerializationTest(test.TestCase):

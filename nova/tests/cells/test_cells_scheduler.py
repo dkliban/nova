@@ -19,6 +19,7 @@ import time
 
 from oslo.config import cfg
 
+from nova import block_device
 from nova.cells import filters
 from nova.cells import weights
 from nova.compute import vm_states
@@ -95,7 +96,10 @@ class CellsSchedulerTestCase(test.TestCase):
         inst_type = db.flavor_get(self.ctxt, 1)
         image = {'properties': {}}
         instance_uuids = self.instance_uuids
-        instance_props = {'name': 'instance-00000001',
+        instance_props = {'id': 'removed',
+                          'security_groups': 'removed',
+                          'info_cache': 'removed',
+                          'name': 'instance-00000001',
                           'hostname': 'meow',
                           'display_name': 'moo',
                           'image_ref': 'fake_image_ref',
@@ -106,6 +110,8 @@ class CellsSchedulerTestCase(test.TestCase):
                           'project_id': self.ctxt.project_id}
 
         call_info = {'uuids': []}
+        block_device_mapping = [block_device.create_image_bdm(
+            'fake_image_ref')]
 
         def _fake_instance_update_at_top(_ctxt, instance):
             call_info['uuids'].append(instance['uuid'])
@@ -114,7 +120,8 @@ class CellsSchedulerTestCase(test.TestCase):
                        _fake_instance_update_at_top)
 
         self.scheduler._create_instances_here(self.ctxt, instance_uuids,
-                instance_props, inst_type, image, ['default'], [])
+                instance_props, inst_type, image,
+                ['default'], block_device_mapping)
         self.assertEqual(instance_uuids, call_info['uuids'])
 
         for instance_uuid in instance_uuids:
@@ -415,6 +422,23 @@ class CellsSchedulerTestCase(test.TestCase):
         self.assertEqual(self.instance_uuids, call_info['errored_uuids1'])
         self.assertEqual(self.instance_uuids, call_info['errored_uuids2'])
 
+    def test_filter_schedule_skipping(self):
+        # if a filter handles scheduling, short circuit
+
+        def _grab(filter_properties):
+            return None
+
+        self.stubs.Set(self.scheduler, '_grab_target_cells', _grab)
+
+        def _test(self, *args):
+            raise test.TestingException("shouldn't be called")
+
+        try:
+            self.scheduler._schedule_build_to_cells(None, None, None, _test,
+                                                    None)
+        except test.TestingException:
+            self.fail("Scheduling did not properly short circuit")
+
     def test_cells_filter_args_correct(self):
         # Re-init our fakes with some filters.
         our_path = 'nova.tests.cells.test_cells_scheduler'
@@ -481,7 +505,9 @@ class CellsSchedulerTestCase(test.TestCase):
                                'scheduler': self.scheduler,
                                'routing_path': self.my_cell_state.name,
                                'host_sched_kwargs': host_sched_kwargs,
-                               'request_spec': self.request_spec}
+                               'request_spec': self.request_spec,
+                               'cell_scheduler_method':
+                                   'schedule_run_instance'}
         self.assertEqual(expected_filt_props, call_info['filt_props'])
         self.assertEqual([FakeFilterClass1, FakeFilterClass2],
                          call_info['filt_classes'])
@@ -586,7 +612,9 @@ class CellsSchedulerTestCase(test.TestCase):
                                'scheduler': self.scheduler,
                                'routing_path': self.my_cell_state.name,
                                'host_sched_kwargs': host_sched_kwargs,
-                               'request_spec': self.request_spec}
+                               'request_spec': self.request_spec,
+                               'cell_scheduler_method':
+                                   'schedule_run_instance'}
         self.assertEqual(expected_filt_props, call_info['weight_props'])
         self.assertEqual([FakeWeightClass1, FakeWeightClass2],
                          call_info['weight_classes'])

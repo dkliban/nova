@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-#
 # Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -20,7 +18,6 @@ import datetime
 from nova.api.openstack import compute
 from nova import db
 from nova.openstack.common import jsonutils
-import nova.openstack.common.rpc
 from nova import test
 from nova.tests.api.openstack import fakes
 from nova.tests import fake_instance
@@ -47,7 +44,7 @@ class DiskConfigTestCase(test.TestCase):
             osapi_compute_extension=[
                 'nova.api.openstack.compute.contrib.select_extensions'],
             osapi_compute_ext_list=['Disk_config'])
-        nova.tests.image.fake.stub_out_image_service(self.stubs)
+        self._setup_fake_image_service()
 
         fakes.stub_out_nw_api(self.stubs)
 
@@ -67,7 +64,8 @@ class DiskConfigTestCase(test.TestCase):
 
         self.stubs.Set(db, 'instance_get', fake_instance_get)
 
-        def fake_instance_get_by_uuid(context, uuid, columns_to_join=None):
+        def fake_instance_get_by_uuid(context, uuid,
+                                      columns_to_join=None, use_slave=False):
             for instance in FAKE_INSTANCES:
                 if uuid == instance['uuid']:
                     return instance
@@ -123,12 +121,30 @@ class DiskConfigTestCase(test.TestCase):
 
         self.app = compute.APIRouter(init_only=('servers', 'images'))
 
+    def _setup_fake_image_service(self):
+        self.image_service = nova.tests.image.fake.stub_out_image_service(
+                self.stubs)
+        timestamp = datetime.datetime(2011, 1, 1, 1, 2, 3)
+        image = {'id': '88580842-f50a-11e2-8d3a-f23c91aec05e',
+                 'name': 'fakeimage7',
+                 'created_at': timestamp,
+                 'updated_at': timestamp,
+                 'deleted_at': None,
+                 'deleted': False,
+                 'status': 'active',
+                 'is_public': False,
+                 'container_format': 'ova',
+                 'disk_format': 'vhd',
+                 'size': '74185822',
+                 'properties': {'auto_disk_config': 'Disabled'}}
+        self.image_service.create(None, image)
+
     def tearDown(self):
         super(DiskConfigTestCase, self).tearDown()
         nova.tests.image.fake.FakeImageService_reset()
 
     def assertDiskConfig(self, dict_, value):
-        self.assert_(API_DISK_CONFIG in dict_)
+        self.assertIn(API_DISK_CONFIG, dict_)
         self.assertEqual(dict_[API_DISK_CONFIG], value)
 
     def test_show_server(self):
@@ -241,6 +257,52 @@ class DiskConfigTestCase(test.TestCase):
         res = req.get_response(self.app)
         server_dict = jsonutils.loads(res.body)['server']
         self.assertDiskConfig(server_dict, 'AUTO')
+
+    def test_create_server_detect_from_image_disabled_goes_to_manual(self):
+        req = fakes.HTTPRequest.blank('/fake/servers')
+        req.method = 'POST'
+        req.content_type = 'application/json'
+        body = {'server': {
+                  'name': 'server_test',
+                  'imageRef': '88580842-f50a-11e2-8d3a-f23c91aec05e',
+                  'flavorRef': '1',
+               }}
+
+        req.body = jsonutils.dumps(body)
+        res = req.get_response(self.app)
+        server_dict = jsonutils.loads(res.body)['server']
+        self.assertDiskConfig(server_dict, 'MANUAL')
+
+    def test_create_server_errors_when_disabled_and_auto(self):
+        req = fakes.HTTPRequest.blank('/fake/servers')
+        req.method = 'POST'
+        req.content_type = 'application/json'
+        body = {'server': {
+                  'name': 'server_test',
+                  'imageRef': '88580842-f50a-11e2-8d3a-f23c91aec05e',
+                  'flavorRef': '1',
+                  API_DISK_CONFIG: 'AUTO'
+               }}
+
+        req.body = jsonutils.dumps(body)
+        res = req.get_response(self.app)
+        self.assertEqual(res.status_int, 400)
+
+    def test_create_server_when_disabled_and_manual(self):
+        req = fakes.HTTPRequest.blank('/fake/servers')
+        req.method = 'POST'
+        req.content_type = 'application/json'
+        body = {'server': {
+                  'name': 'server_test',
+                  'imageRef': '88580842-f50a-11e2-8d3a-f23c91aec05e',
+                  'flavorRef': '1',
+                  API_DISK_CONFIG: 'MANUAL'
+               }}
+
+        req.body = jsonutils.dumps(body)
+        res = req.get_response(self.app)
+        server_dict = jsonutils.loads(res.body)['server']
+        self.assertDiskConfig(server_dict, 'MANUAL')
 
     def test_update_server_invalid_disk_config(self):
         # Return BadRequest if user passes an invalid diskConfig value.

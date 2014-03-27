@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 Justin Santa Barbara
 # Copyright 2012 OpenStack Foundation
 # All Rights Reserved.
@@ -161,9 +159,13 @@ class _FakeImageService(object):
         """Return list of detailed image information."""
         return copy.deepcopy(self.images.values())
 
-    def download(self, context, image_id, data):
+    def download(self, context, image_id, dst_path=None, data=None):
         self.show(context, image_id)
-        data.write(self._imagedata.get(image_id, ''))
+        if data:
+            data.write(self._imagedata.get(image_id, ''))
+        elif dst_path:
+            with open(dst_path, 'wb') as data:
+                data.write(self._imagedata.get(image_id, ''))
 
     def show(self, context, image_id):
         """Get data about specified image.
@@ -187,7 +189,7 @@ class _FakeImageService(object):
         image_id = str(metadata.get('id', uuid.uuid4()))
         metadata['id'] = image_id
         if image_id in self.images:
-            raise exception.Duplicate()
+            raise exception.CouldNotUploadImage(image_id=image_id)
         self.images[image_id] = copy.deepcopy(metadata)
         if data:
             self._imagedata[image_id] = data.read()
@@ -208,7 +210,7 @@ class _FakeImageService(object):
             image = self.images[image_id]
             try:
                 image['properties'].update(metadata.pop('properties'))
-            except Exception:
+            except KeyError:
                 pass
             image.update(metadata)
         return self.images[image_id]
@@ -245,9 +247,9 @@ def get_valid_image_id():
 
 
 def stub_out_image_service(stubs):
-    def fake_get_remote_image_service(context, image_href):
-        return (FakeImageService(), image_href)
+    image_service = FakeImageService()
     stubs.Set(nova.image.glance, 'get_remote_image_service',
-              lambda x, y: (FakeImageService(), y))
+              lambda x, y: (image_service, y))
     stubs.Set(nova.image.glance, 'get_default_image_service',
-              lambda: FakeImageService())
+              lambda: image_service)
+    return image_service

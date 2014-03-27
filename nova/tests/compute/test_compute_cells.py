@@ -1,4 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
 # Copyright (c) 2012 Rackspace Hosting
 # All Rights Reserved.
 #
@@ -18,12 +17,13 @@ Tests For Compute w/ Cells
 """
 import functools
 
+import mock
 from oslo.config import cfg
 
+from nova.cells import manager
 from nova.compute import api as compute_api
 from nova.compute import cells_api as compute_cells_api
 from nova import db
-from nova import exception
 from nova.openstack.common import jsonutils
 from nova import quota
 from nova.tests.compute import test_compute
@@ -145,42 +145,6 @@ class CellsComputeAPITestCase(test_compute.ComputeAPITestCase):
     def test_instance_metadata(self):
         self.skipTest("Test is incompatible with cells.")
 
-    def test_snapshot_given_image_uuid(self):
-        self.skipTest("Test doesn't apply to API cell.")
-
-    @wrap_create_instance
-    def test_snapshot(self):
-        return super(CellsComputeAPITestCase, self).test_snapshot()
-
-    @wrap_create_instance
-    def test_snapshot_image_metadata_inheritance(self):
-        return super(CellsComputeAPITestCase,
-                self).test_snapshot_image_metadata_inheritance()
-
-    @wrap_create_instance
-    def test_snapshot_minram_mindisk(self):
-        return super(CellsComputeAPITestCase,
-                self).test_snapshot_minram_mindisk()
-
-    @wrap_create_instance
-    def test_snapshot_minram_mindisk_VHD(self):
-        return super(CellsComputeAPITestCase,
-                self).test_snapshot_minram_mindisk_VHD()
-
-    @wrap_create_instance
-    def test_snapshot_minram_mindisk_img_missing_minram(self):
-        return super(CellsComputeAPITestCase,
-                self).test_snapshot_minram_mindisk_img_missing_minram()
-
-    @wrap_create_instance
-    def test_snapshot_minram_mindisk_no_image(self):
-        return super(CellsComputeAPITestCase,
-                self).test_snapshot_minram_mindisk_no_image()
-
-    @wrap_create_instance
-    def test_backup(self):
-        return super(CellsComputeAPITestCase, self).test_backup()
-
     def test_evacuate(self):
         self.skipTest("Test is incompatible with cells.")
 
@@ -189,10 +153,11 @@ class CellsComputeAPITestCase(test_compute.ComputeAPITestCase):
         self.mox.StubOutWithMock(cells_rpcapi,
                                  'instance_delete_everywhere')
         inst = self._create_fake_instance_obj()
-        exc = exception.InstanceUnknownCell(instance_uuid=inst['uuid'])
         cells_rpcapi.instance_delete_everywhere(self.context,
                 inst, 'hard')
         self.mox.ReplayAll()
+        self.stubs.Set(self.compute_api.network_api, 'deallocate_for_instance',
+                       lambda *a, **kw: None)
         self.compute_api.delete(self.context, inst)
 
     def test_soft_delete_instance_no_cell(self):
@@ -200,10 +165,11 @@ class CellsComputeAPITestCase(test_compute.ComputeAPITestCase):
         self.mox.StubOutWithMock(cells_rpcapi,
                                  'instance_delete_everywhere')
         inst = self._create_fake_instance_obj()
-        exc = exception.InstanceUnknownCell(instance_uuid=inst['uuid'])
         cells_rpcapi.instance_delete_everywhere(self.context,
                 inst, 'soft')
         self.mox.ReplayAll()
+        self.stubs.Set(self.compute_api.network_api, 'deallocate_for_instance',
+                       lambda *a, **kw: None)
         self.compute_api.soft_delete(self.context, inst)
 
     def test_get_migrations(self):
@@ -218,6 +184,39 @@ class CellsComputeAPITestCase(test_compute.ComputeAPITestCase):
         response = self.compute_api.get_migrations(self.context, filters)
 
         self.assertEqual(migrations, response)
+
+    @mock.patch('nova.cells.messaging._TargetedMessage')
+    def test_rebuild_sig(self, mock_msg):
+        # TODO(belliott) Cells could benefit from better testing to ensure API
+        # and manager signatures stay up to date
+
+        def wire(version):
+            # wire the rpc cast directly to the manager method to make sure
+            # the signature matches
+            cells_mgr = manager.CellsManager()
+
+            def cast(context, method, *args, **kwargs):
+                fn = getattr(cells_mgr, method)
+                fn(context, *args, **kwargs)
+
+            cells_mgr.cast = cast
+            return cells_mgr
+
+        cells_rpcapi = self.compute_api.cells_rpcapi
+        client = cells_rpcapi.client
+
+        with mock.patch.object(client, 'prepare', side_effect=wire):
+            inst = self._create_fake_instance_obj()
+            inst.cell_name = 'mycell'
+
+            cells_rpcapi.rebuild_instance(self.context, inst, 'pass', None,
+                                          None, None, None, None,
+                                          recreate=False,
+                                          on_shared_storage=False, host='host',
+                                          preserve_ephemeral=True, kwargs=None)
+
+        # one targeted message should have been created
+        self.assertEqual(1, mock_msg.call_count)
 
 
 class CellsComputePolicyTestCase(test_compute.ComputePolicyTestCase):

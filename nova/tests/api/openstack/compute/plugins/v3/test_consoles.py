@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010-2011 OpenStack Foundation
 # Copyright 2011 Piston Cloud Computing, Inc.
 # All Rights Reserved.
@@ -19,7 +17,6 @@
 import datetime
 import uuid as stdlib_uuid
 
-from lxml import etree
 import webob
 
 from nova.api.openstack.compute.plugins.v3 import consoles
@@ -88,7 +85,7 @@ def stub_instance(id, user_id='fake', project_id='fake', host=None,
         "id": int(id),
         "created_at": datetime.datetime(2010, 10, 10, 12, 0, 0),
         "updated_at": datetime.datetime(2010, 11, 11, 11, 0, 0),
-        "admin_pass": "",
+        "admin_password": "",
         "user_id": user_id,
         "project_id": project_id,
         "image_ref": image_ref,
@@ -124,7 +121,7 @@ def stub_instance(id, user_id='fake', project_id='fake', host=None,
     return instance
 
 
-class ConsolesControllerTest(test.TestCase):
+class ConsolesControllerTest(test.NoDBTestCase):
     def setUp(self):
         super(ConsolesControllerTest, self).setUp()
         self.flags(verbose=True)
@@ -144,7 +141,8 @@ class ConsolesControllerTest(test.TestCase):
         self.stubs.Set(console.api.API, 'create_console', fake_create_console)
 
         req = fakes.HTTPRequestV3.blank(self.url)
-        self.controller.create(req, self.uuid)
+        self.controller.create(req, self.uuid, None)
+        self.assertEqual(self.controller.create.wsgi_code, 201)
 
     def test_create_console_unknown_instance(self):
         def fake_create_console(cons_self, context, instance_id):
@@ -153,7 +151,7 @@ class ConsolesControllerTest(test.TestCase):
 
         req = fakes.HTTPRequestV3.blank(self.url)
         self.assertRaises(webob.exc.HTTPNotFound, self.controller.create,
-                          req, self.uuid)
+                          req, self.uuid, None)
 
     def test_show_console(self):
         def fake_get_console(cons_self, context, instance_id, console_id):
@@ -213,8 +211,8 @@ class ConsolesControllerTest(test.TestCase):
             return [cons1, cons2]
 
         expected = {'consoles':
-                [{'console': {'id': 10, 'console_type': 'fake_type'}},
-                 {'console': {'id': 11, 'console_type': 'fake_type2'}}]}
+                [{'id': 10, 'console_type': 'fake_type'},
+                 {'id': 11, 'console_type': 'fake_type2'}]}
 
         self.stubs.Set(console.api.API, 'get_consoles', fake_get_consoles)
 
@@ -270,46 +268,3 @@ class ConsolesControllerTest(test.TestCase):
         req = fakes.HTTPRequestV3.blank(self.url + '/20')
         self.assertRaises(webob.exc.HTTPNotFound, self.controller.delete,
                           req, self.uuid, '20')
-
-
-class TestConsolesXMLSerializer(test.TestCase):
-    def test_show(self):
-        fixture = {'console': {'id': 20,
-                               'password': 'fake_password',
-                               'port': 'fake_port',
-                               'host': 'fake_hostname',
-                               'console_type': 'fake_type'}}
-
-        output = consoles.ConsoleTemplate().serialize(fixture)
-        res_tree = etree.XML(output)
-
-        self.assertEqual(res_tree.tag, 'console')
-        self.assertEqual(res_tree.xpath('id')[0].text, '20')
-        self.assertEqual(res_tree.xpath('port')[0].text, 'fake_port')
-        self.assertEqual(res_tree.xpath('host')[0].text, 'fake_hostname')
-        self.assertEqual(res_tree.xpath('password')[0].text, 'fake_password')
-        self.assertEqual(res_tree.xpath('console_type')[0].text, 'fake_type')
-
-    def test_index(self):
-        fixture = {'consoles': [{'console': {'id': 10,
-                                             'console_type': 'fake_type'}},
-                                {'console': {'id': 11,
-                                             'console_type': 'fake_type2'}}]}
-
-        output = consoles.ConsolesTemplate().serialize(fixture)
-        res_tree = etree.XML(output)
-
-        self.assertEqual(res_tree.tag, 'consoles')
-        self.assertEqual(len(res_tree), 2)
-        self.assertEqual(res_tree[0].tag, 'console')
-        self.assertEqual(res_tree[1].tag, 'console')
-        self.assertEqual(len(res_tree[0]), 1)
-        self.assertEqual(res_tree[0][0].tag, 'console')
-        self.assertEqual(len(res_tree[1]), 1)
-        self.assertEqual(res_tree[1][0].tag, 'console')
-        self.assertEqual(res_tree[0][0].xpath('id')[0].text, '10')
-        self.assertEqual(res_tree[1][0].xpath('id')[0].text, '11')
-        self.assertEqual(res_tree[0][0].xpath('console_type')[0].text,
-                         'fake_type')
-        self.assertEqual(res_tree[1][0].xpath('console_type')[0].text,
-                         'fake_type2')

@@ -23,6 +23,8 @@ function usage {
   echo "                               Default: .venv"
   echo "  --tools-path <dir>          Location of the tools directory"
   echo "                               Default: \$(pwd)"
+  echo "  --concurrency <concurrency> How many processes to use when running the tests. A value of 0 autodetects concurrency from your CPU count"
+  echo "                               Default: 0"
   echo ""
   echo "Note: with no options specified, the script will try to run the tests in a virtual environment,"
   echo "      If no virtualenv is found, the script will ask if you would like to create one.  If you "
@@ -56,6 +58,10 @@ function process_options {
         (( i++ ))
         tools_path=${!i}
         ;;
+      --concurrency)
+        (( i++ ))
+        concurrency=${!i}
+        ;;
       -*) testropts="$testropts ${!i}";;
       *) testrargs="$testrargs ${!i}"
     esac
@@ -80,6 +86,7 @@ no_pep8=0
 coverage=0
 debug=0
 update=0
+concurrency=0
 
 LANG=en_US.UTF-8
 LANGUAGE=en_US:en
@@ -97,12 +104,6 @@ if [ $no_site_packages -eq 1 ]; then
   installvenvopts="--no-site-packages"
 fi
 
-function init_testr {
-  if [ ! -d .testrepository ]; then
-    ${wrapper} testr init
-  fi
-}
-
 function run_tests {
   # Cleanup *pyc
   ${wrapper} find . -type f -name "*.pyc" -delete
@@ -113,7 +114,7 @@ function run_tests {
       # provided.
       testrargs="discover ./nova/tests"
     fi
-    ${wrapper} python -m testtools.run $testropts $testrargs
+    ${wrapper} python -m nova.openstack.common.lockutils python -m testtools.run $testropts $testrargs
 
     # Short circuit because all of the testr and coverage stuff
     # below does not make sense when running testtools.run for
@@ -130,7 +131,7 @@ function run_tests {
   # Just run the test suites in current environment
   set +e
   testrargs=`echo "$testrargs" | sed -e's/^\s*\(.*\)\s*$/\1/'`
-  TESTRTESTS="$TESTRTESTS --testr-args='--subunit $testropts $testrargs'"
+  TESTRTESTS="$TESTRTESTS --testr-args='--subunit --concurrency $concurrency $testropts $testrargs'"
   if [ setup.cfg -nt nova.egg-info/entry_points.txt ]
   then
     ${wrapper} python setup.py egg_info
@@ -168,11 +169,15 @@ function copy_subunit_log {
 
 function run_pep8 {
   echo "Running flake8 ..."
+  if [ $never_venv -eq 1 ]; then
+      echo "**WARNING**:"
+      echo "Running flake8 without virtual env may miss OpenStack HACKING detection"
+  fi
   bash -c "${wrapper} flake8"
 }
 
 
-TESTRTESTS="python setup.py testr"
+TESTRTESTS="python -m nova.openstack.common.lockutils python setup.py testr"
 
 if [ $never_venv -eq 0 ]
 then
@@ -214,7 +219,6 @@ if [ $just_pep8 -eq 1 ]; then
     exit
 fi
 
-init_testr
 run_tests
 
 # NOTE(sirp): we only want to run pep8 when we're running the full-test suite,

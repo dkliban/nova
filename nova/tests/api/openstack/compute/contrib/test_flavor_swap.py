@@ -38,16 +38,21 @@ FAKE_FLAVORS = {
 }
 
 
-#TOD(jogo) dedup these accross nova.api.openstack.contrib.test_flavor*
+#TOD(jogo) dedup these across nova.api.openstack.contrib.test_flavor*
 def fake_flavor_get_by_flavor_id(flavorid, ctxt=None):
     return FAKE_FLAVORS['flavor %s' % flavorid]
 
 
-def fake_flavor_get_all(*args, **kwargs):
-    return FAKE_FLAVORS
+def fake_get_all_flavors_sorted_list(context=None, inactive=False,
+                                     filters=None, sort_key='flavorid',
+                                     sort_dir='asc', limit=None, marker=None):
+    return [
+        fake_flavor_get_by_flavor_id(1),
+        fake_flavor_get_by_flavor_id(2)
+    ]
 
 
-class FlavorSwapTest(test.TestCase):
+class FlavorSwapTest(test.NoDBTestCase):
     content_type = 'application/json'
     prefix = ''
 
@@ -57,8 +62,8 @@ class FlavorSwapTest(test.TestCase):
               '.flavor_swap.Flavor_swap')
         self.flags(osapi_compute_extension=[ext])
         fakes.stub_out_nw_api(self.stubs)
-        self.stubs.Set(flavors, "get_all_flavors",
-                       fake_flavor_get_all)
+        self.stubs.Set(flavors, "get_all_flavors_sorted_list",
+                       fake_get_all_flavors_sorted_list)
         self.stubs.Set(flavors,
                        "get_flavor_by_flavor_id",
                        fake_flavor_get_by_flavor_id)

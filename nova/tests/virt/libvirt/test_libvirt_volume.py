@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-#
 #    Copyright 2010 OpenStack Foundation
 #    Copyright 2012 University Of Minho
 #
@@ -17,6 +15,7 @@
 
 import fixtures
 import os
+import time
 
 from oslo.config import cfg
 
@@ -32,7 +31,7 @@ from nova.virt.libvirt import volume
 CONF = cfg.CONF
 
 
-class LibvirtVolumeTestCase(test.TestCase):
+class LibvirtVolumeTestCase(test.NoDBTestCase):
 
     def setUp(self):
         super(LibvirtVolumeTestCase, self).setUp()
@@ -86,6 +85,38 @@ class LibvirtVolumeTestCase(test.TestCase):
         self.assertEqual(tree.get('type'), 'file')
         self.assertEqual(tree.find('./source').get('file'), file_path)
 
+    def _assertDiskInfoEquals(self, tree, disk_info):
+        self.assertEqual(tree.get('device'), disk_info['type'])
+        self.assertEqual(tree.find('./target').get('bus'),
+                         disk_info['bus'])
+        self.assertEqual(tree.find('./target').get('dev'),
+                         disk_info['dev'])
+
+    def _test_libvirt_volume_driver_disk_info(self):
+        libvirt_driver = volume.LibvirtVolumeDriver(self.fake_conn)
+        connection_info = {
+            'driver_volume_type': 'fake',
+            'data': {
+                'device_path': '/foo',
+            },
+            'serial': 'fake_serial',
+        }
+        conf = libvirt_driver.connect_volume(connection_info, self.disk_info)
+        tree = conf.format_dom()
+        self._assertDiskInfoEquals(tree, self.disk_info)
+
+    def test_libvirt_volume_disk_info_type(self):
+        self.disk_info['type'] = 'cdrom'
+        self._test_libvirt_volume_driver_disk_info()
+
+    def test_libvirt_volume_disk_info_dev(self):
+        self.disk_info['dev'] = 'hdc'
+        self._test_libvirt_volume_driver_disk_info()
+
+    def test_libvirt_volume_disk_info_bus(self):
+        self.disk_info['bus'] = 'scsi'
+        self._test_libvirt_volume_driver_disk_info()
+
     def test_libvirt_volume_driver_serial(self):
         libvirt_driver = volume.LibvirtVolumeDriver(self.fake_conn)
         connection_info = {
@@ -99,7 +130,7 @@ class LibvirtVolumeTestCase(test.TestCase):
         tree = conf.format_dom()
         self.assertEqual('block', tree.get('type'))
         self.assertEqual('fake_serial', tree.find('./serial').text)
-        self.assertEqual(None, tree.find('./blockio'))
+        self.assertIsNone(tree.find('./blockio'))
 
     def test_libvirt_volume_driver_blockio(self):
         libvirt_driver = volume.LibvirtVolumeDriver(self.fake_conn)
@@ -123,6 +154,75 @@ class LibvirtVolumeTestCase(test.TestCase):
         self.assertEqual('4096', blockio.get('logical_block_size'))
         self.assertEqual('4096', blockio.get('physical_block_size'))
 
+    def test_libvirt_volume_driver_iotune(self):
+        libvirt_driver = volume.LibvirtVolumeDriver(self.fake_conn)
+        connection_info = {
+            'driver_volume_type': 'fake',
+            'data': {
+                "device_path": "/foo",
+                'qos_specs': 'bar',
+                },
+            }
+        disk_info = {
+            "bus": "virtio",
+            "dev": "vde",
+            "type": "disk",
+            }
+        conf = libvirt_driver.connect_volume(connection_info, disk_info)
+        tree = conf.format_dom()
+        iotune = tree.find('./iotune')
+        # ensure invalid qos_specs is ignored
+        self.assertIsNone(iotune)
+
+        specs = {
+            'total_bytes_sec': '102400',
+            'read_bytes_sec': '51200',
+            'write_bytes_sec': '0',
+            'total_iops_sec': '0',
+            'read_iops_sec': '200',
+            'write_iops_sec': '200',
+        }
+        del connection_info['data']['qos_specs']
+        connection_info['data'].update(dict(qos_specs=specs))
+        conf = libvirt_driver.connect_volume(connection_info, disk_info)
+        tree = conf.format_dom()
+        self.assertEqual('102400', tree.find('./iotune/total_bytes_sec').text)
+        self.assertEqual('51200', tree.find('./iotune/read_bytes_sec').text)
+        self.assertEqual('0', tree.find('./iotune/write_bytes_sec').text)
+        self.assertEqual('0', tree.find('./iotune/total_iops_sec').text)
+        self.assertEqual('200', tree.find('./iotune/read_iops_sec').text)
+        self.assertEqual('200', tree.find('./iotune/write_iops_sec').text)
+
+    def test_libvirt_volume_driver_readonly(self):
+        libvirt_driver = volume.LibvirtVolumeDriver(self.fake_conn)
+        connection_info = {
+            'driver_volume_type': 'fake',
+            'data': {
+                "device_path": "/foo",
+                'access_mode': 'bar',
+                },
+            }
+        disk_info = {
+            "bus": "virtio",
+            "dev": "vde",
+            "type": "disk",
+            }
+        self.assertRaises(exception.InvalidVolumeAccessMode,
+                          libvirt_driver.connect_volume,
+                          connection_info, self.disk_info)
+
+        connection_info['data']['access_mode'] = 'rw'
+        conf = libvirt_driver.connect_volume(connection_info, disk_info)
+        tree = conf.format_dom()
+        readonly = tree.find('./readonly')
+        self.assertIsNone(readonly)
+
+        connection_info['data']['access_mode'] = 'ro'
+        conf = libvirt_driver.connect_volume(connection_info, disk_info)
+        tree = conf.format_dom()
+        readonly = tree.find('./readonly')
+        self.assertIsNotNone(readonly)
+
     def iscsi_connection(self, volume, location, iqn):
         return {
                 'driver_volume_type': 'iscsi',
@@ -131,6 +231,10 @@ class LibvirtVolumeTestCase(test.TestCase):
                     'target_portal': location,
                     'target_iqn': iqn,
                     'target_lun': 1,
+                    'qos_specs': {
+                        'total_bytes_sec': '102400',
+                        'read_iops_sec': '200',
+                        }
                 }
         }
 
@@ -141,6 +245,7 @@ class LibvirtVolumeTestCase(test.TestCase):
         connection_info = self.iscsi_connection(self.vol, self.location,
                                                 self.iqn)
         conf = libvirt_driver.connect_volume(connection_info, self.disk_info)
+        self.assertEqual('qemu', conf.driver_name)
         tree = conf.format_dom()
         dev_str = '/dev/disk/by-path/ip-%s-iscsi-%s-lun-1' % (self.location,
                                                               self.iqn)
@@ -156,27 +261,31 @@ class LibvirtVolumeTestCase(test.TestCase):
                               '-p', self.location, '--op', 'update',
                               '-n', 'node.startup', '-v', 'automatic'),
                              ('iscsiadm', '-m', 'node', '-T', self.iqn,
+                              '-p', self.location, '--rescan'),
+                             ('iscsiadm', '-m', 'node', '-T', self.iqn,
                               '-p', self.location, '--op', 'update',
                               '-n', 'node.startup', '-v', 'manual'),
                              ('iscsiadm', '-m', 'node', '-T', self.iqn,
                               '-p', self.location, '--logout'),
                              ('iscsiadm', '-m', 'node', '-T', self.iqn,
                               '-p', self.location, '--op', 'delete')]
+        self.assertEqual('102400', tree.find('./iotune/total_bytes_sec').text)
         self.assertEqual(self.executes, expected_commands)
 
     def test_libvirt_iscsi_driver_still_in_use(self):
         # NOTE(vish) exists is to make driver assume connecting worked
         self.stubs.Set(os.path, 'exists', lambda x: True)
         libvirt_driver = volume.LibvirtISCSIVolumeDriver(self.fake_conn)
-        devs = ['/dev/disk/by-path/ip-%s-iscsi-%s-lun-1' % (self.location,
+        name = 'volume-00000001'
+        devs = ['/dev/disk/by-path/ip-%s-iscsi-%s-lun-2' % (self.location,
                                                             self.iqn)]
         self.stubs.Set(self.fake_conn, 'get_all_block_devices', lambda: devs)
         vol = {'id': 1, 'name': self.name}
         connection_info = self.iscsi_connection(vol, self.location, self.iqn)
         conf = libvirt_driver.connect_volume(connection_info, self.disk_info)
         tree = conf.format_dom()
-        dev_str = '/dev/disk/by-path/ip-%s-iscsi-%s-lun-1' % (self.location,
-                                                              self.iqn)
+        dev_name = 'ip-%s-iscsi-%s-lun-1' % (self.location, self.iqn)
+        dev_str = '/dev/disk/by-path/%s' % dev_name
         self.assertEqual(tree.get('type'), 'block')
         self.assertEqual(tree.find('./source').get('dev'), dev_str)
         libvirt_driver.disconnect_volume(connection_info, "vde")
@@ -187,8 +296,23 @@ class LibvirtVolumeTestCase(test.TestCase):
                               '-p', self.location, '--login'),
                              ('iscsiadm', '-m', 'node', '-T', self.iqn,
                               '-p', self.location, '--op', 'update',
-                              '-n', 'node.startup', '-v', 'automatic')]
+                              '-n', 'node.startup', '-v', 'automatic'),
+                             ('iscsiadm', '-m', 'node', '-T', self.iqn,
+                              '-p', self.location, '--rescan'),
+                             ('cp', '/dev/stdin',
+                              '/sys/block/%s/device/delete' % dev_name)]
         self.assertEqual(self.executes, expected_commands)
+
+    def iser_connection(self, volume, location, iqn):
+        return {
+                'driver_volume_type': 'iser',
+                'data': {
+                    'volume_id': volume['id'],
+                    'target_portal': location,
+                    'target_iqn': iqn,
+                    'target_lun': 1,
+                }
+        }
 
     def sheepdog_connection(self, volume):
         return {
@@ -213,10 +337,14 @@ class LibvirtVolumeTestCase(test.TestCase):
             'driver_volume_type': 'rbd',
             'data': {
                 'name': '%s/%s' % ('rbd', volume['name']),
-                'auth_enabled': CONF.rbd_secret_uuid is not None,
-                'auth_username': CONF.rbd_user,
+                'auth_enabled': CONF.libvirt.rbd_secret_uuid is not None,
+                'auth_username': CONF.libvirt.rbd_user,
                 'secret_type': 'ceph',
-                'secret_uuid': CONF.rbd_secret_uuid,
+                'secret_uuid': CONF.libvirt.rbd_secret_uuid,
+                'qos_specs': {
+                    'total_bytes_sec': '1048576',
+                    'read_iops_sec': '500',
+                    }
             }
         }
 
@@ -226,7 +354,9 @@ class LibvirtVolumeTestCase(test.TestCase):
         conf = libvirt_driver.connect_volume(connection_info, self.disk_info)
         tree = conf.format_dom()
         self._assertNetworkAndProtocolEquals(tree)
-        self.assertEqual(tree.find('./source/auth'), None)
+        self.assertIsNone(tree.find('./source/auth'))
+        self.assertEqual('1048576', tree.find('./iotune/total_bytes_sec').text)
+        self.assertEqual('500', tree.find('./iotune/read_iops_sec').text)
         libvirt_driver.disconnect_volume(connection_info, "vde")
 
     def test_libvirt_rbd_driver_hosts(self):
@@ -239,7 +369,7 @@ class LibvirtVolumeTestCase(test.TestCase):
         conf = libvirt_driver.connect_volume(connection_info, self.disk_info)
         tree = conf.format_dom()
         self._assertNetworkAndProtocolEquals(tree)
-        self.assertEqual(tree.find('./source/auth'), None)
+        self.assertIsNone(tree.find('./source/auth'))
         found_hosts = tree.findall('./source/host')
         self.assertEqual([host.get('name') for host in found_hosts], hosts)
         self.assertEqual([host.get('port') for host in found_hosts], ports)
@@ -274,7 +404,8 @@ class LibvirtVolumeTestCase(test.TestCase):
         flags_uuid = '37152720-1785-11e2-a740-af0c1d8b8e4b'
         flags_user = 'bar'
         self.flags(rbd_user=flags_user,
-                   rbd_secret_uuid=flags_uuid)
+                   rbd_secret_uuid=flags_uuid,
+                   group='libvirt')
 
         conf = libvirt_driver.connect_volume(connection_info, self.disk_info)
         tree = conf.format_dom()
@@ -296,7 +427,7 @@ class LibvirtVolumeTestCase(test.TestCase):
         conf = libvirt_driver.connect_volume(connection_info, self.disk_info)
         tree = conf.format_dom()
         self._assertNetworkAndProtocolEquals(tree)
-        self.assertEqual(tree.find('./auth'), None)
+        self.assertIsNone(tree.find('./auth'))
         libvirt_driver.disconnect_volume(connection_info, "vde")
 
     def test_libvirt_rbd_driver_auth_disabled_flags_override(self):
@@ -313,7 +444,8 @@ class LibvirtVolumeTestCase(test.TestCase):
         flags_uuid = '37152720-1785-11e2-a740-af0c1d8b8e4b'
         flags_user = 'bar'
         self.flags(rbd_user=flags_user,
-                   rbd_secret_uuid=flags_uuid)
+                   rbd_secret_uuid=flags_uuid,
+                   group='libvirt')
 
         conf = libvirt_driver.connect_volume(connection_info, self.disk_info)
         tree = conf.format_dom()
@@ -337,7 +469,7 @@ class LibvirtVolumeTestCase(test.TestCase):
         libvirt_driver.disconnect_volume(connection_info, 'vde')
 
     def test_libvirt_kvm_volume_with_multipath(self):
-        self.flags(libvirt_iscsi_use_multipath=True)
+        self.flags(iscsi_use_multipath=True, group='libvirt')
         self.stubs.Set(os.path, 'exists', lambda x: True)
         devs = ['/dev/mapper/sda', '/dev/mapper/sdb']
         self.stubs.Set(self.fake_conn, 'get_all_block_devices', lambda: devs)
@@ -348,13 +480,68 @@ class LibvirtVolumeTestCase(test.TestCase):
         connection_info['data']['device_path'] = mpdev_filepath
         target_portals = ['fake_portal1', 'fake_portal2']
         libvirt_driver._get_multipath_device_name = lambda x: mpdev_filepath
+        self.stubs.Set(libvirt_driver,
+                       '_get_target_portals_from_iscsiadm_output',
+                       lambda x: [[self.location, self.iqn]])
         conf = libvirt_driver.connect_volume(connection_info, self.disk_info)
         tree = conf.format_dom()
         self.assertEqual(tree.find('./source').get('dev'), mpdev_filepath)
+        libvirt_driver._get_multipath_iqn = lambda x: self.iqn
+        libvirt_driver.disconnect_volume(connection_info, 'vde')
+        expected_multipath_cmd = ('multipath', '-f', 'foo')
+        self.assertIn(expected_multipath_cmd, self.executes)
+
+    def test_libvirt_kvm_volume_with_multipath_still_in_use(self):
+        name = 'volume-00000001'
+        location = '10.0.2.15:3260'
+        iqn = 'iqn.2010-10.org.openstack:%s' % name
+        mpdev_filepath = '/dev/mapper/foo'
+
+        def _get_multipath_device_name(path):
+            if '%s-lun-1' % iqn in path:
+                return mpdev_filepath
+            return '/dev/mapper/donotdisconnect'
+
+        self.flags(iscsi_use_multipath=True, group='libvirt')
+        self.stubs.Set(os.path, 'exists', lambda x: True)
+
+        libvirt_driver = volume.LibvirtISCSIVolumeDriver(self.fake_conn)
+        libvirt_driver._get_multipath_device_name =\
+            lambda x: _get_multipath_device_name(x)
+
+        block_devs = ['/dev/disks/by-path/%s-iscsi-%s-lun-2' % (location, iqn)]
+        self.stubs.Set(self.fake_conn, 'get_all_block_devices',
+                       lambda: block_devs)
+
+        vol = {'id': 1, 'name': name}
+        connection_info = self.iscsi_connection(vol, location, iqn)
+        connection_info['data']['device_path'] = mpdev_filepath
+
+        libvirt_driver._get_multipath_iqn = lambda x: iqn
+
+        iscsi_devs = ['1.2.3.4-iscsi-%s-lun-1' % iqn,
+                      '%s-iscsi-%s-lun-1' % (location, iqn),
+                      '%s-iscsi-%s-lun-2' % (location, iqn)]
+        libvirt_driver._get_iscsi_devices = lambda: iscsi_devs
+
+        self.stubs.Set(libvirt_driver,
+                       '_get_target_portals_from_iscsiadm_output',
+                       lambda x: [[location, iqn]])
+
+        # Set up disconnect volume mock expectations
+        self.mox.StubOutWithMock(libvirt_driver, '_delete_device')
+        self.mox.StubOutWithMock(libvirt_driver, '_rescan_multipath')
+        libvirt_driver._rescan_multipath()
+        libvirt_driver._delete_device('/dev/disk/by-path/%s' % iscsi_devs[0])
+        libvirt_driver._delete_device('/dev/disk/by-path/%s' % iscsi_devs[1])
+        libvirt_driver._rescan_multipath()
+
+        # Ensure that the mpath devices are deleted
+        self.mox.ReplayAll()
         libvirt_driver.disconnect_volume(connection_info, 'vde')
 
     def test_libvirt_kvm_volume_with_multipath_getmpdev(self):
-        self.flags(libvirt_iscsi_use_multipath=True)
+        self.flags(iscsi_use_multipath=True, group='libvirt')
         self.stubs.Set(os.path, 'exists', lambda x: True)
         libvirt_driver = volume.LibvirtISCSIVolumeDriver(self.fake_conn)
         name0 = 'volume-00000000'
@@ -369,7 +556,77 @@ class LibvirtVolumeTestCase(test.TestCase):
         mpdev_filepath = '/dev/mapper/foo'
         target_portals = ['fake_portal1', 'fake_portal2']
         libvirt_driver._get_multipath_device_name = lambda x: mpdev_filepath
+        self.stubs.Set(libvirt_driver,
+                       '_get_target_portals_from_iscsiadm_output',
+                       lambda x: [['fake_portal1', 'fake_iqn1']])
         conf = libvirt_driver.connect_volume(connection_info, self.disk_info)
+        tree = conf.format_dom()
+        self.assertEqual(tree.find('./source').get('dev'), mpdev_filepath)
+        libvirt_driver.disconnect_volume(connection_info, 'vde')
+
+    def test_libvirt_kvm_iser_volume_with_multipath(self):
+        self.flags(iser_use_multipath=True, group='libvirt')
+        self.stubs.Set(os.path, 'exists', lambda x: True)
+        self.stubs.Set(time, 'sleep', lambda x: None)
+        devs = ['/dev/mapper/sda', '/dev/mapper/sdb']
+        self.stubs.Set(self.fake_conn, 'get_all_block_devices', lambda: devs)
+        libvirt_driver = volume.LibvirtISERVolumeDriver(self.fake_conn)
+        name = 'volume-00000001'
+        location = '10.0.2.15:3260'
+        iqn = 'iqn.2010-10.org.iser.openstack:%s' % name
+        vol = {'id': 1, 'name': name}
+        connection_info = self.iser_connection(vol, location, iqn)
+        mpdev_filepath = '/dev/mapper/foo'
+        connection_info['data']['device_path'] = mpdev_filepath
+        disk_info = {
+            "bus": "virtio",
+            "dev": "vde",
+            "type": "disk",
+            }
+        target_portals = ['fake_portal1', 'fake_portal2']
+        libvirt_driver._get_multipath_device_name = lambda x: mpdev_filepath
+        self.stubs.Set(libvirt_driver,
+                       '_get_target_portals_from_iscsiadm_output',
+                       lambda x: [[location, iqn]])
+        conf = libvirt_driver.connect_volume(connection_info, disk_info)
+        tree = conf.format_dom()
+        self.assertEqual(tree.find('./source').get('dev'), mpdev_filepath)
+        libvirt_driver._get_multipath_iqn = lambda x: iqn
+        libvirt_driver.disconnect_volume(connection_info, 'vde')
+        expected_multipath_cmd = ('multipath', '-f', 'foo')
+        self.assertIn(expected_multipath_cmd, self.executes)
+
+    def test_libvirt_kvm_iser_volume_with_multipath_getmpdev(self):
+        self.flags(iser_use_multipath=True, group='libvirt')
+        self.stubs.Set(os.path, 'exists', lambda x: True)
+        self.stubs.Set(time, 'sleep', lambda x: None)
+        libvirt_driver = volume.LibvirtISERVolumeDriver(self.fake_conn)
+        name0 = 'volume-00000000'
+        location0 = '10.0.2.15:3260'
+        iqn0 = 'iqn.2010-10.org.iser.openstack:%s' % name0
+        vol0 = {'id': 0, 'name': name0}
+        dev0 = '/dev/disk/by-path/ip-%s-iscsi-%s-lun-0' % (location0, iqn0)
+        name = 'volume-00000001'
+        location = '10.0.2.15:3260'
+        iqn = 'iqn.2010-10.org.iser.openstack:%s' % name
+        vol = {'id': 1, 'name': name}
+        dev = '/dev/disk/by-path/ip-%s-iscsi-%s-lun-1' % (location, iqn)
+        devs = [dev0, dev]
+        self.stubs.Set(self.fake_conn, 'get_all_block_devices', lambda: devs)
+        self.stubs.Set(libvirt_driver, '_get_iscsi_devices', lambda: [])
+        connection_info = self.iser_connection(vol, location, iqn)
+        mpdev_filepath = '/dev/mapper/foo'
+        disk_info = {
+            "bus": "virtio",
+            "dev": "vde",
+            "type": "disk",
+            }
+        target_portals = ['fake_portal1', 'fake_portal2']
+        libvirt_driver._get_multipath_device_name = lambda x: mpdev_filepath
+        self.stubs.Set(libvirt_driver,
+                       '_get_target_portals_from_iscsiadm_output',
+                       lambda x: [['fake_portal1', 'fake_iqn1']])
+        conf = libvirt_driver.connect_volume(connection_info, disk_info)
         tree = conf.format_dom()
         self.assertEqual(tree.find('./source').get('dev'), mpdev_filepath)
         libvirt_driver.disconnect_volume(connection_info, 'vde')
@@ -377,12 +634,14 @@ class LibvirtVolumeTestCase(test.TestCase):
     def test_libvirt_nfs_driver(self):
         # NOTE(vish) exists is to make driver assume connecting worked
         mnt_base = '/mnt'
-        self.flags(nfs_mount_point_base=mnt_base)
+        self.flags(nfs_mount_point_base=mnt_base, group='libvirt')
 
         libvirt_driver = volume.LibvirtNFSVolumeDriver(self.fake_conn)
+        self.stubs.Set(libvirt_utils, 'is_mounted', lambda x, d: False)
+
         export_string = '192.168.1.1:/nfs/share1'
         export_mnt_base = os.path.join(mnt_base,
-                libvirt_driver.get_hash_str(export_string))
+                utils.get_hash_str(export_string))
         file_path = os.path.join(export_mnt_base, self.name)
 
         connection_info = {'data': {'export': export_string,
@@ -394,18 +653,45 @@ class LibvirtVolumeTestCase(test.TestCase):
 
         expected_commands = [
             ('mkdir', '-p', export_mnt_base),
-            ('mount', '-t', 'nfs', export_string, export_mnt_base)]
+            ('mount', '-t', 'nfs', export_string, export_mnt_base),
+            ('umount', export_mnt_base)]
+        self.assertEqual(expected_commands, self.executes)
+
+    def test_libvirt_nfs_driver_already_mounted(self):
+        # NOTE(vish) exists is to make driver assume connecting worked
+        mnt_base = '/mnt'
+        self.flags(nfs_mount_point_base=mnt_base, group='libvirt')
+
+        libvirt_driver = volume.LibvirtNFSVolumeDriver(self.fake_conn)
+
+        export_string = '192.168.1.1:/nfs/share1'
+        export_mnt_base = os.path.join(mnt_base,
+                utils.get_hash_str(export_string))
+        file_path = os.path.join(export_mnt_base, self.name)
+
+        connection_info = {'data': {'export': export_string,
+                                    'name': self.name}}
+        conf = libvirt_driver.connect_volume(connection_info, self.disk_info)
+        tree = conf.format_dom()
+        self._assertFileTypeEquals(tree, file_path)
+        libvirt_driver.disconnect_volume(connection_info, "vde")
+
+        expected_commands = [
+            ('findmnt', '--target', export_mnt_base, '--source',
+             export_string),
+            ('umount', export_mnt_base)]
         self.assertEqual(self.executes, expected_commands)
 
     def test_libvirt_nfs_driver_with_opts(self):
         mnt_base = '/mnt'
-        self.flags(nfs_mount_point_base=mnt_base)
+        self.flags(nfs_mount_point_base=mnt_base, group='libvirt')
 
         libvirt_driver = volume.LibvirtNFSVolumeDriver(self.fake_conn)
+        self.stubs.Set(libvirt_utils, 'is_mounted', lambda x, d: False)
         export_string = '192.168.1.1:/nfs/share1'
         options = '-o intr,nfsvers=3'
         export_mnt_base = os.path.join(mnt_base,
-                libvirt_driver.get_hash_str(export_string))
+                utils.get_hash_str(export_string))
         file_path = os.path.join(export_mnt_base, self.name)
 
         connection_info = {'data': {'export': export_string,
@@ -419,9 +705,10 @@ class LibvirtVolumeTestCase(test.TestCase):
         expected_commands = [
             ('mkdir', '-p', export_mnt_base),
             ('mount', '-t', 'nfs', '-o', 'intr,nfsvers=3',
-             export_string, export_mnt_base)
+             export_string, export_mnt_base),
+            ('umount', export_mnt_base),
         ]
-        self.assertEqual(self.executes, expected_commands)
+        self.assertEqual(expected_commands, self.executes)
 
     def aoe_connection(self, shelf, lun):
         return {
@@ -448,12 +735,13 @@ class LibvirtVolumeTestCase(test.TestCase):
 
     def test_libvirt_glusterfs_driver(self):
         mnt_base = '/mnt'
-        self.flags(glusterfs_mount_point_base=mnt_base)
+        self.flags(glusterfs_mount_point_base=mnt_base, group='libvirt')
 
         libvirt_driver = volume.LibvirtGlusterfsVolumeDriver(self.fake_conn)
+        self.stubs.Set(libvirt_utils, 'is_mounted', lambda x, d: False)
         export_string = '192.168.1.1:/volume-00001'
         export_mnt_base = os.path.join(mnt_base,
-                libvirt_driver.get_hash_str(export_string))
+                utils.get_hash_str(export_string))
         file_path = os.path.join(export_mnt_base, self.name)
 
         connection_info = {'data': {'export': export_string,
@@ -465,18 +753,64 @@ class LibvirtVolumeTestCase(test.TestCase):
 
         expected_commands = [
             ('mkdir', '-p', export_mnt_base),
-            ('mount', '-t', 'glusterfs', export_string, export_mnt_base)]
-        self.assertEqual(self.executes, expected_commands)
+            ('mount', '-t', 'glusterfs', export_string, export_mnt_base),
+            ('umount', export_mnt_base)]
+        self.assertEqual(expected_commands, self.executes)
 
-    def test_libvirt_glusterfs_driver_with_opts(self):
+    def test_libvirt_glusterfs_driver_already_mounted(self):
         mnt_base = '/mnt'
-        self.flags(glusterfs_mount_point_base=mnt_base)
+        self.flags(glusterfs_mount_point_base=mnt_base, group='libvirt')
 
         libvirt_driver = volume.LibvirtGlusterfsVolumeDriver(self.fake_conn)
         export_string = '192.168.1.1:/volume-00001'
+        export_mnt_base = os.path.join(mnt_base,
+                utils.get_hash_str(export_string))
+        file_path = os.path.join(export_mnt_base, self.name)
+
+        connection_info = {'data': {'export': export_string,
+                                    'name': self.name}}
+        conf = libvirt_driver.connect_volume(connection_info, self.disk_info)
+        tree = conf.format_dom()
+        self._assertFileTypeEquals(tree, file_path)
+        libvirt_driver.disconnect_volume(connection_info, "vde")
+
+        expected_commands = [
+            ('findmnt', '--target', export_mnt_base,
+             '--source', export_string),
+            ('umount', export_mnt_base)]
+        self.assertEqual(self.executes, expected_commands)
+
+    def test_libvirt_glusterfs_driver_qcow2(self):
+        libvirt_driver = volume.LibvirtGlusterfsVolumeDriver(self.fake_conn)
+        self.stubs.Set(libvirt_utils, 'is_mounted', lambda x, d: False)
+        export_string = '192.168.1.1:/volume-00001'
+        name = 'volume-00001'
+        format = 'qcow2'
+
+        connection_info = {'data': {'export': export_string,
+                                    'name': name,
+                                    'format': format}}
+        disk_info = {
+            "bus": "virtio",
+            "dev": "vde",
+            "type": "disk",
+            }
+        conf = libvirt_driver.connect_volume(connection_info, disk_info)
+        tree = conf.format_dom()
+        self.assertEqual(tree.get('type'), 'file')
+        self.assertEqual(tree.find('./driver').get('type'), 'qcow2')
+        libvirt_driver.disconnect_volume(connection_info, "vde")
+
+    def test_libvirt_glusterfs_driver_with_opts(self):
+        mnt_base = '/mnt'
+        self.flags(glusterfs_mount_point_base=mnt_base, group='libvirt')
+
+        libvirt_driver = volume.LibvirtGlusterfsVolumeDriver(self.fake_conn)
+        self.stubs.Set(libvirt_utils, 'is_mounted', lambda x, d: False)
+        export_string = '192.168.1.1:/volume-00001'
         options = '-o backupvolfile-server=192.168.1.2'
         export_mnt_base = os.path.join(mnt_base,
-                libvirt_driver.get_hash_str(export_string))
+                utils.get_hash_str(export_string))
         file_path = os.path.join(export_mnt_base, self.name)
 
         connection_info = {'data': {'export': export_string,
@@ -491,12 +825,15 @@ class LibvirtVolumeTestCase(test.TestCase):
             ('mkdir', '-p', export_mnt_base),
             ('mount', '-t', 'glusterfs',
              '-o', 'backupvolfile-server=192.168.1.2',
-             export_string, export_mnt_base)]
+             export_string, export_mnt_base),
+            ('umount', export_mnt_base),
+        ]
         self.assertEqual(self.executes, expected_commands)
 
     def test_libvirt_glusterfs_libgfapi(self):
-        self.flags(qemu_allowed_storage_drivers=['gluster'])
+        self.flags(qemu_allowed_storage_drivers=['gluster'], group='libvirt')
         libvirt_driver = volume.LibvirtGlusterfsVolumeDriver(self.fake_conn)
+        self.stubs.Set(libvirt_utils, 'is_mounted', lambda x, d: False)
         export_string = '192.168.1.1:/volume-00001'
         name = 'volume-00001'
 
@@ -517,6 +854,7 @@ class LibvirtVolumeTestCase(test.TestCase):
         self.assertEqual(source.get('protocol'), 'gluster')
         self.assertEqual(source.get('name'), 'volume-00001/volume-00001')
         self.assertEqual(source.find('./host').get('name'), '192.168.1.1')
+        self.assertEqual(source.find('./host').get('port'), '24007')
 
         libvirt_driver.disconnect_volume(connection_info, "vde")
 
@@ -549,24 +887,28 @@ class LibvirtVolumeTestCase(test.TestCase):
                                 'id': 0, 'lun': 1}]}
         self.stubs.Set(linuxscsi, 'find_multipath_device', lambda x: devices)
         self.stubs.Set(linuxscsi, 'remove_device', lambda x: None)
-        wwn = '1234567890123456'
-        connection_info = self.fibrechan_connection(self.vol, self.location,
-                                                    wwn)
-        mount_device = "vde"
-        conf = libvirt_driver.connect_volume(connection_info, self.disk_info)
-        tree = conf.format_dom()
-        dev_str = '/dev/disk/by-path/pci-0000:05:00.2-fc-0x%s-lun-1' % wwn
-        self.assertEqual(tree.get('type'), 'block')
-        self.assertEqual(tree.find('./source').get('dev'), multipath_devname)
-        connection_info["data"]["devices"] = devices["devices"]
-        libvirt_driver.disconnect_volume(connection_info, mount_device)
-        expected_commands = []
-        self.assertEqual(self.executes, expected_commands)
+        # Should work for string, unicode, and list
+        wwns = ['1234567890123456', unicode('1234567890123456'),
+                ['1234567890123456', '1234567890123457']]
+        for wwn in wwns:
+            connection_info = self.fibrechan_connection(self.vol,
+                                                        self.location, wwn)
+            mount_device = "vde"
+            conf = libvirt_driver.connect_volume(connection_info,
+                                                 self.disk_info)
+            tree = conf.format_dom()
+            dev_str = '/dev/disk/by-path/pci-0000:05:00.2-fc-0x%s-lun-1' % wwn
+            self.assertEqual(tree.get('type'), 'block')
+            self.assertEqual(tree.find('./source').get('dev'),
+                             multipath_devname)
+            connection_info["data"]["devices"] = devices["devices"]
+            libvirt_driver.disconnect_volume(connection_info, mount_device)
+            expected_commands = []
+            self.assertEqual(self.executes, expected_commands)
 
-        self.stubs.Set(libvirt_utils, 'get_fc_hbas',
-                       lambda: [])
-        self.stubs.Set(libvirt_utils, 'get_fc_hbas_info',
-                       lambda: [])
+        # Should not work for anything other than string, unicode, and list
+        connection_info = self.fibrechan_connection(self.vol,
+                                                    self.location, 123)
         self.assertRaises(exception.NovaException,
                           libvirt_driver.connect_volume,
                           connection_info, self.disk_info)
@@ -614,7 +956,8 @@ class LibvirtVolumeTestCase(test.TestCase):
 
         self.stubs.Set(os, 'access', _access_wrapper)
         self.flags(scality_sofs_config=TEST_CONFIG,
-                   scality_sofs_mount_point=TEST_MOUNT)
+                   scality_sofs_mount_point=TEST_MOUNT,
+                   group='libvirt')
         driver = volume.LibvirtScalityVolumeDriver(self.fake_conn)
         conf = driver.connect_volume(TEST_CONN_INFO, self.disk_info)
 

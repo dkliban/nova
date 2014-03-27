@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 Isaku Yamahata
 # All Rights Reserved.
 #
@@ -25,7 +23,7 @@ from nova import test
 from nova.tests import matchers
 
 
-class BlockDeviceMappingEc2CloudTestCase(test.TestCase):
+class BlockDeviceMappingEc2CloudTestCase(test.NoDBTestCase):
     """Test Case for Block Device Mapping."""
 
     def fake_ec2_vol_id_to_uuid(obj, ec2_id):

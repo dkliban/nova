@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-#
 #    Copyright 2010 OpenStack Foundation
 #    (c) Copyright 2012-2013 Hewlett-Packard Development Company, L.P.
 #
@@ -27,7 +25,7 @@ LOG = logging.getLogger(__name__)
 CONF = cfg.CONF
 
 
-class StorageLinuxSCSITestCase(test.TestCase):
+class StorageLinuxSCSITestCase(test.NoDBTestCase):
     def setUp(self):
         super(StorageLinuxSCSITestCase, self).setUp()
         self.executes = []

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011 X.commerce, a business unit of eBay Inc.
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
@@ -21,14 +19,16 @@
 
 import calendar
 import inspect
-import netaddr
 import os
 import re
 
+import netaddr
 from oslo.config import cfg
+import six
 
-from nova import db
 from nova import exception
+from nova.objects import fixed_ip as fixed_ip_obj
+from nova.objects import virtual_interface as vif_obj
 from nova.openstack.common import excutils
 from nova.openstack.common import fileutils
 from nova.openstack.common.gettextutils import _
@@ -46,18 +46,18 @@ LOG = logging.getLogger(__name__)
 linux_net_opts = [
     cfg.MultiStrOpt('dhcpbridge_flagfile',
                     default=['/etc/nova/nova-dhcpbridge.conf'],
-                    help='location of flagfiles for dhcpbridge'),
+                    help='Location of flagfiles for dhcpbridge'),
     cfg.StrOpt('networks_path',
                default=paths.state_path_def('networks'),
                help='Location to keep network config files'),
     cfg.StrOpt('public_interface',
                default='eth0',
                help='Interface for public IP addresses'),
-    cfg.StrOpt('network_device_mtu',
-               help='MTU setting for vlan'),
+    cfg.IntOpt('network_device_mtu',
+               help='MTU setting for network interface'),
     cfg.StrOpt('dhcpbridge',
                default=paths.bindir_def('nova-dhcpbridge'),
-               help='location of nova-dhcpbridge'),
+               help='Location of nova-dhcpbridge'),
     cfg.StrOpt('routing_source_ip',
                default='$my_ip',
                help='Public IP of network host'),
@@ -66,12 +66,12 @@ linux_net_opts = [
                help='Lifetime of a DHCP lease in seconds'),
     cfg.MultiStrOpt('dns_server',
                     default=[],
-                    help='if set, uses specific dns server for dnsmasq. Can'
-                         'be specified multiple times.'),
+                    help='If set, uses specific DNS server for dnsmasq. Can'
+                         ' be specified multiple times.'),
     cfg.BoolOpt('use_network_dns_servers',
                 default=False,
-                help='if set, uses the dns1 and dns2 from the network ref.'
-                     'as dns servers.'),
+                help='If set, uses the dns1 and dns2 from the network ref.'
+                     ' as dns servers.'),
     cfg.ListOpt('dmz_cidr',
                default=[],
                help='A list of dmz range that should be accepted'),
@@ -91,10 +91,10 @@ linux_net_opts = [
                help='Name of Open vSwitch bridge used with linuxnet'),
     cfg.BoolOpt('send_arp_for_ha',
                 default=False,
-                help='send gratuitous ARPs for HA setup'),
+                help='Send gratuitous ARPs for HA setup'),
     cfg.IntOpt('send_arp_for_ha_count',
                default=3,
-               help='send this many gratuitous ARPs for HA setup'),
+               help='Send this many gratuitous ARPs for HA setup'),
     cfg.BoolOpt('use_single_default_gateway',
                 default=False,
                 help='Use single default gateway. Only first nic of vm will '
@@ -106,22 +106,29 @@ linux_net_opts = [
                          'Can be specified multiple times.'),
     cfg.StrOpt('metadata_host',
                default='$my_ip',
-               help='the ip for the metadata api server'),
+               help='The IP address for the metadata API server'),
     cfg.IntOpt('metadata_port',
                default=8775,
-               help='the port for the metadata api port'),
+               help='The port for the metadata API port'),
     cfg.StrOpt('iptables_top_regex',
                default='',
-               help='Regular expression to match iptables rule that should'
+               help='Regular expression to match iptables rule that should '
                     'always be on the top.'),
     cfg.StrOpt('iptables_bottom_regex',
                default='',
-               help='Regular expression to match iptables rule that should'
+               help='Regular expression to match iptables rule that should '
                     'always be on the bottom.'),
     cfg.StrOpt('iptables_drop_action',
                default='DROP',
                help=('The table that iptables to jump to when a packet is '
                      'to be dropped.')),
+    cfg.IntOpt('ovs_vsctl_timeout',
+               default=120,
+               help='Amount of time, in seconds, that ovs_vsctl should wait '
+                    'for a response from the database. 0 is to wait forever.'),
+    cfg.BoolOpt('fake_network',
+                default=False,
+                help='If passed, use fake network devices and addresses'),
     ]
 
 CONF = cfg.CONF
@@ -292,7 +299,7 @@ class IptablesTable(object):
 
     def remove_rules_regex(self, regex):
         """Remove all rules matching regex."""
-        if isinstance(regex, basestring):
+        if isinstance(regex, six.string_types):
             regex = re.compile(regex)
         num_rules = len(self.rules)
         self.rules = filter(lambda r: not regex.match(str(r)), self.rules)
@@ -804,20 +811,32 @@ def clean_conntrack(fixed_ip):
         LOG.exception(_('Error deleting conntrack entries for %s'), fixed_ip)
 
 
+def _enable_ipv4_forwarding():
+    sysctl_key = 'net.ipv4.ip_forward'
+    stdout, stderr = _execute('sysctl', '-n', sysctl_key)
+    if stdout.strip() is not '1':
+        _execute('sysctl', '-w', '%s=1' % sysctl_key, run_as_root=True)
+
+
+@utils.synchronized('lock_gateway', external=True)
 def initialize_gateway_device(dev, network_ref):
     if not network_ref:
         return
 
-    _execute('sysctl', '-w', 'net.ipv4.ip_forward=1', run_as_root=True)
+    _enable_ipv4_forwarding()
 
     # NOTE(vish): The ip for dnsmasq has to be the first address on the
     #             bridge for it to respond to reqests properly
-    full_ip = '%s/%s' % (network_ref['dhcp_server'],
-                         network_ref['cidr'].rpartition('/')[2])
+    try:
+        prefix = network_ref.cidr.prefixlen
+    except AttributeError:
+        prefix = network_ref['cidr'].rpartition('/')[2]
+
+    full_ip = '%s/%s' % (network_ref['dhcp_server'], prefix)
     new_ip_params = [[full_ip, 'brd', network_ref['broadcast']]]
     old_ip_params = []
     out, err = _execute('ip', 'addr', 'show', 'dev', dev,
-                        'scope', 'global', run_as_root=True)
+                        'scope', 'global')
     for line in out.split('\n'):
         fields = line.split()
         if fields and fields[0] == 'inet':
@@ -827,8 +846,7 @@ def initialize_gateway_device(dev, network_ref):
                 new_ip_params.append(ip_params)
     if not old_ip_params or old_ip_params[0][0] != full_ip:
         old_routes = []
-        result = _execute('ip', 'route', 'show', 'dev', dev,
-                          run_as_root=True)
+        result = _execute('ip', 'route', 'show', 'dev', dev)
         if result:
             out, err = result
             for line in out.split('\n'):
@@ -862,13 +880,13 @@ def get_dhcp_leases(context, network_ref):
     host = None
     if network_ref['multi_host']:
         host = CONF.host
-    for data in db.network_get_associated_fixed_ips(context,
-                                                    network_ref['id'],
-                                                    host=host):
+    for fixedip in fixed_ip_obj.FixedIPList.get_by_network(context,
+                                                           network_ref,
+                                                           host=host):
         # NOTE(cfb): Don't return a lease entry if the IP isn't
         #            already leased
-        if data['allocated'] and data['leased']:
-            hosts.append(_host_lease(data))
+        if fixedip.allocated and fixedip.leased:
+            hosts.append(_host_lease(fixedip))
 
     return '\n'.join(hosts)
 
@@ -880,21 +898,21 @@ def get_dhcp_hosts(context, network_ref):
     if network_ref['multi_host']:
         host = CONF.host
     macs = set()
-    for data in db.network_get_associated_fixed_ips(context,
-                                                    network_ref['id'],
-                                                    host=host):
-        if data['vif_address'] not in macs:
-            hosts.append(_host_dhcp(data))
-            macs.add(data['vif_address'])
+    for fixedip in fixed_ip_obj.FixedIPList.get_by_network(context,
+                                                           network_ref,
+                                                           host=host):
+        if fixedip.virtual_interface.address not in macs:
+            hosts.append(_host_dhcp(fixedip))
+            macs.add(fixedip.virtual_interface.address)
     return '\n'.join(hosts)
 
 
 def get_dns_hosts(context, network_ref):
     """Get network's DNS hosts in hosts format."""
     hosts = []
-    for data in db.network_get_associated_fixed_ips(context,
-                                                    network_ref['id']):
-        hosts.append(_host_dns(data))
+    for fixedip in fixed_ip_obj.FixedIPList.get_by_network(context,
+                                                           network_ref):
+        hosts.append(_host_dns(fixedip))
     return '\n'.join(hosts)
 
 
@@ -948,26 +966,25 @@ def get_dhcp_opts(context, network_ref):
     host = None
     if network_ref['multi_host']:
         host = CONF.host
-    data = db.network_get_associated_fixed_ips(context,
-                                               network_ref['id'],
-                                               host=host)
-
-    if data:
-        instance_set = set([datum['instance_uuid'] for datum in data])
+    fixedips = fixed_ip_obj.FixedIPList.get_by_network(context, network_ref,
+                                                       host=host)
+    if fixedips:
+        instance_set = set([fixedip.instance_uuid for fixedip in fixedips])
         default_gw_vif = {}
         for instance_uuid in instance_set:
-            vifs = db.virtual_interface_get_by_instance(context,
-                                                        instance_uuid)
+            vifs = vif_obj.VirtualInterfaceList.get_by_instance_uuid(context,
+                    instance_uuid)
             if vifs:
                 #offer a default gateway to the first virtual interface
-                default_gw_vif[instance_uuid] = vifs[0]['id']
+                default_gw_vif[instance_uuid] = vifs[0].id
 
-        for datum in data:
-            instance_uuid = datum['instance_uuid']
+        for fixedip in fixedips:
+            instance_uuid = fixedip.instance_uuid
             if instance_uuid in default_gw_vif:
                 # we don't want default gateway for this fixed ip
-                if default_gw_vif[instance_uuid] != datum['vif_id']:
-                    hosts.append(_host_dhcp_opts(datum))
+                if (default_gw_vif[instance_uuid] !=
+                        fixedip.virtual_interface_id):
+                    hosts.append(_host_dhcp_opts(fixedip))
     return '\n'.join(hosts)
 
 
@@ -1027,8 +1044,7 @@ def restart_dhcp(context, dev, network_ref):
         write_to_file(optsfile, get_dhcp_opts(context, network_ref))
         os.chmod(optsfile, 0o644)
 
-    if network_ref['multi_host']:
-        _add_dhcp_mangle_rule(dev)
+    _add_dhcp_mangle_rule(dev)
 
     # Make sure dnsmasq can actually read it (it setuid()s to "nobody")
     os.chmod(conffile, 0o644)
@@ -1140,44 +1156,44 @@ interface %s
     _execute(*cmd, run_as_root=True)
 
 
-def _host_lease(data):
+def _host_lease(fixedip):
     """Return a host string for an address in leasefile format."""
     timestamp = timeutils.utcnow()
     seconds_since_epoch = calendar.timegm(timestamp.utctimetuple())
     return '%d %s %s %s *' % (seconds_since_epoch + CONF.dhcp_lease_time,
-                              data['vif_address'],
-                              data['address'],
-                              data['instance_hostname'] or '*')
+                              fixedip.virtual_interface.address,
+                              fixedip.address,
+                              fixedip.instance.hostname or '*')
 
 
 def _host_dhcp_network(data):
-    return 'NW-%s' % data['vif_id']
+    return 'NW-%s' % data.virtual_interface_id
 
 
-def _host_dhcp(data):
+def _host_dhcp(fixedip):
     """Return a host string for an address in dhcp-host format."""
     if CONF.use_single_default_gateway:
-        return '%s,%s.%s,%s,%s' % (data['vif_address'],
-                               data['instance_hostname'],
+        return '%s,%s.%s,%s,%s' % (fixedip.virtual_interface.address,
+                               fixedip.instance.hostname,
                                CONF.dhcp_domain,
-                               data['address'],
-                               'net:' + _host_dhcp_network(data))
+                               fixedip.address,
+                               'net:' + _host_dhcp_network(fixedip))
     else:
-        return '%s,%s.%s,%s' % (data['vif_address'],
-                               data['instance_hostname'],
+        return '%s,%s.%s,%s' % (fixedip.virtual_interface.address,
+                               fixedip.instance.hostname,
                                CONF.dhcp_domain,
-                               data['address'])
+                               fixedip.address)
 
 
-def _host_dns(data):
-    return '%s\t%s.%s' % (data['address'],
-                          data['instance_hostname'],
+def _host_dns(fixedip):
+    return '%s\t%s.%s' % (fixedip.address,
+                          fixedip.instance.hostname,
                           CONF.dhcp_domain)
 
 
-def _host_dhcp_opts(data):
+def _host_dhcp_opts(fixedip):
     """Return an empty gateway option."""
-    return '%s,%s' % (_host_dhcp_network(data), 3)
+    return '%s,%s' % (_host_dhcp_network(fixedip), 3)
 
 
 def _execute(*cmd, **kwargs):
@@ -1191,9 +1207,7 @@ def _execute(*cmd, **kwargs):
 
 def device_exists(device):
     """Check if ethernet device exists."""
-    (_out, err) = _execute('ip', 'link', 'show', 'dev', device,
-                           check_exit_code=False, run_as_root=True)
-    return not err
+    return os.path.exists('/sys/class/net/%s' % device)
 
 
 def _dhcp_file(dev, kind):
@@ -1253,6 +1267,15 @@ def _ip_bridge_cmd(action, params, device):
     return cmd
 
 
+def _set_device_mtu(dev):
+    """Set the device MTU."""
+
+    if CONF.network_device_mtu:
+        utils.execute('ip', 'link', 'set', dev, 'mtu',
+                      CONF.network_device_mtu, run_as_root=True,
+                      check_exit_code=[0, 2, 254])
+
+
 def _create_veth_pair(dev1_name, dev2_name):
     """Create a pair of veth devices with the specified names,
     deleting any previous devices with those names.
@@ -1266,22 +1289,32 @@ def _create_veth_pair(dev1_name, dev2_name):
         utils.execute('ip', 'link', 'set', dev, 'up', run_as_root=True)
         utils.execute('ip', 'link', 'set', dev, 'promisc', 'on',
                       run_as_root=True)
+        _set_device_mtu(dev)
+
+
+def _ovs_vsctl(args):
+    full_args = ['ovs-vsctl', '--timeout=%s' % CONF.ovs_vsctl_timeout] + args
+    try:
+        return utils.execute(*full_args, run_as_root=True)
+    except Exception as e:
+        LOG.error(_("Unable to execute %(cmd)s. Exception: %(exception)s"),
+                  {'cmd': full_args, 'exception': e})
+        raise exception.AgentError(method=full_args)
 
 
 def create_ovs_vif_port(bridge, dev, iface_id, mac, instance_id):
-    utils.execute('ovs-vsctl', '--', '--may-exist', 'add-port',
-                  bridge, dev,
-                  '--', 'set', 'Interface', dev,
-                  'external-ids:iface-id=%s' % iface_id,
-                  'external-ids:iface-status=active',
-                  'external-ids:attached-mac=%s' % mac,
-                  'external-ids:vm-uuid=%s' % instance_id,
-                  run_as_root=True)
+    _ovs_vsctl(['--', '--if-exists', 'del-port', dev, '--',
+                'add-port', bridge, dev,
+                '--', 'set', 'Interface', dev,
+                'external-ids:iface-id=%s' % iface_id,
+                'external-ids:iface-status=active',
+                'external-ids:attached-mac=%s' % mac,
+                'external-ids:vm-uuid=%s' % instance_id])
+    _set_device_mtu(dev)
 
 
 def delete_ovs_vif_port(bridge, dev):
-    utils.execute('ovs-vsctl', 'del-port', bridge, dev,
-                  run_as_root=True)
+    _ovs_vsctl(['del-port', bridge, dev])
     delete_net_dev(dev)
 
 
@@ -1354,8 +1387,7 @@ def get_dev(network):
 
 
 class LinuxNetInterfaceDriver(object):
-    """
-    Abstract class that defines generic network host API
+    """Abstract class that defines generic network host API
     for for all Linux interface drivers.
     """
 
@@ -1419,24 +1451,24 @@ class LinuxBridgeInterfaceDriver(LinuxNetInterfaceDriver):
     def get_dev(self, network):
         return network['bridge']
 
-    @classmethod
-    def ensure_vlan_bridge(_self, vlan_num, bridge, bridge_interface,
-                                            net_attrs=None, mac_address=None):
+    @staticmethod
+    def ensure_vlan_bridge(vlan_num, bridge, bridge_interface,
+                           net_attrs=None, mac_address=None):
         """Create a vlan and bridge unless they already exist."""
         interface = LinuxBridgeInterfaceDriver.ensure_vlan(vlan_num,
                                                bridge_interface, mac_address)
         LinuxBridgeInterfaceDriver.ensure_bridge(bridge, interface, net_attrs)
         return interface
 
-    @classmethod
-    def remove_vlan_bridge(cls, vlan_num, bridge):
+    @staticmethod
+    def remove_vlan_bridge(vlan_num, bridge):
         """Delete a bridge and vlan."""
         LinuxBridgeInterfaceDriver.remove_bridge(bridge)
         LinuxBridgeInterfaceDriver.remove_vlan(vlan_num)
 
-    @classmethod
+    @staticmethod
     @utils.synchronized('lock_vlan', external=True)
-    def ensure_vlan(_self, vlan_num, bridge_interface, mac_address=None):
+    def ensure_vlan(vlan_num, bridge_interface, mac_address=None):
         """Create a vlan unless it already exists."""
         interface = 'vlan%s' % vlan_num
         if not device_exists(interface):
@@ -1453,22 +1485,19 @@ class LinuxBridgeInterfaceDriver(LinuxNetInterfaceDriver):
                          check_exit_code=[0, 2, 254])
             _execute('ip', 'link', 'set', interface, 'up', run_as_root=True,
                      check_exit_code=[0, 2, 254])
-            if CONF.network_device_mtu:
-                _execute('ip', 'link', 'set', interface, 'mtu',
-                         CONF.network_device_mtu, run_as_root=True,
-                         check_exit_code=[0, 2, 254])
+            _set_device_mtu(interface)
         return interface
 
-    @classmethod
+    @staticmethod
     @utils.synchronized('lock_vlan', external=True)
-    def remove_vlan(cls, vlan_num):
+    def remove_vlan(vlan_num):
         """Delete a vlan."""
         vlan_interface = 'vlan%s' % vlan_num
         delete_net_dev(vlan_interface)
 
-    @classmethod
+    @staticmethod
     @utils.synchronized('lock_bridge', external=True)
-    def ensure_bridge(_self, bridge, interface, net_attrs=None, gateway=True,
+    def ensure_bridge(bridge, interface, net_attrs=None, gateway=True,
                       filtering=True):
         """Create a bridge unless it already exists.
 
@@ -1502,6 +1531,8 @@ class LinuxBridgeInterfaceDriver(LinuxNetInterfaceDriver):
             LOG.debug(msg, {'interface': interface, 'bridge': bridge})
             out, err = _execute('brctl', 'addif', bridge, interface,
                                 check_exit_code=False, run_as_root=True)
+            out, err = _execute('ip', 'link', 'set', interface, 'up',
+                                check_exit_code=False, run_as_root=True)
 
             # NOTE(vish): This will break if there is already an ip on the
             #             interface, so we move any ips to the bridge
@@ -1516,11 +1547,11 @@ class LinuxBridgeInterfaceDriver(LinuxNetInterfaceDriver):
                     _execute('ip', 'route', 'del', *fields,
                              run_as_root=True)
             out, err = _execute('ip', 'addr', 'show', 'dev', interface,
-                                'scope', 'global', run_as_root=True)
+                                'scope', 'global')
             for line in out.split('\n'):
                 fields = line.split()
                 if fields and fields[0] == 'inet':
-                    if fields[-2] == 'secondary':
+                    if fields[-2] in ('secondary', 'dynamic', ):
                         params = fields[1:-2]
                     else:
                         params = fields[1:-1]
@@ -1551,9 +1582,9 @@ class LinuxBridgeInterfaceDriver(LinuxNetInterfaceDriver):
                                      ('--out-interface %s -j %s'
                                       % (bridge, CONF.iptables_drop_action)))
 
-    @classmethod
+    @staticmethod
     @utils.synchronized('lock_bridge', external=True)
-    def remove_bridge(cls, bridge, gateway=True, filtering=True):
+    def remove_bridge(bridge, gateway=True, filtering=True):
         """Delete a bridge."""
         if not device_exists(bridge):
             return
@@ -1694,21 +1725,17 @@ class LinuxOVSInterfaceDriver(LinuxNetInterfaceDriver):
         dev = self.get_dev(network)
         if not device_exists(dev):
             bridge = CONF.linuxnet_ovs_integration_bridge
-            _execute('ovs-vsctl',
-                     '--', '--may-exist', 'add-port', bridge, dev,
-                     '--', 'set', 'Interface', dev, 'type=internal',
-                     '--', 'set', 'Interface', dev,
-                     'external-ids:iface-id=%s' % dev,
-                     '--', 'set', 'Interface', dev,
-                     'external-ids:iface-status=active',
-                     '--', 'set', 'Interface', dev,
-                     'external-ids:attached-mac=%s' % mac_address,
-                     run_as_root=True)
+            _ovs_vsctl(['--', '--may-exist', 'add-port', bridge, dev,
+                        '--', 'set', 'Interface', dev, 'type=internal',
+                        '--', 'set', 'Interface', dev,
+                        'external-ids:iface-id=%s' % dev,
+                        '--', 'set', 'Interface', dev,
+                        'external-ids:iface-status=active',
+                        '--', 'set', 'Interface', dev,
+                        'external-ids:attached-mac=%s' % mac_address])
             _execute('ip', 'link', 'set', dev, 'address', mac_address,
                      run_as_root=True)
-            if CONF.network_device_mtu:
-                _execute('ip', 'link', 'set', dev, 'mtu',
-                         CONF.network_device_mtu, run_as_root=True)
+            _set_device_mtu(dev)
             _execute('ip', 'link', 'set', dev, 'up', run_as_root=True)
             if not gateway:
                 # If we weren't instructed to act as a gateway then add the
@@ -1735,8 +1762,7 @@ class LinuxOVSInterfaceDriver(LinuxNetInterfaceDriver):
     def unplug(self, network):
         dev = self.get_dev(network)
         bridge = CONF.linuxnet_ovs_integration_bridge
-        _execute('ovs-vsctl', '--', '--if-exists', 'del-port',
-                 bridge, dev, run_as_root=True)
+        _ovs_vsctl(['--', '--if-exists', 'del-port', bridge, dev])
         return dev
 
     def get_dev(self, network):

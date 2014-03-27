@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011-2013 University of Southern California / ISI
 # All Rights Reserved.
 #
@@ -22,6 +20,7 @@ Class for Tilera bare-metal nodes.
 import base64
 import os
 
+import jinja2
 from oslo.config import cfg
 
 from nova.compute import flavors
@@ -44,28 +43,14 @@ CONF.import_opt('use_ipv6', 'nova.netconf')
 CONF.import_opt('net_config_template', 'nova.virt.baremetal.pxe',
                 group='baremetal')
 
-CHEETAH = None
-
-
-def _get_cheetah():
-    global CHEETAH
-    if CHEETAH is None:
-        from Cheetah import Template
-        CHEETAH = Template.Template
-    return CHEETAH
-
 
 def build_network_config(network_info):
     interfaces = bm_utils.map_network_interfaces(network_info, CONF.use_ipv6)
-    cheetah = _get_cheetah()
-    network_config = str(cheetah(
-            open(CONF.baremetal.net_config_template).read(),
-            searchList=[
-                {'interfaces': interfaces,
-                 'use_ipv6': CONF.use_ipv6,
-                }
-            ]))
-    return network_config
+    tmpl_path, tmpl_file = os.path.split(CONF.baremetal.net_config_template)
+    env = jinja2.Environment(loader=jinja2.FileSystemLoader(tmpl_path))
+    template = env.get_template(tmpl_file)
+    return template.render({'interfaces': interfaces,
+                            'use_ipv6': CONF.use_ipv6})
 
 
 def get_image_dir_path(instance):
@@ -85,9 +70,9 @@ def get_tilera_nfs_path(node_id):
 
 
 def get_partition_sizes(instance):
-    instance_type = flavors.extract_flavor(instance)
-    root_mb = instance_type['root_gb'] * 1024
-    swap_mb = instance_type['swap']
+    flavor = flavors.extract_flavor(instance)
+    root_mb = flavor['root_gb'] * 1024
+    swap_mb = flavor['swap']
 
     if swap_mb < 1:
         swap_mb = 1
@@ -96,8 +81,7 @@ def get_partition_sizes(instance):
 
 
 def get_tftp_image_info(instance):
-    """
-    Generate the paths for tftp files for this instance.
+    """Generate the paths for tftp files for this instance.
 
     Raises NovaException if
     - instance does not contain kernel_id
@@ -181,7 +165,8 @@ class Tilera(base.NodeDriver):
                              target=image_path,
                              image_id=image_meta['id'],
                              user_id=instance['user_id'],
-                             project_id=instance['project_id']
+                             project_id=instance['project_id'],
+                             clean=True,
                         )
 
         return [image_meta['id'], image_path]
@@ -218,7 +203,7 @@ class Tilera(base.NodeDriver):
                     image=get_image_file_path(instance),
                     key=ssh_key,
                     net=net_config,
-                    metadata=instance['metadata'],
+                    metadata=utils.instance_meta(instance),
                     admin_password=admin_password,
                     files=injected_files,
                     partition=partition,
@@ -311,8 +296,7 @@ class Tilera(base.NodeDriver):
                 os.path.join(CONF.baremetal.tftp_root, instance['uuid']))
 
     def _iptables_set(self, node_ip, user_data):
-        """
-        Sets security setting (iptables:port) if needed.
+        """Sets security setting (iptables:port) if needed.
 
         iptables -A INPUT -p tcp ! -s $IP --dport $PORT -j DROP
         /tftpboot/iptables_rule script sets iptables rule on the given node.

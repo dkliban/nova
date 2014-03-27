@@ -96,9 +96,7 @@ class HostController(object):
 
     @wsgi.serializers(xml=HostIndexTemplate)
     def index(self, req):
-        """
-        :returns: A dict in the format:
-
+        """Returns a dict in the format:
             {'hosts': [{'host_name': 'some.host.name',
                'service': 'cells',
                'zone': 'internal'},
@@ -151,19 +149,20 @@ class HostController(object):
     @wsgi.serializers(xml=HostUpdateTemplate)
     @wsgi.deserializers(xml=HostUpdateDeserializer)
     def update(self, req, id, body):
-        """
+        """Updates a specified body.
+
         :param body: example format {'status': 'enable',
                                      'maintenance_mode': 'enable'}
-        :returns:
         """
         def read_enabled(orig_val, msg):
-            """
+            """Checks a specified orig_val and returns True for 'enabled'
+            and False for 'disabled'.
+
             :param orig_val: A string with either 'enable' or 'disable'. May
                              be surrounded by whitespace, and case doesn't
                              matter
             :param msg: The message to be passed to HTTPBadRequest. A single
                         %s will be replaced with orig_val.
-            :returns:   True for 'enabled' and False for 'disabled'
             """
             val = orig_val.strip().lower()
             if val == "enable":
@@ -336,7 +335,7 @@ class HostController(object):
         except exception.AdminRequired:
             msg = _("Describe-resource is admin only functionality")
             raise webob.exc.HTTPForbidden(explanation=msg)
-        compute_node = service['compute_node'][0]
+        compute_node = service['compute_node']
         instances = self.api.instance_get_all_by_host(context, host_name)
         resources = [self._get_total_resources(host_name, compute_node)]
         resources.append(self._get_used_now_resources(host_name,

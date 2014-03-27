@@ -12,37 +12,55 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import copy
-
 from nova.cells import opts as cells_opts
 from nova.cells import rpcapi as cells_rpcapi
+from nova.compute import flavors
 from nova import db
 from nova import exception
 from nova import notifications
 from nova.objects import base
+from nova.objects import fields
+from nova.objects import flavor as flavor_obj
 from nova.objects import instance_fault
 from nova.objects import instance_info_cache
+from nova.objects import pci_device
 from nova.objects import security_group
-from nova.objects import utils as obj_utils
+from nova.openstack.common.gettextutils import _
+from nova.openstack.common import log as logging
+from nova.openstack.common import timeutils
 from nova import utils
 
 from oslo.config import cfg
 
 
 CONF = cfg.CONF
+LOG = logging.getLogger(__name__)
 
+
+# List of fields that can be joined in DB layer.
+_INSTANCE_OPTIONAL_JOINED_FIELDS = ['metadata', 'system_metadata',
+                                    'info_cache', 'security_groups',
+                                    'pci_devices']
+# These are fields that are optional but don't translate to db columns
+_INSTANCE_OPTIONAL_NON_COLUMN_FIELDS = ['fault']
 
 # These are fields that can be specified as expected_attrs
-INSTANCE_OPTIONAL_FIELDS = ['metadata', 'system_metadata', 'fault']
-# These are fields that are always joined by the db right now
-INSTANCE_IMPLIED_FIELDS = ['info_cache', 'security_groups']
-# These are fields that are optional but don't translate to db columns
-INSTANCE_OPTIONAL_NON_COLUMNS = ['fault']
-# These are all fields that most query calls load by default
-INSTANCE_DEFAULT_FIELDS = INSTANCE_OPTIONAL_FIELDS + INSTANCE_IMPLIED_FIELDS
+INSTANCE_OPTIONAL_ATTRS = (_INSTANCE_OPTIONAL_JOINED_FIELDS +
+                           _INSTANCE_OPTIONAL_NON_COLUMN_FIELDS)
+# These are fields that most query calls load by default
+INSTANCE_DEFAULT_FIELDS = ['metadata', 'system_metadata',
+                           'info_cache', 'security_groups']
 
 
-class Instance(base.NovaObject):
+def _expected_cols(expected_attrs):
+    """Return expected_attrs that are columns needing joining."""
+    if not expected_attrs:
+        return expected_attrs
+    return [attr for attr in expected_attrs
+                 if attr in _INSTANCE_OPTIONAL_JOINED_FIELDS]
+
+
+class Instance(base.NovaPersistentObject, base.NovaObject):
     # Version 1.0: Initial version
     # Version 1.1: Added info_cache
     # Version 1.2: Added security_groups
@@ -50,106 +68,119 @@ class Instance(base.NovaObject):
     #              save()
     # Version 1.4: Added locked_by and deprecated locked
     # Version 1.5: Added cleaned
-    VERSION = '1.5'
+    # Version 1.6: Added pci_devices
+    # Version 1.7: String attributes updated to support unicode
+    # Version 1.8: 'security_groups' and 'pci_devices' cannot be None
+    # Version 1.9: Make uuid a non-None real string
+    # Version 1.10: Added use_slave to refresh and get_by_uuid
+    # Version 1.11: Update instance from database during destroy
+    # Version 1.12: Added ephemeral_key_uuid
+    # Version 1.13: Added delete_metadata_key()
+    VERSION = '1.13'
 
     fields = {
-        'id': int,
+        'id': fields.IntegerField(),
 
-        'user_id': obj_utils.str_or_none,
-        'project_id': obj_utils.str_or_none,
+        'user_id': fields.StringField(nullable=True),
+        'project_id': fields.StringField(nullable=True),
 
-        'image_ref': obj_utils.str_or_none,
-        'kernel_id': obj_utils.str_or_none,
-        'ramdisk_id': obj_utils.str_or_none,
-        'hostname': obj_utils.str_or_none,
+        'image_ref': fields.StringField(nullable=True),
+        'kernel_id': fields.StringField(nullable=True),
+        'ramdisk_id': fields.StringField(nullable=True),
+        'hostname': fields.StringField(nullable=True),
 
-        'launch_index': obj_utils.int_or_none,
-        'key_name': obj_utils.str_or_none,
-        'key_data': obj_utils.str_or_none,
+        'launch_index': fields.IntegerField(nullable=True),
+        'key_name': fields.StringField(nullable=True),
+        'key_data': fields.StringField(nullable=True),
 
-        'power_state': obj_utils.int_or_none,
-        'vm_state': obj_utils.str_or_none,
-        'task_state': obj_utils.str_or_none,
+        'power_state': fields.IntegerField(nullable=True),
+        'vm_state': fields.StringField(nullable=True),
+        'task_state': fields.StringField(nullable=True),
 
-        'memory_mb': obj_utils.int_or_none,
-        'vcpus': obj_utils.int_or_none,
-        'root_gb': obj_utils.int_or_none,
-        'ephemeral_gb': obj_utils.int_or_none,
+        'memory_mb': fields.IntegerField(nullable=True),
+        'vcpus': fields.IntegerField(nullable=True),
+        'root_gb': fields.IntegerField(nullable=True),
+        'ephemeral_gb': fields.IntegerField(nullable=True),
+        'ephemeral_key_uuid': fields.UUIDField(nullable=True),
 
-        'host': obj_utils.str_or_none,
-        'node': obj_utils.str_or_none,
+        'host': fields.StringField(nullable=True),
+        'node': fields.StringField(nullable=True),
 
-        'instance_type_id': obj_utils.int_or_none,
+        'instance_type_id': fields.IntegerField(nullable=True),
 
-        'user_data': obj_utils.str_or_none,
+        'user_data': fields.StringField(nullable=True),
 
-        'reservation_id': obj_utils.str_or_none,
+        'reservation_id': fields.StringField(nullable=True),
 
-        'scheduled_at': obj_utils.datetime_or_str_or_none,
-        'launched_at': obj_utils.datetime_or_str_or_none,
-        'terminated_at': obj_utils.datetime_or_str_or_none,
+        'scheduled_at': fields.DateTimeField(nullable=True),
+        'launched_at': fields.DateTimeField(nullable=True),
+        'terminated_at': fields.DateTimeField(nullable=True),
 
-        'availability_zone': obj_utils.str_or_none,
+        'availability_zone': fields.StringField(nullable=True),
 
-        'display_name': obj_utils.str_or_none,
-        'display_description': obj_utils.str_or_none,
+        'display_name': fields.StringField(nullable=True),
+        'display_description': fields.StringField(nullable=True),
 
-        'launched_on': obj_utils.str_or_none,
+        'launched_on': fields.StringField(nullable=True),
 
         # NOTE(jdillaman): locked deprecated in favor of locked_by,
         # to be removed in Icehouse
-        'locked': bool,
-        'locked_by': obj_utils.str_or_none,
+        'locked': fields.BooleanField(default=False),
+        'locked_by': fields.StringField(nullable=True),
 
-        'os_type': obj_utils.str_or_none,
-        'architecture': obj_utils.str_or_none,
-        'vm_mode': obj_utils.str_or_none,
-        'uuid': obj_utils.str_or_none,
+        'os_type': fields.StringField(nullable=True),
+        'architecture': fields.StringField(nullable=True),
+        'vm_mode': fields.StringField(nullable=True),
+        'uuid': fields.UUIDField(),
 
-        'root_device_name': obj_utils.str_or_none,
-        'default_ephemeral_device': obj_utils.str_or_none,
-        'default_swap_device': obj_utils.str_or_none,
-        'config_drive': obj_utils.str_or_none,
+        'root_device_name': fields.StringField(nullable=True),
+        'default_ephemeral_device': fields.StringField(nullable=True),
+        'default_swap_device': fields.StringField(nullable=True),
+        'config_drive': fields.StringField(nullable=True),
 
-        'access_ip_v4': obj_utils.ip_or_none(4),
-        'access_ip_v6': obj_utils.ip_or_none(6),
+        'access_ip_v4': fields.IPV4AddressField(nullable=True),
+        'access_ip_v6': fields.IPV6AddressField(nullable=True),
 
-        'auto_disk_config': bool,
-        'progress': obj_utils.int_or_none,
+        'auto_disk_config': fields.BooleanField(default=False),
+        'progress': fields.IntegerField(nullable=True),
 
-        'shutdown_terminate': bool,
-        'disable_terminate': bool,
+        'shutdown_terminate': fields.BooleanField(default=False),
+        'disable_terminate': fields.BooleanField(default=False),
 
-        'cell_name': obj_utils.str_or_none,
+        'cell_name': fields.StringField(nullable=True),
 
-        'metadata': dict,
-        'system_metadata': dict,
+        'metadata': fields.DictOfStringsField(),
+        'system_metadata': fields.DictOfNullableStringsField(),
 
-        'info_cache': obj_utils.nested_object_or_none(
-            instance_info_cache.InstanceInfoCache),
+        'info_cache': fields.ObjectField('InstanceInfoCache',
+                                         nullable=True),
 
-        'security_groups': obj_utils.nested_object_or_none(
-            security_group.SecurityGroupList),
+        'security_groups': fields.ObjectField('SecurityGroupList'),
 
-        'fault': obj_utils.nested_object_or_none(
-            instance_fault.InstanceFault),
+        'fault': fields.ObjectField('InstanceFault', nullable=True),
 
-        'cleaned': bool,
+        'cleaned': fields.BooleanField(default=False),
 
+        'pci_devices': fields.ObjectField('PciDeviceList', nullable=True),
         }
 
     obj_extra_fields = ['name']
 
     def __init__(self, *args, **kwargs):
         super(Instance, self).__init__(*args, **kwargs)
-        self.obj_reset_changes()
+        self._reset_metadata_tracking()
+
+    def _reset_metadata_tracking(self, fields=None):
+        if fields is None or 'system_metadata' in fields:
+            self._orig_system_metadata = (dict(self.system_metadata) if
+                                          'system_metadata' in self else {})
+        if fields is None or 'metadata' in fields:
+            self._orig_metadata = (dict(self.metadata) if
+                                   'metadata' in self else {})
 
     def obj_reset_changes(self, fields=None):
         super(Instance, self).obj_reset_changes(fields)
-        self._orig_system_metadata = (dict(self.system_metadata) if
-                                      'system_metadata' in self else {})
-        self._orig_metadata = (dict(self.metadata) if
-                               'metadata' in self else {})
+        self._reset_metadata_tracking(fields=fields)
 
     def obj_what_changed(self):
         changes = super(Instance, self).obj_what_changed()
@@ -159,6 +190,42 @@ class Instance(base.NovaObject):
                                           self._orig_system_metadata):
             changes.add('system_metadata')
         return changes
+
+    @classmethod
+    def _obj_from_primitive(cls, context, objver, primitive):
+        self = super(Instance, cls)._obj_from_primitive(context, objver,
+                                                        primitive)
+        self._reset_metadata_tracking()
+        return self
+
+    def obj_make_compatible(self, primitive, target_version):
+        target_version = (int(target_version.split('.')[0]),
+                          int(target_version.split('.')[1]))
+        unicode_attributes = ['user_id', 'project_id', 'image_ref',
+                              'kernel_id', 'ramdisk_id', 'hostname',
+                              'key_name', 'key_data', 'host', 'node',
+                              'user_data', 'availability_zone',
+                              'display_name', 'display_description',
+                              'launched_on', 'locked_by', 'os_type',
+                              'architecture', 'vm_mode', 'root_device_name',
+                              'default_ephemeral_device',
+                              'default_swap_device', 'config_drive',
+                              'cell_name']
+        if target_version < (1, 10) and 'info_cache' in primitive:
+            # NOTE(danms): Instance <= 1.9 (havana) had info_cache 1.4
+            self.info_cache.obj_make_compatible(primitive['info_cache'],
+                                                '1.4')
+            primitive['info_cache']['nova_object.version'] = '1.4'
+        if target_version < (1, 7):
+            # NOTE(danms): Before 1.7, we couldn't handle unicode in
+            # string fields, so squash it here
+            for field in [x for x in unicode_attributes if x in primitive
+                          and primitive[x] is not None]:
+                primitive[field] = primitive[field].encode('ascii', 'replace')
+        if target_version < (1, 6):
+            # NOTE(danms): Before 1.6 there was no pci_devices list
+            if 'pci_devices' in primitive:
+                del primitive['pci_devices']
 
     @property
     def name(self):
@@ -170,9 +237,11 @@ class Instance(base.NovaObject):
             # NOTE(russellb): Don't use self.iteritems() here, as it will
             # result in infinite recursion on the name property.
             for key in self.fields:
-                # prevent recursion if someone specifies %(name)s
-                # %(name)s will not be valid.
                 if key == 'name':
+                    # NOTE(danms): prevent recursion
+                    continue
+                elif not self.obj_attr_is_set(key):
+                    # NOTE(danms): Don't trigger lazy-loads
                     continue
                 info[key] = self[key]
             try:
@@ -180,35 +249,6 @@ class Instance(base.NovaObject):
             except KeyError:
                 base_name = self.uuid
         return base_name
-
-    def _attr_access_ip_v4_to_primitive(self):
-        if self.access_ip_v4 is not None:
-            return str(self.access_ip_v4)
-        else:
-            return None
-
-    def _attr_access_ip_v6_to_primitive(self):
-        if self.access_ip_v6 is not None:
-            return str(self.access_ip_v6)
-        else:
-            return None
-
-    _attr_scheduled_at_to_primitive = obj_utils.dt_serializer('scheduled_at')
-    _attr_launched_at_to_primitive = obj_utils.dt_serializer('launched_at')
-    _attr_terminated_at_to_primitive = obj_utils.dt_serializer('terminated_at')
-    _attr_info_cache_to_primitive = obj_utils.obj_serializer('info_cache')
-    _attr_security_groups_to_primitive = obj_utils.obj_serializer(
-        'security_groups')
-
-    _attr_scheduled_at_from_primitive = obj_utils.dt_deserializer
-    _attr_launched_at_from_primitive = obj_utils.dt_deserializer
-    _attr_terminated_at_from_primitive = obj_utils.dt_deserializer
-
-    def _attr_info_cache_from_primitive(self, val):
-        return base.NovaObject.obj_from_primitive(val)
-
-    def _attr_security_groups_from_primitive(self, val):
-        return base.NovaObject.obj_from_primitive(val)
 
     @staticmethod
     def _from_db_object(context, instance, db_inst, expected_attrs=None):
@@ -220,7 +260,7 @@ class Instance(base.NovaObject):
             expected_attrs = []
         # Most of the field names match right now, so be quick
         for field in instance.fields:
-            if field in INSTANCE_OPTIONAL_FIELDS + INSTANCE_IMPLIED_FIELDS:
+            if field in INSTANCE_OPTIONAL_ATTRS:
                 continue
             elif field == 'deleted':
                 instance.deleted = db_inst['deleted'] == db_inst['id']
@@ -237,44 +277,40 @@ class Instance(base.NovaObject):
             instance['fault'] = (
                 instance_fault.InstanceFault.get_latest_for_instance(
                     context, instance.uuid))
-        # NOTE(danms): info_cache and security_groups are almost
-        # always joined in the DB layer right now, so check to see if
-        # they are asked for and are present in the resulting object
-        if 'info_cache' in expected_attrs and db_inst.get('info_cache'):
-            instance['info_cache'] = instance_info_cache.InstanceInfoCache()
-            instance_info_cache.InstanceInfoCache._from_db_object(
-                    context, instance['info_cache'], db_inst['info_cache'])
-        if ('security_groups' in expected_attrs and
-                db_inst.get('security_groups') is not None):
-            instance['security_groups'] = security_group.SecurityGroupList()
-            security_group._make_secgroup_list(context,
-                                               instance['security_groups'],
-                                               db_inst['security_groups'])
+
+        if 'pci_devices' in expected_attrs:
+            pci_devices = base.obj_make_list(
+                    context, pci_device.PciDeviceList(),
+                    pci_device.PciDevice, db_inst['pci_devices'])
+            instance['pci_devices'] = pci_devices
+        if 'info_cache' in expected_attrs:
+            if db_inst['info_cache'] is None:
+                instance.info_cache = None
+            elif not instance.obj_attr_is_set('info_cache'):
+                # TODO(danms): If this ever happens on a backlevel instance
+                # passed to us by a backlevel service, things will break
+                instance.info_cache = instance_info_cache.InstanceInfoCache()
+            if instance.info_cache is not None:
+                instance_info_cache.InstanceInfoCache._from_db_object(
+                    context, instance.info_cache, db_inst['info_cache'])
+        if 'security_groups' in expected_attrs:
+            sec_groups = base.obj_make_list(
+                    context, security_group.SecurityGroupList(),
+                    security_group.SecurityGroup, db_inst['security_groups'])
+            instance['security_groups'] = sec_groups
 
         instance._context = context
         instance.obj_reset_changes()
         return instance
 
-    @staticmethod
-    def _attrs_to_columns(attrs):
-        """Translate instance attributes into columns needing joining."""
-        columns_to_join = []
-        if 'metadata' in attrs:
-            columns_to_join.append('metadata')
-        if 'system_metadata' in attrs:
-            columns_to_join.append('system_metadata')
-        # NOTE(danms): The DB API currently always joins info_cache and
-        # security_groups for get operations, so don't add them to the
-        # list of columns
-        return columns_to_join
-
     @base.remotable_classmethod
-    def get_by_uuid(cls, context, uuid, expected_attrs=None):
+    def get_by_uuid(cls, context, uuid, expected_attrs=None, use_slave=False):
         if expected_attrs is None:
             expected_attrs = ['info_cache', 'security_groups']
-        columns_to_join = cls._attrs_to_columns(expected_attrs)
+        columns_to_join = _expected_cols(expected_attrs)
         db_inst = db.instance_get_by_uuid(context, uuid,
-                                          columns_to_join=columns_to_join)
+                                          columns_to_join=columns_to_join,
+                                          use_slave=use_slave)
         return cls._from_db_object(context, cls(), db_inst,
                                    expected_attrs)
 
@@ -282,7 +318,7 @@ class Instance(base.NovaObject):
     def get_by_id(cls, context, inst_id, expected_attrs=None):
         if expected_attrs is None:
             expected_attrs = ['info_cache', 'security_groups']
-        columns_to_join = cls._attrs_to_columns(expected_attrs)
+        columns_to_join = _expected_cols(expected_attrs)
         db_inst = db.instance_get(context, inst_id,
                                   columns_to_join=columns_to_join)
         return cls._from_db_object(context, cls(), db_inst,
@@ -293,9 +329,8 @@ class Instance(base.NovaObject):
         if self.obj_attr_is_set('id'):
             raise exception.ObjectActionError(action='create',
                                               reason='already created')
-        updates = {}
-        for attr in self.obj_what_changed() - set(['id']):
-            updates[attr] = self[attr]
+        updates = self.obj_get_changes()
+        updates.pop('id', None)
         expected_attrs = [attr for attr in INSTANCE_DEFAULT_FIELDS
                           if attr in updates]
         if 'security_groups' in updates:
@@ -323,7 +358,9 @@ class Instance(base.NovaObject):
             constraint = None
 
         try:
-            db.instance_destroy(context, self.uuid, constraint=constraint)
+            db_inst = db.instance_destroy(context, self.uuid,
+                                          constraint=constraint)
+            Instance._from_db_object(context, self, db_inst)
         except exception.ConstraintNotMet:
             raise exception.ObjectActionError(action='destroy',
                                               reason='host changed')
@@ -335,9 +372,16 @@ class Instance(base.NovaObject):
     def _save_security_groups(self, context):
         for secgroup in self.security_groups:
             secgroup.save(context)
+        self.security_groups.obj_reset_changes()
 
-    def _save_instance_fault(self, context):
+    def _save_fault(self, context):
         # NOTE(danms): I don't think we need to worry about this, do we?
+        pass
+
+    def _save_pci_devices(self, context):
+        # NOTE(yjiang5): All devices held by PCI tracker, only PCI tracker
+        # permitted to update the DB. all change to devices from here will
+        # be dropped.
         pass
 
     @base.remotable
@@ -369,7 +413,7 @@ class Instance(base.NovaObject):
             # We also need to nuke any updates to vm_state and task_state
             # unless admin_state_reset is True.  compute cells are
             # authoritative for their view of vm_state and task_state.
-            stale_instance = copy.deepcopy(self)
+            stale_instance = self.obj_clone()
 
             def _handle_cell_update_from_api():
                 cells_api = cells_rpcapi.CellsAPI()
@@ -383,9 +427,13 @@ class Instance(base.NovaObject):
         updates = {}
         changes = self.obj_what_changed()
         for field in self.fields:
-            if (hasattr(self, base.get_attrname(field)) and
+            if (self.obj_attr_is_set(field) and
                     isinstance(self[field], base.NovaObject)):
-                getattr(self, '_save_%s' % field)(context)
+                try:
+                    getattr(self, '_save_%s' % field)(context)
+                except AttributeError:
+                    LOG.exception(_('No save handler for %s') % field,
+                                  instance=self)
             elif field in changes:
                 updates[field] = self[field]
 
@@ -402,12 +450,27 @@ class Instance(base.NovaObject):
                 updates['cleaned'] = 0
 
         if expected_task_state is not None:
+            if (self.VERSION == '1.9' and
+                    expected_task_state == 'image_snapshot'):
+                # NOTE(danms): Icehouse introduced a pending state which
+                # Havana doesn't know about. If we're an old instance,
+                # tolerate the pending state as well
+                expected_task_state = [
+                    expected_task_state, 'image_snapshot_pending']
             updates['expected_task_state'] = expected_task_state
         if expected_vm_state is not None:
             updates['expected_vm_state'] = expected_vm_state
 
+        expected_attrs = [attr for attr in _INSTANCE_OPTIONAL_JOINED_FIELDS
+                               if self.obj_attr_is_set(attr)]
+        # NOTE(alaski): We need to pull system_metadata for the
+        # notification.send_update() below.  If we don't there's a KeyError
+        # when it tries to extract the flavor.
+        if 'system_metadata' not in expected_attrs:
+            expected_attrs.append('system_metadata')
         old_ref, inst_ref = db.instance_update_and_get_original(
-                context, self.uuid, updates, update_cells=False)
+                context, self.uuid, updates, update_cells=False,
+                columns_to_join=_expected_cols(expected_attrs))
 
         if stale_instance:
             _handle_cell_update_from_api()
@@ -415,59 +478,97 @@ class Instance(base.NovaObject):
             cells_api = cells_rpcapi.CellsAPI()
             cells_api.instance_update_at_top(context, inst_ref)
 
-        expected_attrs = []
-        for attr in INSTANCE_OPTIONAL_FIELDS:
-            if hasattr(self, base.get_attrname(attr)):
-                expected_attrs.append(attr)
         self._from_db_object(context, self, inst_ref, expected_attrs)
-        if 'vm_state' in changes or 'task_state' in changes:
-            notifications.send_update(context, old_ref, inst_ref)
+        notifications.send_update(context, old_ref, inst_ref)
         self.obj_reset_changes()
 
     @base.remotable
-    def refresh(self, context):
-        extra = []
-        for field in INSTANCE_DEFAULT_FIELDS:
-            if hasattr(self, base.get_attrname(field)):
-                extra.append(field)
+    def refresh(self, context, use_slave=False):
+        extra = [field for field in INSTANCE_OPTIONAL_ATTRS
+                       if self.obj_attr_is_set(field)]
         current = self.__class__.get_by_uuid(context, uuid=self.uuid,
-                                             expected_attrs=extra)
+                                             expected_attrs=extra,
+                                             use_slave=use_slave)
+        # NOTE(danms): We orphan the instance copy so we do not unexpectedly
+        # trigger a lazy-load (which would mean we failed to calculate the
+        # expected_attrs properly)
+        current._context = None
+
         for field in self.fields:
-            if (hasattr(self, base.get_attrname(field)) and
-                    self[field] != current[field]):
-                self[field] = current[field]
+            if self.obj_attr_is_set(field):
+                if field == 'info_cache':
+                    self.info_cache.refresh()
+                    # NOTE(danms): Make sure this shows up as touched
+                    self.info_cache = self.info_cache
+                elif self[field] != current[field]:
+                    self[field] = current[field]
         self.obj_reset_changes()
 
     def obj_load_attr(self, attrname):
-        extra = []
-        if attrname == 'system_metadata':
-            extra.append('system_metadata')
-        elif attrname == 'metadata':
-            extra.append('metadata')
-        elif attrname == 'info_cache':
-            extra.append('info_cache')
-        elif attrname == 'security_groups':
-            extra.append('security_groups')
-        elif attrname == 'fault':
-            extra.append('fault')
-
-        if not extra:
+        if attrname not in INSTANCE_OPTIONAL_ATTRS:
             raise exception.ObjectActionError(
                 action='obj_load_attr',
                 reason='attribute %s not lazy-loadable' % attrname)
+        if not self._context:
+            raise exception.OrphanedObjectError(method='obj_load_attr',
+                                                objtype=self.obj_name())
 
-        # NOTE(danms): This could be optimized to just load the bits we need
+        LOG.debug(_("Lazy-loading `%(attr)s' on %(name)s uuid %(uuid)s"),
+                  {'attr': attrname,
+                   'name': self.obj_name(),
+                   'uuid': self.uuid,
+                   })
+        # FIXME(comstud): This should be optimized to only load the attr.
         instance = self.__class__.get_by_uuid(self._context,
                                               uuid=self.uuid,
-                                              expected_attrs=extra)
+                                              expected_attrs=[attrname])
 
         # NOTE(danms): Never allow us to recursively-load
-        if hasattr(instance, base.get_attrname(attrname)):
+        if instance.obj_attr_is_set(attrname):
             self[attrname] = instance[attrname]
         else:
             raise exception.ObjectActionError(
                 action='obj_load_attr',
                 reason='loading %s requires recursion' % attrname)
+
+    def get_flavor(self, namespace=None):
+        prefix = ('%s_' % namespace) if namespace is not None else ''
+
+        db_flavor = flavors.extract_flavor(self, prefix)
+        flavor = flavor_obj.Flavor()
+        for key in flavors.system_metadata_flavor_props:
+            flavor[key] = db_flavor[key]
+        return flavor
+
+    def set_flavor(self, flavor, namespace=None):
+        prefix = ('%s_' % namespace) if namespace is not None else ''
+
+        self.system_metadata = flavors.save_flavor_info(
+            self.system_metadata, flavor, prefix)
+        self.save()
+
+    def delete_flavor(self, namespace):
+        self.system_metadata = flavors.delete_flavor_info(
+            self.system_metadata, "%s_" % namespace)
+        self.save()
+
+    @base.remotable
+    def delete_metadata_key(self, context, key):
+        """Optimized metadata delete method.
+
+        This provides a more efficient way to delete a single metadata
+        key, instead of just calling instance.save(). This should be called
+        with the key still present in self.metadata, which it will update
+        after completion.
+        """
+        db.instance_metadata_delete(context, self.uuid, key)
+        md_was_changed = 'metadata' in self.obj_what_changed()
+        del self.metadata[key]
+        self._orig_metadata.pop(key, None)
+        instance_dict = base.obj_to_primitive(self)
+        notifications.send_update(context, instance_dict, instance_dict)
+        if not md_was_changed:
+            self.obj_reset_changes(['metadata'])
 
 
 def _make_instance_list(context, inst_list, db_inst_list, expected_attrs):
@@ -494,29 +595,46 @@ def _make_instance_list(context, inst_list, db_inst_list, expected_attrs):
     return inst_list
 
 
-def expected_cols(expected_attrs):
-    """Return expected_attrs that are columns needing joining."""
-    if expected_attrs:
-        return list(set(expected_attrs) - set(INSTANCE_OPTIONAL_NON_COLUMNS))
-    else:
-        return expected_attrs
-
-
 class InstanceList(base.ObjectListBase, base.NovaObject):
+    # Version 1.0: Initial version
+    # Version 1.1: Added use_slave to get_by_host
+    #              Instance <= version 1.9
+    # Version 1.2: Instance <= version 1.11
+    # Version 1.3: Added use_slave to get_by_filters
+    # Version 1.4: Instance <= version 1.12
+    # Version 1.5: Added method get_active_by_window_joined.
+    # Version 1.6: Instance <= version 1.13
+    VERSION = '1.6'
+
+    fields = {
+        'objects': fields.ListOfObjectsField('Instance'),
+    }
+    child_versions = {
+        '1.1': '1.9',
+        # NOTE(danms): Instance was at 1.9 before we added this
+        '1.2': '1.11',
+        '1.3': '1.11',
+        '1.4': '1.12',
+        '1.5': '1.12',
+        '1.6': '1.13',
+        }
+
     @base.remotable_classmethod
     def get_by_filters(cls, context, filters,
                        sort_key='created_at', sort_dir='desc', limit=None,
-                       marker=None, expected_attrs=None):
+                       marker=None, expected_attrs=None, use_slave=False):
         db_inst_list = db.instance_get_all_by_filters(
             context, filters, sort_key, sort_dir, limit=limit, marker=marker,
-            columns_to_join=expected_cols(expected_attrs))
+            columns_to_join=_expected_cols(expected_attrs),
+            use_slave=use_slave)
         return _make_instance_list(context, cls(), db_inst_list,
                                    expected_attrs)
 
     @base.remotable_classmethod
-    def get_by_host(cls, context, host, expected_attrs=None):
+    def get_by_host(cls, context, host, expected_attrs=None, use_slave=False):
         db_inst_list = db.instance_get_all_by_host(
-            context, host, columns_to_join=expected_cols(expected_attrs))
+            context, host, columns_to_join=_expected_cols(expected_attrs),
+            use_slave=use_slave)
         return _make_instance_list(context, cls(), db_inst_list,
                                    expected_attrs)
 
@@ -542,6 +660,58 @@ class InstanceList(base.ObjectListBase, base.NovaObject):
                                                              reboot_window)
         return _make_instance_list(context, cls(), db_inst_list,
                                    expected_attrs)
+
+    @base.remotable_classmethod
+    def _get_active_by_window_joined(cls, context, begin, end=None,
+                                    project_id=None, host=None,
+                                    expected_attrs=None):
+        # NOTE(mriedem): We need to convert the begin/end timestamp strings
+        # to timezone-aware datetime objects for the DB API call.
+        begin = timeutils.parse_isotime(begin)
+        end = timeutils.parse_isotime(end) if end else None
+        db_inst_list = db.instance_get_active_by_window_joined(context,
+                                                               begin,
+                                                               end,
+                                                               project_id,
+                                                               host)
+        return _make_instance_list(context, cls(), db_inst_list,
+                                   expected_attrs)
+
+    @classmethod
+    def get_active_by_window_joined(cls, context, begin, end=None,
+                                    project_id=None, host=None,
+                                    expected_attrs=None):
+        """Get instances and joins active during a certain time window.
+
+        :param context: nova request context
+        :param begin: datetime for the start of the time window
+        :param end: datetime for the end of the time window
+        :param project_id: used to filter instances by project
+        :param host: used to filter instances on a given compute host
+        :param expected_attrs: list of related fields that can be joined
+        in the database layer when querying for instances
+        :returns: InstanceList
+        """
+        # NOTE(mriedem): We have to convert the datetime objects to string
+        # primitives for the remote call.
+        begin = timeutils.isotime(begin)
+        end = timeutils.isotime(end) if end else None
+        return cls._get_active_by_window_joined(context, begin, end,
+                                                project_id, host,
+                                                expected_attrs)
+
+    @base.remotable_classmethod
+    def get_by_security_group_id(cls, context, security_group_id):
+        db_secgroup = db.security_group_get(
+            context, security_group_id,
+            columns_to_join=['instances.info_cache',
+                             'instances.system_metadata'])
+        return _make_instance_list(context, cls(), db_secgroup['instances'],
+                                   ['info_cache', 'system_metadata'])
+
+    @classmethod
+    def get_by_security_group(cls, context, security_group):
+        return cls.get_by_security_group_id(context, security_group.id)
 
     def fill_faults(self):
         """Batch query the database for our instances' faults.

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-#
 #    Copyright (c) 2010 Citrix Systems, Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -64,6 +62,8 @@ from nova.openstack.common.gettextutils import _
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
 from nova.openstack.common import timeutils
+from nova.openstack.common import units
+from nova.virt.xenapi.client import session as xenapi_session
 
 
 _CLASSES = ['host', 'network', 'session', 'pool', 'SR', 'VBD',
@@ -85,7 +85,7 @@ def reset():
     for c in _CLASSES:
         _db_content[c] = {}
     host = create_host('fake')
-    create_vm('fake',
+    create_vm('fake dom 0',
               'Running',
               is_a_template=False,
               is_control_domain=True,
@@ -126,11 +126,19 @@ def create_network(name_label, bridge):
 
 
 def create_vm(name_label, status, **kwargs):
-    domid = status == 'Running' and random.randrange(1, 1 << 16) or -1
+    if status == 'Running':
+        domid = random.randrange(1, 1 << 16)
+        resident_on = _db_content['host'].keys()[0]
+    else:
+        domid = -1
+        resident_on = ''
+
     vm_rec = kwargs.copy()
     vm_rec.update({'name_label': name_label,
                    'domid': domid,
-                   'power_state': status})
+                   'power_state': status,
+                   'blocked_operations': {},
+                   'resident_on': resident_on})
     vm_ref = _create_object('VM', vm_rec)
     after_VM_create(vm_ref, vm_rec)
     return vm_ref
@@ -231,20 +239,23 @@ def after_VBD_create(vbd_ref, vbd_rec):
 
 def after_VM_create(vm_ref, vm_rec):
     """Create read-only fields in the VM record."""
+    vm_rec.setdefault('domid', -1)
     vm_rec.setdefault('is_control_domain', False)
-    vm_rec.setdefault('memory_static_max', str(8 * 1024 * 1024 * 1024))
-    vm_rec.setdefault('memory_dynamic_max', str(8 * 1024 * 1024 * 1024))
+    vm_rec.setdefault('is_a_template', False)
+    vm_rec.setdefault('memory_static_max', str(8 * units.Gi))
+    vm_rec.setdefault('memory_dynamic_max', str(8 * units.Gi))
     vm_rec.setdefault('VCPUs_max', str(4))
     vm_rec.setdefault('VBDs', [])
     vm_rec.setdefault('resident_on', '')
 
 
-def create_pbd(config, host_ref, sr_ref, attached):
+def create_pbd(host_ref, sr_ref, attached):
+    config = {'path': '/var/run/sr-mount/%s' % sr_ref}
     return _create_object('PBD',
-                          {'device-config': config,
+                          {'device_config': config,
                            'host': host_ref,
                            'SR': sr_ref,
-                           'currently-attached': attached})
+                           'currently_attached': attached})
 
 
 def create_task(name_label):
@@ -291,7 +302,7 @@ def create_sr(**kwargs):
               'virtual_allocation': str(kwargs.get('virtual_allocation', 0)),
               'other_config': kwargs.get('other_config', {}),
               'VDIs': kwargs.get('VDIs', [])})
-    pbd_ref = create_pbd('', kwargs.get('host_ref'), sr_ref, True)
+    pbd_ref = create_pbd(kwargs.get('host_ref'), sr_ref, True)
     _db_content['SR'][sr_ref]['PBDs'] = [pbd_ref]
     return sr_ref
 
@@ -304,7 +315,12 @@ def _create_local_pif(host_ref):
                               'VLAN': -1,
                               'device': 'fake0',
                               'host_uuid': host_ref,
-                              'network': ''})
+                              'network': '',
+                              'IP': '10.1.1.1',
+                              'IPv6': '',
+                              'uuid': '',
+                              'management': 'true'})
+    _db_content['PIF'][pif_ref]['uuid'] = pif_ref
     return pif_ref
 
 
@@ -324,7 +340,7 @@ def _create_sr(table, obj):
     sr_ref = _create_object(table, obj[2])
     if sr_type == 'iscsi':
         vdi_ref = create_vdi('', sr_ref)
-        pbd_ref = create_pbd('', host_ref, sr_ref, True)
+        pbd_ref = create_pbd(host_ref, sr_ref, True)
         _db_content['SR'][sr_ref]['VDIs'] = [vdi_ref]
         _db_content['SR'][sr_ref]['PBDs'] = [pbd_ref]
         _db_content['VDI'][vdi_ref]['SR'] = sr_ref
@@ -353,6 +369,58 @@ def get_all(table):
 
 def get_all_records(table):
     return _db_content[table]
+
+
+def _query_matches(record, query):
+    # Simple support for the XenServer query language:
+    # 'field "host"="<uuid>" and field "SR"="<sr uuid>"'
+    # Tested through existing tests (e.g. calls to find_network_with_bridge)
+
+    and_clauses = query.split(" and ")
+    if len(and_clauses) > 1:
+        matches = True
+        for clause in and_clauses:
+            matches = matches and _query_matches(record, clause)
+        return matches
+
+    or_clauses = query.split(" or ")
+    if len(or_clauses) > 1:
+        matches = False
+        for clause in or_clauses:
+            matches = matches or _query_matches(record, clause)
+        return matches
+
+    if query[:4] == 'not ':
+        return not _query_matches(record, query[4:])
+
+    # Now it must be a single field - bad queries never match
+    if query[:5] != 'field':
+        return False
+    (field, value) = query[6:].split('=', 1)
+
+    # Some fields (e.g. name_label, memory_overhead) have double
+    # underscores in the DB, but only single underscores when querying
+
+    field = field.replace("__", "_").strip(" \"'")
+    value = value.strip(" \"'")
+
+    # Strings should be directly compared
+    if isinstance(record[field], str):
+        return record[field] == value
+
+    # But for all other value-checks, convert to a string first
+    # (Notably used for booleans - which can be lower or camel
+    # case and are interpreted/sanitised by XAPI)
+    return str(record[field]).lower() == value.lower()
+
+
+def get_all_records_where(table_name, query):
+    matching_records = {}
+    table = _db_content[table_name]
+    for record in table:
+        if _query_matches(table[record], query):
+            matching_records[record] = table[record]
+    return matching_records
 
 
 def get_record(table, ref):
@@ -401,12 +469,11 @@ class Failure(Exception):
 
 
 class SessionBase(object):
-    """
-    Base class for Fake Sessions
-    """
+    """Base class for Fake Sessions."""
 
     def __init__(self, uri):
         self._session = None
+        xenapi_session.apply_session_helpers(self)
 
     def pool_get_default_SR(self, _1, pool_ref):
         return _db_content['pool'].values()[0]['default-SR']
@@ -488,7 +555,7 @@ class SessionBase(object):
         _db_content['SR'][sr_ref]['uuid'] = sr_uuid
         _db_content['SR'][sr_ref]['forgotten'] = 0
         vdi_per_lun = False
-        if type in ('iscsi'):
+        if type == 'iscsi':
             # Just to be clear
             vdi_per_lun = True
         if vdi_per_lun:
@@ -504,10 +571,6 @@ class SessionBase(object):
 
     def SR_scan(self, _1, sr_ref):
         return
-
-    def PIF_get_all_records_where(self, _1, _2):
-        # TODO(salvatore-orlando): filter table on _2
-        return _db_content['PIF']
 
     def VM_get_xenstore_data(self, _1, vm_ref):
         return _db_content['VM'][vm_ref].get('xenstore_data', {})
@@ -560,7 +623,7 @@ class SessionBase(object):
 
     def host_compute_free_memory(self, _1, ref):
         #Always return 12GB available
-        return 12 * 1024 * 1024 * 1024
+        return 12 * units.Gi
 
     def _plugin_agent_version(self, method, args):
         return as_json(returncode='0', message='1.0\\r\\n')
@@ -609,6 +672,7 @@ class SessionBase(object):
                                                     'free': 30,
                                                     'free-computed': 40},
                                     'host_hostname': 'fake-xenhost',
+                                    'host_cpu_info': {'cpu_count': 50},
                                     })
 
     def _plugin_poweraction(self, method, args):
@@ -625,11 +689,44 @@ class SessionBase(object):
     def _plugin_xenhost_host_uptime(self, method, args):
         return jsonutils.dumps({"uptime": "fake uptime"})
 
+    def _plugin_xenhost_get_pci_device_details(self, method, args):
+        """Simulate the ouput of three pci devices.
+
+        Both of those devices are available for pci passtrough but
+        only one will match with the pci whitelist used in the
+        method test_pci_passthrough_devices_*().
+        Return a single list.
+
+        """
+        # Driver is not pciback
+        dev_bad1 = ["Slot:\t86:10.0", "Class:\t0604", "Vendor:\t10b5",
+                    "Device:\t8747", "Rev:\tba", "Driver:\tpcieport", "\n"]
+        # Driver is pciback but vendor and device are bad
+        dev_bad2 = ["Slot:\t88:00.0", "Class:\t0300", "Vendor:\t0bad",
+                    "Device:\tcafe", "SVendor:\t10de", "SDevice:\t100d",
+                    "Rev:\ta1", "Driver:\tpciback", "\n"]
+        # Driver is pciback and vendor, device are used for matching
+        dev_good = ["Slot:\t87:00.0", "Class:\t0300", "Vendor:\t10de",
+                    "Device:\t11bf", "SVendor:\t10de", "SDevice:\t100d",
+                    "Rev:\ta1", "Driver:\tpciback", "\n"]
+
+        lspci_output = "\n".join(dev_bad1 + dev_bad2 + dev_good)
+        return pickle.dumps(lspci_output)
+
+    def _plugin_xenhost_get_pci_type(self, method, args):
+        return pickle.dumps("type-PCI")
+
     def _plugin_console_get_console_log(self, method, args):
         dom_id = args["dom_id"]
         if dom_id == 0:
             raise Failure('Guest does not have a console')
         return base64.b64encode(zlib.compress("dom_id: %s" % dom_id))
+
+    def _plugin_nova_plugin_version_get_version(self, method, args):
+        return pickle.dumps("1.2")
+
+    def _plugin_xenhost_query_gc(self, method, args):
+        return pickle.dumps("False")
 
     def host_call_plugin(self, _1, _2, plugin, method, args):
         func = getattr(self, '_plugin_%s_%s' % (plugin, method), None)
@@ -640,7 +737,7 @@ class SessionBase(object):
         return func(method, args)
 
     def VDI_get_virtual_size(self, *args):
-        return 1 * 1024 * 1024 * 1024
+        return 1 * units.Gi
 
     def VDI_resize_online(self, *args):
         return 'derp'
@@ -653,6 +750,7 @@ class SessionBase(object):
             raise Failure(['VM_BAD_POWER_STATE',
                 'fake-opaque-ref', db_ref['power_state'].lower(), 'halted'])
         db_ref['power_state'] = 'Running'
+        db_ref['domid'] = random.randrange(1, 1 << 16)
 
     def VM_clean_reboot(self, session, vm_ref):
         return self._VM_reboot(session, vm_ref)
@@ -663,6 +761,7 @@ class SessionBase(object):
     def VM_hard_shutdown(self, session, vm_ref):
         db_ref = _db_content['VM'][vm_ref]
         db_ref['power_state'] = 'Halted'
+        db_ref['domid'] = -1
     VM_clean_shutdown = VM_hard_shutdown
 
     def VM_suspend(self, session, vm_ref):
@@ -693,8 +792,9 @@ class SessionBase(object):
                         vif_map, options):
         pass
 
-    def network_get_all_records_where(self, _1, filter):
-        return self.xenapi.network.get_all_records()
+    def VM_remove_from_blocked_operations(self, session, vm_ref, key):
+        # operation is idempotent, XenServer doesn't care if the key exists
+        _db_content['VM'][vm_ref]['blocked_operations'].pop(key, None)
 
     def xenapi_request(self, methodname, params):
         if methodname.startswith('login'):
@@ -790,6 +890,10 @@ class SessionBase(object):
         if func == 'get_all_records':
             self._check_arg_count(params, 1)
             return get_all_records(cls)
+
+        if func == 'get_all_records_where':
+            self._check_arg_count(params, 2)
+            return get_all_records_where(cls, params[1])
 
         if func == 'get_record':
             self._check_arg_count(params, 2)

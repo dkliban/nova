@@ -1,4 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
 # coding=utf-8
 
 # Copyright 2012 Hewlett-Packard Development Company, L.P.
@@ -40,15 +39,15 @@ from nova.virt.baremetal import utils as bm_utils
 opts = [
     cfg.StrOpt('terminal',
                default='shellinaboxd',
-               help='path to baremetal terminal program'),
+               help='Path to baremetal terminal program'),
     cfg.StrOpt('terminal_cert_dir',
-               help='path to baremetal terminal SSL cert(PEM)'),
+               help='Path to baremetal terminal SSL cert(PEM)'),
     cfg.StrOpt('terminal_pid_dir',
                default=paths.state_path_def('baremetal/console'),
-               help='path to directory stores pidfiles of baremetal_terminal'),
+               help='Path to directory stores pidfiles of baremetal_terminal'),
     cfg.IntOpt('ipmi_power_retry',
-               default=5,
-               help='maximal number of retries for IPMI operations'),
+               default=10,
+               help='Maximal number of retries for IPMI operations'),
     ]
 
 baremetal_group = cfg.OptGroup(name='baremetal',
@@ -65,7 +64,10 @@ def _make_password_file(password):
     fd, path = tempfile.mkstemp()
     os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
     with os.fdopen(fd, "w") as f:
-        f.write(password)
+        # NOTE(r-mibu): Since ipmitool hangs with an empty password file,
+        #               we have to write '\0' if password was empty.
+        # see https://bugs.launchpad.net/nova/+bug/1237802 for more details
+        f.write(password or b"\0")
     return path
 
 
@@ -148,17 +150,22 @@ class IPMI(base.PowerManager):
                 self.state = baremetal_states.ACTIVE
                 raise loopingcall.LoopingCallDone()
             if self.retries > CONF.baremetal.ipmi_power_retry:
+                LOG.error(_("IPMI power on failed after %d tries") % (
+                    CONF.baremetal.ipmi_power_retry))
                 self.state = baremetal_states.ERROR
                 raise loopingcall.LoopingCallDone()
             try:
                 self.retries += 1
-                self._exec_ipmitool("power on")
+                if not self.power_on_called:
+                    self._exec_ipmitool("power on")
+                    self.power_on_called = True
             except Exception:
                 LOG.exception(_("IPMI power on failed"))
 
         self.retries = 0
+        self.power_on_called = False
         timer = loopingcall.FixedIntervalLoopingCall(_wait_for_power_on)
-        timer.start(interval=0.5).wait()
+        timer.start(interval=1.0).wait()
 
     def _power_off(self):
         """Turn the power to this node OFF."""
@@ -170,17 +177,22 @@ class IPMI(base.PowerManager):
                 self.state = baremetal_states.DELETED
                 raise loopingcall.LoopingCallDone()
             if self.retries > CONF.baremetal.ipmi_power_retry:
+                LOG.error(_("IPMI power off failed after %d tries") % (
+                    CONF.baremetal.ipmi_power_retry))
                 self.state = baremetal_states.ERROR
                 raise loopingcall.LoopingCallDone()
             try:
                 self.retries += 1
-                self._exec_ipmitool("power off")
+                if not self.power_off_called:
+                    self._exec_ipmitool("power off")
+                    self.power_off_called = True
             except Exception:
                 LOG.exception(_("IPMI power off failed"))
 
         self.retries = 0
+        self.power_off_called = False
         timer = loopingcall.FixedIntervalLoopingCall(_wait_for_power_off)
-        timer.start(interval=0.5).wait()
+        timer.start(interval=1.0).wait()
 
     def _set_pxe_for_next_boot(self):
         try:

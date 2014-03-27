@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011 Citrix Systems, Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -19,6 +17,7 @@
 import re
 
 from eventlet import greenthread
+import six
 
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
@@ -80,7 +79,7 @@ def fake_execute(*cmd_parts, **kwargs):
             LOG.debug(_('Faked command matched %s') % fake_replier[0])
             break
 
-    if isinstance(reply_handler, basestring):
+    if isinstance(reply_handler, six.string_types):
         # If the reply handler is a string, return it as stdout
         reply = reply_handler, ''
     else:

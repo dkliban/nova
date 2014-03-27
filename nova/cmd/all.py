@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
@@ -43,6 +41,7 @@ CONF = cfg.CONF
 CONF.import_opt('manager', 'nova.conductor.api', group='conductor')
 CONF.import_opt('topic', 'nova.conductor.api', group='conductor')
 CONF.import_opt('enabled_apis', 'nova.service')
+CONF.import_opt('enabled_ssl_apis', 'nova.service')
 
 
 def main():
@@ -55,7 +54,8 @@ def main():
     # nova-api
     for api in CONF.enabled_apis:
         try:
-            server = service.WSGIService(api)
+            should_use_ssl = api in CONF.enabled_ssl_apis
+            server = service.WSGIService(api, use_ssl=should_use_ssl)
             launcher.launch_service(server, workers=server.workers or 1)
         except (Exception, SystemExit):
             LOG.exception(_('Failed to load %s') % '%s-api' % api)

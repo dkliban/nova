@@ -23,12 +23,12 @@ import webob
 
 from nova.api.openstack.compute import plugins
 from nova.api.openstack.compute.plugins.v3 import servers
+from nova.api.openstack.compute.plugins.v3 import user_data
 from nova.compute import api as compute_api
 from nova.compute import flavors
 from nova import db
 from nova.network import manager
 from nova.openstack.common import jsonutils
-from nova.openstack.common import rpc
 from nova import test
 from nova.tests.api.openstack import fakes
 from nova.tests import fake_instance
@@ -84,11 +84,12 @@ class ServersControllerCreateTest(test.TestCase):
                 'reservation_id': inst['reservation_id'],
                 "created_at": datetime.datetime(2010, 10, 10, 12, 0, 0),
                 "updated_at": datetime.datetime(2010, 11, 11, 11, 0, 0),
-                "user_data": None,
+                user_data.ATTRIBUTE_NAME: None,
                 "progress": 0,
                 "fixed_ips": [],
                 "task_state": "",
                 "vm_state": "",
+                "root_device_name": inst.get('root_device_name', 'vda'),
             })
 
             self.instance_cache_by_id[instance['id']] = instance
@@ -105,18 +106,6 @@ class ServersControllerCreateTest(test.TestCase):
             instance = self.instance_cache_by_uuid[uuid]
             instance.update(values)
             return instance
-
-        def rpc_call_wrapper(context, topic, msg, timeout=None):
-            """Stub out the scheduler creating the instance entry."""
-            if (topic == CONF.scheduler_topic and
-                    msg['method'] == 'run_instance'):
-                request_spec = msg['args']['request_spec']
-                num_instances = request_spec.get('num_instances', 1)
-                instances = []
-                for x in xrange(num_instances):
-                    instances.append(instance_create(context,
-                        request_spec['instance_properties']))
-                return instances
 
         def server_update(context, instance_uuid, params):
             inst = self.instance_cache_by_uuid[instance_uuid]
@@ -146,11 +135,8 @@ class ServersControllerCreateTest(test.TestCase):
                        fake_method)
         self.stubs.Set(db, 'instance_get', instance_get)
         self.stubs.Set(db, 'instance_update', instance_update)
-        self.stubs.Set(rpc, 'cast', fake_method)
-        self.stubs.Set(rpc, 'call', rpc_call_wrapper)
         self.stubs.Set(db, 'instance_update_and_get_original',
                        server_update)
-        self.stubs.Set(rpc, 'queue_get_for', queue_get_for)
         self.stubs.Set(manager.VlanManager, 'allocate_fixed_ip',
                        fake_method)
 
@@ -167,12 +153,12 @@ class ServersControllerCreateTest(test.TestCase):
         req.body = jsonutils.dumps(body)
         req.headers["content-type"] = "application/json"
         if override_controller:
-            server = override_controller.create(req, body).obj['server']
+            server = override_controller.create(req, body=body).obj['server']
         else:
-            server = self.controller.create(req, body).obj['server']
+            server = self.controller.create(req, body=body).obj['server']
 
     def test_create_instance_with_user_data_disabled(self):
-        params = {'user_data': base64.b64encode('fake')}
+        params = {user_data.ATTRIBUTE_NAME: base64.b64encode('fake')}
         old_create = compute_api.API.create
 
         def create(*args, **kwargs):
@@ -185,7 +171,7 @@ class ServersControllerCreateTest(test.TestCase):
             override_controller=self.no_user_data_controller)
 
     def test_create_instance_with_user_data_enabled(self):
-        params = {'user_data': base64.b64encode('fake')}
+        params = {user_data.ATTRIBUTE_NAME: base64.b64encode('fake')}
         old_create = compute_api.API.create
 
         def create(*args, **kwargs):
@@ -208,8 +194,7 @@ class ServersControllerCreateTest(test.TestCase):
                     'hello': 'world',
                     'open': 'stack',
                 },
-                'personality': {},
-                'user_data': base64.b64encode(value),
+                user_data.ATTRIBUTE_NAME: base64.b64encode(value),
             },
         }
 
@@ -217,7 +202,7 @@ class ServersControllerCreateTest(test.TestCase):
         req.method = 'POST'
         req.body = jsonutils.dumps(body)
         req.headers["content-type"] = "application/json"
-        res = self.controller.create(req, body).obj
+        res = self.controller.create(req, body=body).obj
 
         server = res['server']
         self.assertEqual(FAKE_UUID, server['id'])
@@ -235,8 +220,7 @@ class ServersControllerCreateTest(test.TestCase):
                     'hello': 'world',
                     'open': 'stack',
                 },
-                'personality': {},
-                'user_data': value,
+                user_data.ATTRIBUTE_NAME: value,
             },
         }
 
@@ -245,31 +229,4 @@ class ServersControllerCreateTest(test.TestCase):
         req.body = jsonutils.dumps(body)
         req.headers["content-type"] = "application/json"
         self.assertRaises(webob.exc.HTTPBadRequest,
-                          self.controller.create, req, body)
-
-
-class TestServerCreateRequestXMLDeserializer(test.TestCase):
-
-    def setUp(self):
-        super(TestServerCreateRequestXMLDeserializer, self).setUp()
-        ext_info = plugins.LoadedExtensionInfo()
-        controller = servers.ServersController(extension_info=ext_info)
-        self.deserializer = servers.CreateDeserializer(controller)
-
-    def test_request_with_user_data(self):
-        serial_request = """
-    <server xmlns="http://docs.openstack.org/compute/api/v3"
-        name="user_data_test"
-        image_ref="1"
-        flavor_ref="1"
-        user_data="IyEvYmluL2Jhc2gKL2Jpbi9"/>"""
-        request = self.deserializer.deserialize(serial_request)
-        expected = {
-            "server": {
-                "name": "user_data_test",
-                "image_ref": "1",
-                "flavor_ref": "1",
-                "user_data": "IyEvYmluL2Jhc2gKL2Jpbi9"
-            },
-        }
-        self.assertEquals(request['body'], expected)
+                          self.controller.create, req, body=body)

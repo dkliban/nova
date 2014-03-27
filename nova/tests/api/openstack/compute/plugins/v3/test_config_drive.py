@@ -27,7 +27,6 @@ from nova.compute import flavors
 from nova import db
 from nova.network import manager
 from nova.openstack.common import jsonutils
-from nova.openstack.common import rpc
 from nova import test
 from nova.tests.api.openstack import fakes
 from nova.tests import fake_instance
@@ -50,9 +49,6 @@ class ConfigDriveTest(test.TestCase):
 
     def setUp(self):
         super(ConfigDriveTest, self).setUp()
-        ext_info = plugins.LoadedExtensionInfo()
-        self.Controller = config_drive.ConfigDriveController(
-            extension_info=ext_info)
         fakes.stub_out_networking(self.stubs)
         fakes.stub_out_rate_limiting(self.stubs)
         fake.stub_out_image_service(self.stubs)
@@ -66,9 +62,9 @@ class ConfigDriveTest(test.TestCase):
         req.headers['Content-Type'] = 'application/json'
         response = req.get_response(fakes.wsgi_app_v3(
             init_only=('servers', 'os-config-drive')))
-        self.assertEquals(response.status_int, 200)
+        self.assertEqual(response.status_int, 200)
         res_dict = jsonutils.loads(response.body)
-        self.assertTrue('config_drive' in res_dict['server'])
+        self.assertIn(config_drive.ATTRIBUTE_NAME, res_dict['server'])
 
     def test_detail_servers(self):
         self.stubs.Set(db, 'instance_get_all_by_filters',
@@ -81,7 +77,7 @@ class ConfigDriveTest(test.TestCase):
         server_dicts = jsonutils.loads(res.body)['servers']
         self.assertNotEqual(len(server_dicts), 0)
         for server_dict in server_dicts:
-            self.assertTrue('config_drive' in server_dict)
+            self.assertIn(config_drive.ATTRIBUTE_NAME, server_dict)
 
 
 class ServersControllerCreateTest(test.TestCase):
@@ -126,6 +122,7 @@ class ServersControllerCreateTest(test.TestCase):
                 "fixed_ips": [],
                 "task_state": "",
                 "vm_state": "",
+                "root_device_name": inst.get('root_device_name', 'vda'),
             })
 
             self.instance_cache_by_id[instance['id']] = instance
@@ -142,18 +139,6 @@ class ServersControllerCreateTest(test.TestCase):
             instance = self.instance_cache_by_uuid[uuid]
             instance.update(values)
             return instance
-
-        def rpc_call_wrapper(context, topic, msg, timeout=None):
-            """Stub out the scheduler creating the instance entry."""
-            if (topic == CONF.scheduler_topic and
-                    msg['method'] == 'run_instance'):
-                request_spec = msg['args']['request_spec']
-                num_instances = request_spec.get('num_instances', 1)
-                instances = []
-                for x in xrange(num_instances):
-                    instances.append(instance_create(context,
-                        request_spec['instance_properties']))
-                return instances
 
         def server_update(context, instance_uuid, params):
             inst = self.instance_cache_by_uuid[instance_uuid]
@@ -183,11 +168,8 @@ class ServersControllerCreateTest(test.TestCase):
                 fake_method)
         self.stubs.Set(db, 'instance_get', instance_get)
         self.stubs.Set(db, 'instance_update', instance_update)
-        self.stubs.Set(rpc, 'cast', fake_method)
-        self.stubs.Set(rpc, 'call', rpc_call_wrapper)
         self.stubs.Set(db, 'instance_update_and_get_original',
                 server_update)
-        self.stubs.Set(rpc, 'queue_get_for', queue_get_for)
         self.stubs.Set(manager.VlanManager, 'allocate_fixed_ip',
                        fake_method)
 
@@ -204,13 +186,12 @@ class ServersControllerCreateTest(test.TestCase):
         req.body = jsonutils.dumps(body)
         req.headers["content-type"] = "application/json"
         if override_controller:
-            server = override_controller.create(req, body).obj['server']
+            server = override_controller.create(req, body=body).obj['server']
         else:
-            server = self.controller.create(req, body).obj['server']
+            server = self.controller.create(req, body=body).obj['server']
 
     def test_create_instance_with_config_drive_disabled(self):
-        config_drive = [{'config_drive': 'foo'}]
-        params = {'config_drive': config_drive}
+        params = {config_drive.ATTRIBUTE_NAME: "False"}
         old_create = compute_api.API.create
 
         def create(*args, **kwargs):
@@ -239,8 +220,7 @@ class ServersControllerCreateTest(test.TestCase):
                     'hello': 'world',
                     'open': 'stack',
                 },
-                'personality': {},
-                'config_drive': "true",
+                config_drive.ATTRIBUTE_NAME: "true",
             },
         }
 
@@ -248,7 +228,7 @@ class ServersControllerCreateTest(test.TestCase):
         req.method = 'POST'
         req.body = jsonutils.dumps(body)
         req.headers["content-type"] = "application/json"
-        res = self.controller.create(req, body).obj
+        res = self.controller.create(req, body=body).obj
 
         server = res['server']
         self.assertEqual(FAKE_UUID, server['id'])
@@ -265,8 +245,7 @@ class ServersControllerCreateTest(test.TestCase):
                     'hello': 'world',
                     'open': 'stack',
                 },
-                'personality': {},
-                'config_drive': image_href,
+                config_drive.ATTRIBUTE_NAME: image_href,
             },
         }
 
@@ -276,7 +255,7 @@ class ServersControllerCreateTest(test.TestCase):
         req.headers["content-type"] = "application/json"
 
         self.assertRaises(webob.exc.HTTPBadRequest,
-                          self.controller.create, req, body)
+                          self.controller.create, req, body=body)
 
     def test_create_instance_without_config_drive(self):
         image_href = '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6'
@@ -290,7 +269,6 @@ class ServersControllerCreateTest(test.TestCase):
                     'hello': 'world',
                     'open': 'stack',
                 },
-                'personality': {},
             },
         }
 
@@ -298,34 +276,7 @@ class ServersControllerCreateTest(test.TestCase):
         req.method = 'POST'
         req.body = jsonutils.dumps(body)
         req.headers["content-type"] = "application/json"
-        res = self.controller.create(req, body).obj
+        res = self.controller.create(req, body=body).obj
 
         server = res['server']
         self.assertEqual(FAKE_UUID, server['id'])
-
-
-class TestServerCreateRequestXMLDeserializer(test.TestCase):
-
-    def setUp(self):
-        super(TestServerCreateRequestXMLDeserializer, self).setUp()
-        ext_info = plugins.LoadedExtensionInfo()
-        controller = servers.ServersController(extension_info=ext_info)
-        self.deserializer = servers.CreateDeserializer(controller)
-
-    def test_request_with_config_drive(self):
-        serial_request = """
-    <server xmlns="http://docs.openstack.org/compute/api/v2"
-        name="config_drive_test"
-        image_ref="1"
-        flavor_ref="1"
-        config_drive="true"/>"""
-        request = self.deserializer.deserialize(serial_request)
-        expected = {
-            "server": {
-                "name": "config_drive_test",
-                "image_ref": "1",
-                "flavor_ref": "1",
-                "config_drive": "true"
-            },
-        }
-        self.assertEquals(request['body'], expected)

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -23,35 +21,46 @@ import tempfile
 import testtools
 
 import eventlet
+import eventlet.wsgi
 import requests
 
 import nova.exception
 from nova import test
 from nova.tests import utils
 import nova.wsgi
+from oslo.config import cfg
 import urllib2
 import webob
 
 SSL_CERT_DIR = os.path.normpath(os.path.join(
                                 os.path.dirname(os.path.abspath(__file__)),
                                 'ssl_cert'))
+CONF = cfg.CONF
 
 
-class TestLoaderNothingExists(test.TestCase):
+class TestLoaderNothingExists(test.NoDBTestCase):
     """Loader tests where os.path.exists always returns False."""
 
     def setUp(self):
         super(TestLoaderNothingExists, self).setUp()
         self.stubs.Set(os.path, 'exists', lambda _: False)
 
-    def test_config_not_found(self):
+    def test_relpath_config_not_found(self):
+        self.flags(api_paste_config='api-paste.ini')
+        self.assertRaises(
+            nova.exception.ConfigNotFound,
+            nova.wsgi.Loader,
+        )
+
+    def test_asbpath_config_not_found(self):
+        self.flags(api_paste_config='/etc/nova/api-paste.ini')
         self.assertRaises(
             nova.exception.ConfigNotFound,
             nova.wsgi.Loader,
         )
 
 
-class TestLoaderNormalFilesystem(test.TestCase):
+class TestLoaderNormalFilesystem(test.NoDBTestCase):
     """Loader tests with normal filesystem (unmodified os.path module)."""
 
     _paste_config = """
@@ -69,7 +78,7 @@ document_root = /tmp
         self.loader = nova.wsgi.Loader(self.config.name)
 
     def test_config_found(self):
-        self.assertEquals(self.config.name, self.loader.config_path)
+        self.assertEqual(self.config.name, self.loader.config_path)
 
     def test_app_not_found(self):
         self.assertRaises(
@@ -80,19 +89,24 @@ document_root = /tmp
 
     def test_app_found(self):
         url_parser = self.loader.load_app("test_app")
-        self.assertEquals("/tmp", url_parser.directory)
+        self.assertEqual("/tmp", url_parser.directory)
 
     def tearDown(self):
         self.config.close()
         super(TestLoaderNormalFilesystem, self).tearDown()
 
 
-class TestWSGIServer(test.TestCase):
+class TestWSGIServer(test.NoDBTestCase):
     """WSGI server tests."""
 
     def test_no_app(self):
         server = nova.wsgi.Server("test_app", None)
-        self.assertEquals("test_app", server.name)
+        self.assertEqual("test_app", server.name)
+
+    def test_custom_max_header_line(self):
+        CONF.max_header_line = 4096  # Default value is 16384.
+        server = nova.wsgi.Server("test_custom_max_header_line", None)
+        self.assertEqual(CONF.max_header_line, eventlet.wsgi.MAX_HEADER_LINE)
 
     def test_start_random_port(self):
         server = nova.wsgi.Server("test_random_port", None,
@@ -132,7 +146,7 @@ class TestWSGIServer(test.TestCase):
         server.wait()
 
 
-class TestWSGIServerWithSSL(test.TestCase):
+class TestWSGIServerWithSSL(test.NoDBTestCase):
     """WSGI server with SSL tests."""
 
     def setUp(self):
@@ -160,7 +174,7 @@ class TestWSGIServerWithSSL(test.TestCase):
         cli.write('POST / HTTP/1.1\r\nHost: localhost\r\n'
                   'Connection: close\r\nContent-length:4\r\n\r\nPING')
         response = cli.read(8192)
-        self.assertEquals(response[-4:], "PONG")
+        self.assertEqual(response[-4:], "PONG")
 
         fake_ssl_server.stop()
         fake_ssl_server.wait()
@@ -179,7 +193,7 @@ class TestWSGIServerWithSSL(test.TestCase):
         fake_server = nova.wsgi.Server("fake", test_app,
             host="127.0.0.1", port=0)
         fake_server.start()
-        self.assertNotEquals(0, fake_server.port)
+        self.assertNotEqual(0, fake_server.port)
 
         cli = eventlet.connect(("localhost", fake_ssl_server.port))
         cli = eventlet.wrap_ssl(cli,
@@ -188,14 +202,14 @@ class TestWSGIServerWithSSL(test.TestCase):
         cli.write('POST / HTTP/1.1\r\nHost: localhost\r\n'
                   'Connection: close\r\nContent-length:4\r\n\r\nPING')
         response = cli.read(8192)
-        self.assertEquals(response[-4:], "PONG")
+        self.assertEqual(response[-4:], "PONG")
 
         cli = eventlet.connect(("localhost", fake_server.port))
 
         cli.sendall('POST / HTTP/1.1\r\nHost: localhost\r\n'
                   'Connection: close\r\nContent-length:4\r\n\r\nPING')
         response = cli.recv(8192)
-        self.assertEquals(response[-4:], "PONG")
+        self.assertEqual(response[-4:], "PONG")
 
         fake_ssl_server.stop()
         fake_ssl_server.wait()
@@ -217,7 +231,7 @@ class TestWSGIServerWithSSL(test.TestCase):
         server.start()
 
         response = urllib2.urlopen('https://[::1]:%d/' % server.port)
-        self.assertEquals(greetings, response.read())
+        self.assertEqual(greetings, response.read())
 
         server.stop()
         server.wait()

@@ -1,5 +1,3 @@
-# vim: tabstop=5 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -32,7 +30,7 @@ class FakeRequest(object):
         self.GET = {'reserved': 1} if reserved else {}
 
 
-class UsedLimitsTestCase(test.TestCase):
+class UsedLimitsTestCase(test.NoDBTestCase):
     def setUp(self):
         """Run before each test."""
         super(UsedLimitsTestCase, self).setUp()
@@ -202,7 +200,7 @@ class UsedLimitsTestCase(test.TestCase):
 
         self.controller.index(fake_req, res)
         abs_limits = res.obj['limits']['absolute']
-        self.assertTrue('totalRAMUsed' in abs_limits)
+        self.assertIn('totalRAMUsed', abs_limits)
         self.assertEqual(abs_limits['totalRAMUsed'], 256)
 
     def test_no_ram_quota(self):
@@ -225,7 +223,7 @@ class UsedLimitsTestCase(test.TestCase):
 
         self.controller.index(fake_req, res)
         abs_limits = res.obj['limits']['absolute']
-        self.assertFalse('totalRAMUsed' in abs_limits)
+        self.assertNotIn('totalRAMUsed', abs_limits)
 
     def test_used_limits_xmlns(self):
         fake_req = FakeRequest(self.fake_context)
@@ -248,4 +246,4 @@ class UsedLimitsTestCase(test.TestCase):
 
         self.controller.index(fake_req, res)
         response = res.serialize(None, 'xml')
-        self.assertTrue(used_limits.XMLNS in response.body)
+        self.assertIn(used_limits.XMLNS, response.body)

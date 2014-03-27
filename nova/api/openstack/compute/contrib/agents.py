@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 IBM Corp.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -22,6 +20,7 @@ from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
 from nova import db
 from nova import exception
+from nova import utils
 
 
 authorize = extensions.extension_authorizer('compute', 'agents')
@@ -43,8 +42,7 @@ class AgentsIndexTemplate(xmlutil.TemplateBuilder):
 
 
 class AgentController(object):
-    """
-    The agent is talking about guest agent.The host can use this for
+    """The agent is talking about guest agent.The host can use this for
     things like accessing files on the disk, configuring networking,
     or running other applications/scripts in the guest while it is
     running. Typically this uses some hypervisor-specific transport
@@ -67,9 +65,7 @@ class AgentController(object):
     """
     @wsgi.serializers(xml=AgentsIndexTemplate)
     def index(self, req):
-        """
-        Return a list of all agent builds. Filter by hypervisor.
-        """
+        """Return a list of all agent builds. Filter by hypervisor."""
         context = req.environ['nova.context']
         authorize(context)
         hypervisor = None
@@ -100,6 +96,13 @@ class AgentController(object):
             version = para['version']
         except (TypeError, KeyError):
             raise webob.exc.HTTPUnprocessableEntity()
+
+        try:
+            utils.check_string_length(url, 'url', max_length=255)
+            utils.check_string_length(md5hash, 'md5hash', max_length=255)
+            utils.check_string_length(version, 'version', max_length=255)
+        except exception.InvalidInput as exc:
+            raise webob.exc.HTTPBadRequest(explanation=exc.format_message())
 
         try:
             db.agent_build_update(context, id,
@@ -139,6 +142,17 @@ class AgentController(object):
             raise webob.exc.HTTPUnprocessableEntity()
 
         try:
+            utils.check_string_length(hypervisor, 'hypervisor', max_length=255)
+            utils.check_string_length(os, 'os', max_length=255)
+            utils.check_string_length(architecture, 'architecture',
+                                      max_length=255)
+            utils.check_string_length(version, 'version', max_length=255)
+            utils.check_string_length(url, 'url', max_length=255)
+            utils.check_string_length(md5hash, 'md5hash', max_length=255)
+        except exception.InvalidInput as exc:
+            raise webob.exc.HTTPBadRequest(explanation=exc.format_message())
+
+        try:
             agent_build_ref = db.agent_build_create(context,
                                                 {'hypervisor': hypervisor,
                                                  'os': os,
@@ -147,8 +161,8 @@ class AgentController(object):
                                                  'url': url,
                                                  'md5hash': md5hash})
             agent['agent_id'] = agent_build_ref.id
-        except Exception as ex:
-            raise webob.exc.HTTPServerError(str(ex))
+        except exception.AgentBuildExists as ex:
+            raise webob.exc.HTTPServerError(explanation=ex.format_message())
         return {'agent': agent}
 
 

@@ -65,7 +65,7 @@ def format_event(event):
     return event
 
 
-class InstanceActionsPolicyTest(test.TestCase):
+class InstanceActionsPolicyTest(test.NoDBTestCase):
     def setUp(self):
         super(InstanceActionsPolicyTest, self).setUp()
         self.controller = instance_actions.InstanceActionsController()
@@ -77,7 +77,8 @@ class InstanceActionsPolicyTest(test.TestCase):
         policy.set_rules(rules)
 
         def fake_instance_get_by_uuid(context, instance_id,
-                                      columns_to_join=None):
+                                      columns_to_join=None,
+                                      use_slave=False):
             return fake_instance.fake_db_instance(
                 **{'name': 'fake', 'project_id': '%s_unequal' %
                        context.project_id})
@@ -94,7 +95,8 @@ class InstanceActionsPolicyTest(test.TestCase):
         policy.set_rules(rules)
 
         def fake_instance_get_by_uuid(context, instance_id,
-                                      columns_to_join=None):
+                                      columns_to_join=None,
+                                      use_slave=False):
             return fake_instance.fake_db_instance(
                 **{'name': 'fake', 'project_id': '%s_unequal' %
                        context.project_id})
@@ -106,7 +108,7 @@ class InstanceActionsPolicyTest(test.TestCase):
                           str(uuid.uuid4()), '1')
 
 
-class InstanceActionsTest(test.TestCase):
+class InstanceActionsTest(test.NoDBTestCase):
     def setUp(self):
         super(InstanceActionsTest, self).setUp()
         self.controller = instance_actions.InstanceActionsController()
@@ -116,7 +118,7 @@ class InstanceActionsTest(test.TestCase):
         def fake_get(self, context, instance_uuid):
             return {'uuid': instance_uuid}
 
-        def fake_instance_get_by_uuid(context, instance_id):
+        def fake_instance_get_by_uuid(context, instance_id, use_slave=False):
             return {'name': 'fake', 'project_id': context.project_id}
 
         self.stubs.Set(compute_api.API, 'get', fake_get)
@@ -205,7 +207,7 @@ class InstanceActionsTest(test.TestCase):
                           FAKE_UUID)
 
 
-class InstanceActionsSerializerTest(test.TestCase):
+class InstanceActionsSerializerTest(test.NoDBTestCase):
     def setUp(self):
         super(InstanceActionsSerializerTest, self).setUp()
         self.fake_actions = copy.deepcopy(fake_instance_actions.FAKE_ACTIONS)

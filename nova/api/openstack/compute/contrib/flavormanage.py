@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
@@ -20,15 +18,14 @@ from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
 from nova.compute import flavors
 from nova import exception
+from nova.openstack.common.gettextutils import _
 
 
 authorize = extensions.extension_authorizer('compute', 'flavormanage')
 
 
 class FlavorManageController(wsgi.Controller):
-    """
-    The Flavor Lifecycle API controller for the OpenStack API.
-    """
+    """The Flavor Lifecycle API controller for the OpenStack API."""
     _view_builder_class = flavors_view.ViewBuilder
 
     def __init__(self):
@@ -54,9 +51,11 @@ class FlavorManageController(wsgi.Controller):
     def _create(self, req, body):
         context = req.environ['nova.context']
         authorize(context)
-
+        if not self.is_valid_body(body, 'flavor'):
+            msg = _("Invalid request body")
+            raise webob.exc.HTTPBadRequest(explanation=msg)
         vals = body['flavor']
-        name = vals['name']
+        name = vals.get('name')
         flavorid = vals.get('id')
         memory = vals.get('ram')
         vcpus = vals.get('vcpus')
@@ -73,8 +72,8 @@ class FlavorManageController(wsgi.Controller):
                                     rxtx_factor=rxtx_factor,
                                     is_public=is_public)
             req.cache_db_flavor(flavor)
-        except (exception.InstanceTypeExists,
-                exception.InstanceTypeIdExists) as err:
+        except (exception.FlavorExists,
+                exception.FlavorIdExists) as err:
             raise webob.exc.HTTPConflict(explanation=err.format_message())
         except exception.InvalidInput as exc:
             raise webob.exc.HTTPBadRequest(explanation=exc.format_message())
@@ -83,9 +82,7 @@ class FlavorManageController(wsgi.Controller):
 
 
 class Flavormanage(extensions.ExtensionDescriptor):
-    """
-    Flavor create/delete API support
-    """
+    """Flavor create/delete API support."""
 
     name = "FlavorManage"
     alias = "os-flavor-manage"

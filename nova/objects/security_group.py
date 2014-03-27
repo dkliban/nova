@@ -14,36 +14,42 @@
 
 from nova import db
 from nova.objects import base
+from nova.objects import fields
 
 
-class SecurityGroup(base.NovaObject):
+class SecurityGroup(base.NovaPersistentObject, base.NovaObject):
+    # Version 1.0: Initial version
+    # Version 1.1: String attributes updated to support unicode
+    VERSION = '1.1'
+
     fields = {
-        'id': int,
-        'name': str,
-        'description': str,
-        'user_id': str,
-        'project_id': str,
+        'id': fields.IntegerField(),
+        'name': fields.StringField(),
+        'description': fields.StringField(),
+        'user_id': fields.StringField(),
+        'project_id': fields.StringField(),
         }
 
     @staticmethod
-    def _from_db_object(secgroup, db_secgroup):
+    def _from_db_object(context, secgroup, db_secgroup):
         # NOTE(danms): These are identical right now
         for field in secgroup.fields:
             secgroup[field] = db_secgroup[field]
+        secgroup._context = context
         secgroup.obj_reset_changes()
         return secgroup
 
     @base.remotable_classmethod
     def get(cls, context, secgroup_id):
         db_secgroup = db.security_group_get(context, secgroup_id)
-        return cls._from_db_object(cls(), db_secgroup)
+        return cls._from_db_object(context, cls(), db_secgroup)
 
     @base.remotable_classmethod
     def get_by_name(cls, context, project_id, group_name):
         db_secgroup = db.security_group_get_by_name(context,
                                                     project_id,
                                                     group_name)
-        return cls._from_db_object(cls(), db_secgroup)
+        return cls._from_db_object(context, cls(), db_secgroup)
 
     @base.remotable
     def in_use(self, context):
@@ -51,48 +57,54 @@ class SecurityGroup(base.NovaObject):
 
     @base.remotable
     def save(self, context):
-        updates = {}
-        for field in self.obj_what_changed():
-            updates[field] = self[field]
+        updates = self.obj_get_changes()
         if updates:
             db_secgroup = db.security_group_update(context, self.id, updates)
-            SecurityGroup._from_db_object(self, db_secgroup)
+            SecurityGroup._from_db_object(context, self, db_secgroup)
         self.obj_reset_changes()
 
     @base.remotable
     def refresh(self, context):
-        SecurityGroup._from_db_object(self,
+        SecurityGroup._from_db_object(context, self,
                                       db.security_group_get(context,
                                                             self.id))
 
 
-def _make_secgroup_list(context, secgroup_list, db_secgroup_list):
-    secgroup_list.objects = []
-    for db_secgroup in db_secgroup_list:
-        secgroup = SecurityGroup._from_db_object(SecurityGroup(), db_secgroup)
-        secgroup._context = context
-        secgroup_list.objects.append(secgroup)
-    secgroup_list.obj_reset_changes()
-    return secgroup_list
-
-
 class SecurityGroupList(base.ObjectListBase, base.NovaObject):
+    # Version 1.0: Initial version
+    #              SecurityGroup <= version 1.1
+    VERSION = '1.0'
+
+    fields = {
+        'objects': fields.ListOfObjectsField('SecurityGroup'),
+        }
+    child_versions = {
+        '1.0': '1.1',
+        # NOTE(danms): SecurityGroup was at 1.1 before we added this
+        }
+
+    def __init__(self):
+        super(SecurityGroupList, self).__init__()
+        self.objects = []
+        self.obj_reset_changes()
+
     @base.remotable_classmethod
     def get_all(cls, context):
-        return _make_secgroup_list(context, cls(),
-                                   db.security_group_get_all(context))
+        groups = db.security_group_get_all(context)
+        return base.obj_make_list(context, SecurityGroupList(), SecurityGroup,
+                                  groups)
 
     @base.remotable_classmethod
     def get_by_project(cls, context, project_id):
-        return _make_secgroup_list(context, cls(),
-                                   db.security_group_get_by_project(
-                                       context, project_id))
+        groups = db.security_group_get_by_project(context, project_id)
+        return base.obj_make_list(context, SecurityGroupList(), SecurityGroup,
+                                  groups)
 
     @base.remotable_classmethod
     def get_by_instance(cls, context, instance):
-        return _make_secgroup_list(context, cls(),
-                                   db.security_group_get_by_instance(
-                                       context, instance.uuid))
+        groups = db.security_group_get_by_instance(context, instance.uuid)
+        return base.obj_make_list(context, SecurityGroupList(), SecurityGroup,
+                                  groups)
 
 
 def make_secgroup_list(security_groups):

@@ -13,18 +13,19 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from lxml import etree
 import webob
 
 from nova.api.openstack.compute.plugins.v3 import extended_availability_zone
 from nova import availability_zones
 from nova import compute
 from nova.compute import vm_states
+from nova import db
 from nova import exception
 from nova.objects import instance as instance_obj
 from nova.openstack.common import jsonutils
 from nova import test
 from nova.tests.api.openstack import fakes
+from nova.tests import fake_instance
 
 UUID1 = '00000000-0000-0000-0000-000000000001'
 UUID2 = '00000000-0000-0000-0000-000000000002'
@@ -35,20 +36,20 @@ def fake_compute_get_az(*args, **kwargs):
     inst = fakes.stub_instance(1, uuid=UUID3, host="get-host",
                                vm_state=vm_states.ACTIVE,
                                availability_zone='fakeaz')
-    return inst
+    return fake_instance.fake_instance_obj(args[1], **inst)
 
 
 def fake_compute_get_empty(*args, **kwargs):
     inst = fakes.stub_instance(1, uuid=UUID3, host="",
                                vm_state=vm_states.ACTIVE,
                                availability_zone='fakeaz')
-    return inst
+    return fake_instance.fake_instance_obj(args[1], **inst)
 
 
 def fake_compute_get(*args, **kwargs):
     inst = fakes.stub_instance(1, uuid=UUID3, host="get-host",
                                vm_state=vm_states.ACTIVE)
-    return inst
+    return fake_instance.fake_instance_obj(args[1], **inst)
 
 
 def fake_compute_get_all(*args, **kwargs):
@@ -71,18 +72,20 @@ def fake_get_no_host_availability_zone(context, host):
     return None
 
 
-class ExtendedServerAttributesTest(test.TestCase):
+class ExtendedAvailabilityZoneTest(test.TestCase):
     content_type = 'application/json'
     prefix = '%s:' % extended_availability_zone.ExtendedAvailabilityZone.alias
 
     def setUp(self):
-        super(ExtendedServerAttributesTest, self).setUp()
-        availability_zones._reset_cache()
+        super(ExtendedAvailabilityZoneTest, self).setUp()
+        availability_zones.reset_cache()
         fakes.stub_out_nw_api(self.stubs)
         self.stubs.Set(compute.api.API, 'get', fake_compute_get)
         self.stubs.Set(compute.api.API, 'get_all', fake_compute_get_all)
         self.stubs.Set(availability_zones, 'get_host_availability_zone',
                        fake_get_host_availability_zone)
+        return_server = fakes.fake_instance_get()
+        self.stubs.Set(db, 'instance_get_by_uuid', return_server)
 
     def _make_request(self, url):
         req = webob.Request.blank(url)
@@ -98,7 +101,7 @@ class ExtendedServerAttributesTest(test.TestCase):
     def _get_servers(self, body):
         return jsonutils.loads(body).get('servers')
 
-    def assertServerAttributes(self, server, az):
+    def assertAvailabilityZone(self, server, az):
         self.assertEqual(server.get('%savailability_zone' % self.prefix),
                          az)
 
@@ -111,7 +114,7 @@ class ExtendedServerAttributesTest(test.TestCase):
         res = self._make_request(url)
 
         self.assertEqual(res.status_int, 200)
-        self.assertServerAttributes(self._get_server(res.body), 'fakeaz')
+        self.assertAvailabilityZone(self._get_server(res.body), 'fakeaz')
 
     def test_show_empty_host_az(self):
         self.stubs.Set(compute.api.API, 'get', fake_compute_get_empty)
@@ -122,14 +125,14 @@ class ExtendedServerAttributesTest(test.TestCase):
         res = self._make_request(url)
 
         self.assertEqual(res.status_int, 200)
-        self.assertServerAttributes(self._get_server(res.body), 'fakeaz')
+        self.assertAvailabilityZone(self._get_server(res.body), 'fakeaz')
 
     def test_show(self):
         url = '/v3/servers/%s' % UUID3
         res = self._make_request(url)
 
         self.assertEqual(res.status_int, 200)
-        self.assertServerAttributes(self._get_server(res.body), 'get-host')
+        self.assertAvailabilityZone(self._get_server(res.body), 'get-host')
 
     def test_detail(self):
         url = '/v3/servers/detail'
@@ -137,7 +140,7 @@ class ExtendedServerAttributesTest(test.TestCase):
 
         self.assertEqual(res.status_int, 200)
         for i, server in enumerate(self._get_servers(res.body)):
-            self.assertServerAttributes(server, 'all-host')
+            self.assertAvailabilityZone(server, 'all-host')
 
     def test_no_instance_passthrough_404(self):
 
@@ -149,15 +152,3 @@ class ExtendedServerAttributesTest(test.TestCase):
         res = self._make_request(url)
 
         self.assertEqual(res.status_int, 404)
-
-
-class ExtendedServerAttributesXmlTest(ExtendedServerAttributesTest):
-    content_type = 'application/xml'
-    prefix = ('{%s}' %
-              extended_availability_zone.ExtendedAvailabilityZone.namespace)
-
-    def _get_server(self, body):
-        return etree.XML(body)
-
-    def _get_servers(self, body):
-        return etree.XML(body).getchildren()

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -29,9 +27,12 @@ import nova.db.api
 from nova import exception
 from nova import objects
 from nova.objects import base as objects_base
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
+from nova.openstack.common.report import guru_meditation_report as gmr
 from nova import service
 from nova import utils
+from nova import version
 
 CONF = cfg.CONF
 CONF.import_opt('compute_topic', 'nova.compute.rpcapi')
@@ -46,7 +47,8 @@ def block_db_access():
         def __call__(self, *args, **kwargs):
             stacktrace = "".join(traceback.format_stack())
             LOG = logging.getLogger('nova.compute')
-            LOG.error('No db access allowed in nova-compute: %s' % stacktrace)
+            LOG.error(_('No db access allowed in nova-compute: %s'),
+                      stacktrace)
             raise exception.DBNotAllowed('nova-compute')
 
     nova.db.api.IMPL = NoDB()
@@ -58,6 +60,8 @@ def main():
     logging.setup('nova')
     utils.monkey_patch()
 
+    gmr.TextGuruMeditation.setup_autorun(version)
+
     if not CONF.conductor.use_local:
         block_db_access()
         objects_base.NovaObject.indirection_api = \
@@ -65,6 +69,6 @@ def main():
 
     server = service.Service.create(binary='nova-compute',
                                     topic=CONF.compute_topic,
-                                    db_allowed=False)
+                                    db_allowed=CONF.conductor.use_local)
     service.serve(server)
     service.wait()

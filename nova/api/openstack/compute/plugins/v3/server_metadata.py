@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -33,28 +31,28 @@ class ServerMetadataController(wsgi.Controller):
         super(ServerMetadataController, self).__init__()
 
     def _get_metadata(self, context, server_id):
+        server = common.get_instance(self.compute_api, context, server_id)
         try:
-            server = self.compute_api.get(context, server_id)
+            # NOTE(mikal): get_instanc_metadata sometimes returns
+            # InstanceNotFound in unit tests, even though the instance is
+            # fetched on the line above. I blame mocking.
             meta = self.compute_api.get_instance_metadata(context, server)
         except exception.InstanceNotFound:
             msg = _('Server does not exist')
             raise exc.HTTPNotFound(explanation=msg)
-
         meta_dict = {}
         for key, value in meta.iteritems():
             meta_dict[key] = value
         return meta_dict
 
     @extensions.expected_errors(404)
-    @wsgi.serializers(xml=common.MetadataTemplate)
     def index(self, req, server_id):
         """Returns the list of metadata for a given instance."""
         context = req.environ['nova.context']
         return {'metadata': self._get_metadata(context, server_id)}
 
     @extensions.expected_errors((400, 404, 409, 413))
-    @wsgi.serializers(xml=common.MetadataTemplate)
-    @wsgi.deserializers(xml=common.MetadataDeserializer)
+    @wsgi.response(201)
     def create(self, req, server_id, body):
         if not self.is_valid_body(body, 'metadata'):
             msg = _("Malformed request body")
@@ -70,8 +68,6 @@ class ServerMetadataController(wsgi.Controller):
         return {'metadata': new_metadata}
 
     @extensions.expected_errors((400, 404, 409, 413))
-    @wsgi.serializers(xml=common.MetaItemTemplate)
-    @wsgi.deserializers(xml=common.MetaItemDeserializer)
     def update(self, req, server_id, id, body):
         if not self.is_valid_body(body, 'metadata'):
             msg = _("Malformed request body")
@@ -94,8 +90,6 @@ class ServerMetadataController(wsgi.Controller):
         return {'metadata': meta_item}
 
     @extensions.expected_errors((400, 404, 409, 413))
-    @wsgi.serializers(xml=common.MetadataTemplate)
-    @wsgi.deserializers(xml=common.MetadataDeserializer)
     def update_all(self, req, server_id, body):
         if not self.is_valid_body(body, 'metadata'):
             msg = _("Malformed request body")
@@ -112,15 +106,12 @@ class ServerMetadataController(wsgi.Controller):
     def _update_instance_metadata(self, context, server_id, metadata,
                                   delete=False):
         try:
-            server = self.compute_api.get(context, server_id)
+            server = common.get_instance(self.compute_api, context, server_id,
+                                         want_objects=True)
             return self.compute_api.update_instance_metadata(context,
                                                              server,
                                                              metadata,
                                                              delete)
-
-        except exception.InstanceNotFound:
-            msg = _('Server does not exist')
-            raise exc.HTTPNotFound(explanation=msg)
 
         except exception.InvalidMetadata as error:
             raise exc.HTTPBadRequest(explanation=error.format_message())
@@ -139,7 +130,6 @@ class ServerMetadataController(wsgi.Controller):
                     'update metadata')
 
     @extensions.expected_errors(404)
-    @wsgi.serializers(xml=common.MetaItemTemplate)
     def show(self, req, server_id, id):
         """Return a single metadata item."""
         context = req.environ['nova.context']
@@ -163,14 +153,10 @@ class ServerMetadataController(wsgi.Controller):
             msg = _("Metadata item was not found")
             raise exc.HTTPNotFound(explanation=msg)
 
+        server = common.get_instance(self.compute_api, context, server_id,
+                                     want_objects=True)
         try:
-            server = self.compute_api.get(context, server_id)
             self.compute_api.delete_instance_metadata(context, server, id)
-
-        except exception.InstanceNotFound:
-            msg = _('Server does not exist')
-            raise exc.HTTPNotFound(explanation=msg)
-
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
                     'delete metadata')
@@ -180,7 +166,6 @@ class ServerMetadata(extensions.V3APIExtensionBase):
     """Server Metadata API."""
     name = "Server Metadata"
     alias = "server-metadata"
-    namespace = "http://docs.openstack.org/compute/core/server_metadata/v3"
     version = 1
 
     def get_resources(self):

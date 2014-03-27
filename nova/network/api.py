@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011 X.commerce, a business unit of eBay Inc.
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
@@ -27,7 +25,9 @@ from nova import exception
 from nova.network import floating_ips
 from nova.network import model as network_model
 from nova.network import rpcapi as network_rpcapi
+from nova.objects import instance as instance_obj
 from nova.objects import instance_info_cache as info_cache_obj
+from nova.openstack.common import excutils
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova import policy
@@ -37,8 +37,7 @@ LOG = logging.getLogger(__name__)
 
 
 def refresh_cache(f):
-    """
-    Decorator to update the instance_info_cache
+    """Decorator to update the instance_info_cache
 
     Requires context and instance as function args
     """
@@ -70,8 +69,9 @@ def update_instance_cache_with_nw_info(api, context, instance, nw_info=None,
     try:
         if not isinstance(nw_info, network_model.NetworkInfo):
             nw_info = None
-        if not nw_info:
+        if nw_info is None:
             nw_info = api._get_instance_nw_info(context, instance)
+        LOG.debug(_('Updating cache with info: %s'), nw_info)
         # NOTE(comstud): The save() method actually handles updating or
         # creating the instance.  We don't need to retrieve the object
         # from the DB first.
@@ -80,7 +80,8 @@ def update_instance_cache_with_nw_info(api, context, instance, nw_info=None,
         ic.network_info = nw_info
         ic.save(update_cells=update_cells)
     except Exception:
-        LOG.exception(_('Failed storing info cache'), instance=instance)
+        with excutils.save_and_reraise_exception():
+            LOG.exception(_('Failed storing info cache'), instance=instance)
 
 
 def wrap_check_policy(func):
@@ -122,8 +123,14 @@ class API(base.Base):
 
     @wrap_check_policy
     def get_all(self, context):
+        """Get all the networks.
+
+        If it is an admin user, api will return all the networks,
+        if it is a normal user, api will only return the networks which
+        belong to the user's project.
+        """
         try:
-            return self.db.network_get_all(context)
+            return self.db.network_get_all(context, project_only=True)
         except exception.NoNetworksFound:
             return []
 
@@ -154,6 +161,8 @@ class API(base.Base):
 
     @wrap_check_policy
     def get_floating_ip(self, context, id):
+        if not utils.is_int_like(id):
+            raise exception.InvalidID(id=id)
         return self.db.floating_ip_get(context, id)
 
     @wrap_check_policy
@@ -255,29 +264,41 @@ class API(base.Base):
     @refresh_cache
     def allocate_for_instance(self, context, instance, vpn,
                               requested_networks, macs=None,
-                              conductor_api=None, security_groups=None):
+                              security_groups=None,
+                              dhcp_options=None):
         """Allocates all network structures for an instance.
 
-        TODO(someone): document the rest of these parameters.
-
+        :param context: The request context.
+        :param instance: An Instance dict.
+        :param vpn: A boolean, if True, indicate a vpn to access the instance.
+        :param requested_networks: A dictionary of requested_networks,
+            Optional value containing network_id, fixed_ip, and port_id.
         :param macs: None or a set of MAC addresses that the instance
             should use. macs is supplied by the hypervisor driver (contrast
             with requested_networks which is user supplied).
+        :param security_groups: None or security groups to allocate for
+            instance.
+        :param dhcp_options: None or a set of key/value pairs that should
+            determine the DHCP BOOTP response, eg. for PXE booting an instance
+            configured with the baremetal hypervisor. It is expected that these
+            are already formatted for the neutron v2 api.
+            See nova/virt/driver.py:dhcp_options_for_instance for an example.
         :returns: network info as from get_instance_nw_info() below
         """
         # NOTE(vish): We can't do the floating ip allocation here because
         #             this is called from compute.manager which shouldn't
         #             have db access so we do it on the other side of the
         #             rpc.
-        instance_type = flavors.extract_flavor(instance)
+        flavor = flavors.extract_flavor(instance)
         args = {}
         args['vpn'] = vpn
         args['requested_networks'] = requested_networks
         args['instance_id'] = instance['uuid']
         args['project_id'] = instance['project_id']
         args['host'] = instance['host']
-        args['rxtx_factor'] = instance_type['rxtx_factor']
+        args['rxtx_factor'] = flavor['rxtx_factor']
         args['macs'] = macs
+        args['dhcp_options'] = dhcp_options
         nw_info = self.network_rpcapi.allocate_for_instance(context, **args)
 
         return network_model.NetworkInfo.hydrate(nw_info)
@@ -290,22 +311,19 @@ class API(base.Base):
         #             this is called from compute.manager which shouldn't
         #             have db access so we do it on the other side of the
         #             rpc.
-        args = {}
-        args['instance_id'] = instance['uuid']
-        args['project_id'] = instance['project_id']
-        args['host'] = instance['host']
-        args['requested_networks'] = requested_networks
-        self.network_rpcapi.deallocate_for_instance(context, **args)
+        if not isinstance(instance, instance_obj.Instance):
+            instance = instance_obj.Instance._from_db_object(context,
+                    instance_obj.Instance(), instance)
+        self.network_rpcapi.deallocate_for_instance(context, instance=instance,
+                requested_networks=requested_networks)
 
     # NOTE(danms): Here for neutron compatibility
     def allocate_port_for_instance(self, context, instance, port_id,
-                                   network_id=None, requested_ip=None,
-                                   conductor_api=None):
+                                   network_id=None, requested_ip=None):
         raise NotImplementedError()
 
     # NOTE(danms): Here for neutron compatibility
-    def deallocate_port_for_instance(self, context, instance, port_id,
-                                     conductor_api=None):
+    def deallocate_port_for_instance(self, context, instance, port_id):
         raise NotImplementedError()
 
     # NOTE(danms): Here for neutron compatibility
@@ -318,25 +336,23 @@ class API(base.Base):
 
     @wrap_check_policy
     @refresh_cache
-    def add_fixed_ip_to_instance(self, context, instance, network_id,
-                                 conductor_api=None):
+    def add_fixed_ip_to_instance(self, context, instance, network_id):
         """Adds a fixed ip to instance from specified network."""
-        instance_type = flavors.extract_flavor(instance)
+        flavor = flavors.extract_flavor(instance)
         args = {'instance_id': instance['uuid'],
-                'rxtx_factor': instance_type['rxtx_factor'],
+                'rxtx_factor': flavor['rxtx_factor'],
                 'host': instance['host'],
                 'network_id': network_id}
         self.network_rpcapi.add_fixed_ip_to_instance(context, **args)
 
     @wrap_check_policy
     @refresh_cache
-    def remove_fixed_ip_from_instance(self, context, instance, address,
-                                      conductor_api=None):
+    def remove_fixed_ip_from_instance(self, context, instance, address):
         """Removes a fixed ip from instance from specified network."""
 
-        instance_type = flavors.extract_flavor(instance)
+        flavor = flavors.extract_flavor(instance)
         args = {'instance_id': instance['uuid'],
-                'rxtx_factor': instance_type['rxtx_factor'],
+                'rxtx_factor': flavor['rxtx_factor'],
                 'host': instance['host'],
                 'address': address}
         self.network_rpcapi.remove_fixed_ip_from_instance(context, **args)
@@ -381,9 +397,9 @@ class API(base.Base):
 
     def _get_instance_nw_info(self, context, instance):
         """Returns all network info related to an instance."""
-        instance_type = flavors.extract_flavor(instance)
+        flavor = flavors.extract_flavor(instance)
         args = {'instance_id': instance['uuid'],
-                'rxtx_factor': instance_type['rxtx_factor'],
+                'rxtx_factor': flavor['rxtx_factor'],
                 'host': instance['host'],
                 'project_id': instance['project_id']}
         nw_info = self.network_rpcapi.get_instance_nw_info(context, **args)
@@ -391,15 +407,22 @@ class API(base.Base):
         return network_model.NetworkInfo.hydrate(nw_info)
 
     @wrap_check_policy
-    def validate_networks(self, context, requested_networks):
+    def validate_networks(self, context, requested_networks, num_instances):
         """validate the networks passed at the time of creating
-        the server
-        """
-        if not requested_networks:
-            return
+        the server.
 
-        return self.network_rpcapi.validate_networks(context,
-                                                     requested_networks)
+        Return the number of instances that can be successfully allocated
+        with the requested network configuration.
+        """
+        if requested_networks:
+            self.network_rpcapi.validate_networks(context,
+                                                  requested_networks)
+
+        # Neutron validation checks and returns how many of num_instances
+        # instances can be supported by the quota.  For Nova network
+        # this is part of the subsequent quota check, so we just return
+        # the requested number in this case.
+        return num_instances
 
     @wrap_check_policy
     def get_instance_uuids_by_ip_filter(self, context, filters):
@@ -502,10 +525,10 @@ class API(base.Base):
     @wrap_check_policy
     def migrate_instance_start(self, context, instance, migration):
         """Start to migrate the network of an instance."""
-        instance_type = flavors.extract_flavor(instance)
+        flavor = flavors.extract_flavor(instance)
         args = dict(
             instance_uuid=instance['uuid'],
-            rxtx_factor=instance_type['rxtx_factor'],
+            rxtx_factor=flavor['rxtx_factor'],
             project_id=instance['project_id'],
             source_compute=migration['source_compute'],
             dest_compute=migration['dest_compute'],
@@ -522,10 +545,10 @@ class API(base.Base):
     @wrap_check_policy
     def migrate_instance_finish(self, context, instance, migration):
         """Finish migrating the network of an instance."""
-        instance_type = flavors.extract_flavor(instance)
+        flavor = flavors.extract_flavor(instance)
         args = dict(
             instance_uuid=instance['uuid'],
-            rxtx_factor=instance_type['rxtx_factor'],
+            rxtx_factor=flavor['rxtx_factor'],
             project_id=instance['project_id'],
             source_compute=migration['source_compute'],
             dest_compute=migration['dest_compute'],

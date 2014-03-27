@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -46,7 +44,7 @@ os.makedirs(os.path.join(OSS_TEMPDIR, 'images'))
 os.makedirs(os.path.join(OSS_TEMPDIR, 'buckets'))
 
 
-class S3APITestCase(test.TestCase):
+class S3APITestCase(test.NoDBTestCase):
     """Test objectstore through S3 API."""
 
     def setUp(self):
@@ -77,20 +75,20 @@ class S3APITestCase(test.TestCase):
                                calling_format=s3.OrdinaryCallingFormat())
         self.conn = conn
 
-        def get_http_connection(host, is_secure):
+        def get_http_connection(*args):
             """Get a new S3 connection, don't attempt to reuse connections."""
-            return self.conn.new_http_connection(host, is_secure)
+            return self.conn.new_http_connection(*args)
 
         self.conn.get_http_connection = get_http_connection
 
     def _ensure_no_buckets(self, buckets):  # pylint: disable=C0111
-        self.assertEquals(len(buckets), 0, "Bucket list was not empty")
+        self.assertEqual(len(buckets), 0, "Bucket list was not empty")
         return True
 
     def _ensure_one_bucket(self, buckets, name):  # pylint: disable=C0111
-        self.assertEquals(len(buckets), 1,
-                          "Bucket list didn't have exactly one element in it")
-        self.assertEquals(buckets[0].name, name, "Wrong name")
+        self.assertEqual(len(buckets), 1,
+                         "Bucket list didn't have exactly one element in it")
+        self.assertEqual(buckets[0].name, name, "Wrong name")
         return True
 
     def test_list_buckets(self):
@@ -120,8 +118,8 @@ class S3APITestCase(test.TestCase):
 
         # make sure the contents are correct
         key = bucket.get_key(key_name)
-        self.assertEquals(key.get_contents_as_string(), key_contents,
-                          "Bad contents")
+        self.assertEqual(key.get_contents_as_string(), key_contents,
+                         "Bad contents")
 
         # delete the key
         key.delete()
@@ -129,10 +127,27 @@ class S3APITestCase(test.TestCase):
         self._ensure_no_buckets(bucket.get_all_keys())
 
     def test_unknown_bucket(self):
+        # NOTE(unicell): Since Boto v2.25.0, the underlying implementation
+        # of get_bucket method changed from GET to HEAD.
+        #
+        # Prior to v2.25.0, default validate=True fetched a list of keys in the
+        # bucket and raises S3ResponseError. As a side effect of switching to
+        # HEAD request, get_bucket call now generates less error message.
+        #
+        # To keep original semantics, additional get_all_keys call is
+        # suggestted per Boto document. This case tests both validate=False and
+        # validate=True case for completeness.
+        #
+        # http://docs.pythonboto.org/en/latest/releasenotes/v2.25.0.html
+        # http://docs.pythonboto.org/en/latest/s3_tut.html#accessing-a-bucket
         bucket_name = 'falalala'
         self.assertRaises(boto_exception.S3ResponseError,
                           self.conn.get_bucket,
                           bucket_name)
+        bucket = self.conn.get_bucket(bucket_name, validate=False)
+        self.assertRaises(boto_exception.S3ResponseError,
+                          bucket.get_all_keys,
+                          maxkeys=0)
 
     def tearDown(self):
         """Tear down test server."""

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -20,10 +18,10 @@ Starting point for routing EC2 requests.
 
 """
 
-import urlparse
-
 from eventlet.green import httplib
 from oslo.config import cfg
+import six
+import six.moves.urllib.parse as urlparse
 import webob
 import webob.dec
 import webob.exc
@@ -158,7 +156,7 @@ class Lockout(wsgi.Middleware):
         failures = int(self.mc.get(failures_key) or 0)
         if failures >= CONF.lockout_attempts:
             detail = _("Too many failed authentications.")
-            raise webob.exc.HTTPForbidden(detail=detail)
+            raise webob.exc.HTTPForbidden(explanation=detail)
         res = req.get_response(self.application)
         if res.status_int == 403:
             failures = self.mc.incr(failures_key)
@@ -186,12 +184,12 @@ class EC2KeystoneAuth(wsgi.Middleware):
         signature = req.params.get('Signature')
         if not signature:
             msg = _("Signature not provided")
-            return faults.ec2_error_response(request_id, "Unauthorized", msg,
+            return faults.ec2_error_response(request_id, "AuthFailure", msg,
                                              status=400)
         access = req.params.get('AWSAccessKeyId')
         if not access:
             msg = _("Access key not provided")
-            return faults.ec2_error_response(request_id, "Unauthorized", msg,
+            return faults.ec2_error_response(request_id, "AuthFailure", msg,
                                              status=400)
 
         # Make a copy of args for authentication and signature verification.
@@ -227,8 +225,8 @@ class EC2KeystoneAuth(wsgi.Middleware):
                 msg = response.reason
             else:
                 msg = _("Failure communicating with keystone")
-            return faults.ec2_error_response(request_id, "Unauthorized", msg,
-                                             status=400)
+            return faults.ec2_error_response(request_id, "AuthFailure", msg,
+                                             status=response.status)
         result = jsonutils.loads(data)
         conn.close()
 
@@ -243,7 +241,7 @@ class EC2KeystoneAuth(wsgi.Middleware):
         except (AttributeError, KeyError) as e:
             LOG.exception(_("Keystone failure: %s") % e)
             msg = _("Failure communicating with keystone")
-            return faults.ec2_error_response(request_id, "Unauthorized", msg,
+            return faults.ec2_error_response(request_id, "AuthFailure", msg,
                                              status=400)
 
         remote_address = req.remote_addr
@@ -304,7 +302,7 @@ class Requestify(wsgi.Middleware):
             if expired:
                 msg = _("Timestamp failed validation.")
                 LOG.exception(msg)
-                raise webob.exc.HTTPForbidden(detail=msg)
+                raise webob.exc.HTTPForbidden(explanation=msg)
 
             # Raise KeyError if omitted
             action = req.params['Action']
@@ -470,16 +468,17 @@ def exception_to_ec2code(ex):
 
 
 def ec2_error_ex(ex, req, code=None, message=None, unexpected=False):
-    """
-    Return an EC2 error response based on passed exception and log
+    """Return an EC2 error response based on passed exception and log
     the exception on an appropriate log level:
 
         * DEBUG: expected errors
-        * ERROR: unexpected client (4xx) errors
-        * CRITICAL: unexpected server (5xx) errors
+        * ERROR: unexpected errors
+
+    All expected errors are treated as client errors and 4xx HTTP
+    status codes are always returned for them.
 
     Unexpected 5xx errors may contain sensitive information,
-    supress their messages for security.
+    suppress their messages for security.
     """
     if not code:
         code = exception_to_ec2code(ex)
@@ -488,19 +487,23 @@ def ec2_error_ex(ex, req, code=None, message=None, unexpected=False):
         status = 500
 
     if unexpected:
-        log_msg = _("Unexpected %(ex_name)s raised")
-        if status >= 500:
-            log_fun = LOG.critical
+        log_fun = LOG.error
+        if ex.args and status < 500:
+            log_msg = _("Unexpected %(ex_name)s raised: %(ex_str)s")
         else:
-            log_fun = LOG.error
-            if ex.args:
-                log_msg = _("Unexpected %(ex_name)s raised: %(ex_str)s")
+            log_msg = _("Unexpected %(ex_name)s raised")
     else:
         log_fun = LOG.debug
         if ex.args:
             log_msg = _("%(ex_name)s raised: %(ex_str)s")
         else:
             log_msg = _("%(ex_name)s raised")
+        # NOTE(jruzicka): For compatibility with EC2 API, treat expected
+        # exceptions as client (4xx) errors. The exception error code is 500
+        # by default and most exceptions inherit this from NovaException even
+        # though they are actually client errors in most cases.
+        if status >= 500:
+            status = 400
     context = req.environ['nova.context']
     request_id = context.request_id
     log_msg_args = {
@@ -515,14 +518,12 @@ def ec2_error_ex(ex, req, code=None, message=None, unexpected=False):
         # Log filtered environment for unexpected errors.
         env = req.environ.copy()
         for k in env.keys():
-            if not isinstance(env[k], basestring):
+            if not isinstance(env[k], six.string_types):
                 env.pop(k)
         log_fun(_('Environment: %s') % jsonutils.dumps(env))
     if not message:
-        message = _('Unknown error occured.')
-    # note(jruzicka): To preserve old behavior, all exceptions are returned
-    # with 400 status until EC2 errors are properly fixed.
-    return faults.ec2_error_response(request_id, code, message, status=400)
+        message = _('Unknown error occurred.')
+    return faults.ec2_error_response(request_id, code, message, status=status)
 
 
 class Executor(wsgi.Application):
@@ -538,7 +539,6 @@ class Executor(wsgi.Application):
     def __call__(self, req):
         context = req.environ['nova.context']
         api_request = req.environ['ec2.request']
-        result = None
         try:
             result = api_request.invoke(context)
         except exception.InstanceNotFound as ex:
@@ -553,20 +553,32 @@ class Executor(wsgi.Application):
             ec2_id = ec2utils.id_to_ec2_snap_id(ex.kwargs['snapshot_id'])
             message = ex.msg_fmt % {'snapshot_id': ec2_id}
             return ec2_error_ex(ex, req, message=message)
-        except exception.KeyPairExists as ex:
-            code = 'InvalidKeyPair.Duplicate'
-            return ec2_error_ex(ex, req, code=code)
-        except exception.InvalidKeypair as ex:
-            code = 'InvalidKeyPair.Format'
-            return ec2_error_ex(ex, req, code=code)
-        except (exception.EC2APIError,
-                exception.NotFound,
+        except (exception.CannotDisassociateAutoAssignedFloatingIP,
+                exception.FloatingIpAssociated,
+                exception.FloatingIpNotFound,
+                exception.ImageNotActive,
+                exception.InvalidInstanceIDMalformed,
+                exception.InvalidKeypair,
                 exception.InvalidParameterValue,
                 exception.InvalidPortRange,
+                exception.InvalidVolume,
+                exception.KeyPairExists,
+                exception.KeypairNotFound,
+                exception.MissingParameter,
+                exception.NoFloatingIpInterface,
+                exception.NoMoreFixedIps,
                 exception.NotAuthorized,
-                exception.InvalidRequest,
                 exception.QuotaError,
-                exception.InvalidInstanceIDMalformed) as ex:
+                exception.SecurityGroupExists,
+                exception.SecurityGroupLimitExceeded,
+                exception.SecurityGroupRuleExists,
+                exception.VolumeUnattached,
+                # Following aren't translated to valid EC2 errors.
+                exception.ImageNotFound,
+                exception.ImageNotFoundEC2,
+                exception.InvalidAttribute,
+                exception.InvalidRequest,
+                exception.NotFound) as ex:
             return ec2_error_ex(ex, req)
         except Exception as ex:
             return ec2_error_ex(ex, req, unexpected=True)

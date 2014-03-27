@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
@@ -16,6 +14,7 @@ from oslo.config import cfg
 import webob.dec
 import webob.exc
 
+import nova.api.ec2
 from nova import context
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
@@ -26,7 +25,7 @@ LOG = logging.getLogger(__name__)
 
 
 def ec2_error_response(request_id, code, message, status=500):
-    """Helper to construct an EC2 compatible error reposne."""
+    """Helper to construct an EC2 compatible error response."""
     LOG.debug(_('EC2 error response: %(code)s: %(message)s') %
                 {'code': code, 'message': message})
     resp = webob.Response()
@@ -52,12 +51,12 @@ class Fault(webob.exc.HTTPException):
     @webob.dec.wsgify
     def __call__(self, req):
         """Generate a WSGI response based on the exception passed to ctor."""
-        code = self.wrapped_exc.status_int
+        code = nova.api.ec2.exception_to_ec2code(self.wrapped_exc)
+        status = self.wrapped_exc.status_int
         message = self.wrapped_exc.explanation
 
-        if code == 501:
+        if status == 501:
             message = "The requested function is not supported"
-        code = str(code)
 
         if 'AWSAccessKeyId' not in req.params:
             raise webob.exc.HTTPBadRequest()
@@ -71,5 +70,5 @@ class Fault(webob.exc.HTTPException):
                                       project_id,
                                       remote_address=remote_address)
         resp = ec2_error_response(ctxt.request_id, code,
-                                  message=message, status=code)
+                                  message=message, status=status)
         return resp

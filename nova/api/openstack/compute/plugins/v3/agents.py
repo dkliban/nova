@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 IBM Corp.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -17,36 +15,20 @@
 
 import webob.exc
 
+from nova.api.openstack.compute.schemas.v3 import agents as schema
 from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
-from nova.api.openstack import xmlutil
+from nova.api import validation
 from nova import db
 from nova import exception
-from nova.openstack.common.gettextutils import _
 
 
 ALIAS = "os-agents"
 authorize = extensions.extension_authorizer('compute', 'v3:' + ALIAS)
 
 
-class AgentsIndexTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('agents')
-        elem = xmlutil.SubTemplateElement(root, 'agent', selector='agents')
-        elem.set('hypervisor')
-        elem.set('os')
-        elem.set('architecture')
-        elem.set('version')
-        elem.set('md5hash')
-        elem.set('agent_id')
-        elem.set('url')
-
-        return xmlutil.MasterTemplate(root, 1)
-
-
 class AgentController(object):
-    """
-    The agent is talking about guest agent.The host can use this for
+    """The agent is talking about guest agent.The host can use this for
     things like accessing files on the disk, configuring networking,
     or running other applications/scripts in the guest while it is
     running. Typically this uses some hypervisor-specific transport
@@ -68,11 +50,8 @@ class AgentController(object):
     http://wiki.openstack.org/GuestAgentXenStoreCommunication
     """
     @extensions.expected_errors(())
-    @wsgi.serializers(xml=AgentsIndexTemplate)
     def index(self, req):
-        """
-        Return a list of all agent builds. Filter by hypervisor.
-        """
+        """Return a list of all agent builds. Filter by hypervisor."""
         context = req.environ['nova.context']
         authorize(context)
         hypervisor = None
@@ -92,21 +71,16 @@ class AgentController(object):
         return {'agents': agents}
 
     @extensions.expected_errors((400, 404))
+    @validation.schema(schema.update)
     def update(self, req, id, body):
         """Update an existing agent build."""
         context = req.environ['nova.context']
         authorize(context)
 
-        try:
-            para = body['agent']
-            url = para['url']
-            md5hash = para['md5hash']
-            version = para['version']
-        except TypeError as e:
-            raise webob.exc.HTTPBadRequest()
-        except KeyError as e:
-            raise webob.exc.HTTPBadRequest(explanation=_(
-                "Could not find %s parameter in the request") % e.args[0])
+        para = body['agent']
+        url = para['url']
+        md5hash = para['md5hash']
+        version = para['version']
 
         try:
             db.agent_build_update(context, id,
@@ -132,24 +106,20 @@ class AgentController(object):
             raise webob.exc.HTTPNotFound(explanation=ex.format_message())
 
     @extensions.expected_errors((400, 409))
+    @wsgi.response(201)
+    @validation.schema(schema.create)
     def create(self, req, body):
         """Creates a new agent build."""
         context = req.environ['nova.context']
         authorize(context)
 
-        try:
-            agent = body['agent']
-            hypervisor = agent['hypervisor']
-            os = agent['os']
-            architecture = agent['architecture']
-            version = agent['version']
-            url = agent['url']
-            md5hash = agent['md5hash']
-        except TypeError as e:
-            raise webob.exc.HTTPBadRequest()
-        except KeyError as e:
-            raise webob.exc.HTTPBadRequest(explanation=_(
-                "Could not find %s parameter in the request") % e.args[0])
+        agent = body['agent']
+        hypervisor = agent['hypervisor']
+        os = agent['os']
+        architecture = agent['architecture']
+        version = agent['version']
+        url = agent['url']
+        md5hash = agent['md5hash']
 
         try:
             agent_build_ref = db.agent_build_create(context,
@@ -170,7 +140,6 @@ class Agents(extensions.V3APIExtensionBase):
 
     name = "Agents"
     alias = ALIAS
-    namespace = "http://docs.openstack.org/compute/ext/agents/api/v3"
     version = 1
 
     def get_resources(self):

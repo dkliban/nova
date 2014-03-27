@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 NTT
 # All Rights Reserved.
 #
@@ -16,18 +14,24 @@
 # under the License.
 
 import calendar
+import contextlib
+import datetime
 import os
 
+import mock
 import mox
 from oslo.config import cfg
 
 from nova import context
 from nova import db
+from nova import exception
 from nova.network import driver
 from nova.network import linux_net
+from nova.objects import fixed_ip as fixed_ip_obj
 from nova.openstack.common import fileutils
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
+from nova.openstack.common import processutils
 from nova.openstack.common import timeutils
 from nova import test
 from nova import utils
@@ -41,15 +45,15 @@ instances = {'00000000-0000-0000-0000-0000000000000000':
                  {'id': 0,
                   'uuid': '00000000-0000-0000-0000-0000000000000000',
                   'host': 'fake_instance00',
-                  'created_at': 'fakedate',
-                  'updated_at': 'fakedate',
+                  'created_at': datetime.datetime(1955, 11, 5, 0, 0, 0),
+                  'updated_at': datetime.datetime(1985, 10, 26, 1, 35, 0),
                   'hostname': 'fake_instance00'},
              '00000000-0000-0000-0000-0000000000000001':
                  {'id': 1,
                   'uuid': '00000000-0000-0000-0000-0000000000000001',
                   'host': 'fake_instance01',
-                  'created_at': 'fakedate',
-                  'updated_at': 'fakedate',
+                  'created_at': datetime.datetime(1955, 11, 5, 0, 0, 0),
+                  'updated_at': datetime.datetime(1985, 10, 26, 1, 35, 0),
                   'hostname': 'fake_instance01'}}
 
 
@@ -164,31 +168,55 @@ fixed_ips = [{'id': 0,
 
 
 vifs = [{'id': 0,
+         'created_at': None,
+         'updated_at': None,
+         'deleted_at': None,
+         'deleted': 0,
          'address': 'DE:AD:BE:EF:00:00',
          'uuid': '00000000-0000-0000-0000-0000000000000000',
          'network_id': 0,
          'instance_uuid': '00000000-0000-0000-0000-0000000000000000'},
         {'id': 1,
+         'created_at': None,
+         'updated_at': None,
+         'deleted_at': None,
+         'deleted': 0,
          'address': 'DE:AD:BE:EF:00:01',
          'uuid': '00000000-0000-0000-0000-0000000000000001',
          'network_id': 1,
          'instance_uuid': '00000000-0000-0000-0000-0000000000000000'},
         {'id': 2,
+         'created_at': None,
+         'updated_at': None,
+         'deleted_at': None,
+         'deleted': 0,
          'address': 'DE:AD:BE:EF:00:02',
          'uuid': '00000000-0000-0000-0000-0000000000000002',
          'network_id': 1,
          'instance_uuid': '00000000-0000-0000-0000-0000000000000001'},
         {'id': 3,
+         'created_at': None,
+         'updated_at': None,
+         'deleted_at': None,
+         'deleted': 0,
          'address': 'DE:AD:BE:EF:00:03',
          'uuid': '00000000-0000-0000-0000-0000000000000003',
          'network_id': 0,
          'instance_uuid': '00000000-0000-0000-0000-0000000000000001'},
         {'id': 4,
+         'created_at': None,
+         'updated_at': None,
+         'deleted_at': None,
+         'deleted': 0,
          'address': 'DE:AD:BE:EF:00:04',
          'uuid': '00000000-0000-0000-0000-0000000000000004',
          'network_id': 0,
          'instance_uuid': '00000000-0000-0000-0000-0000000000000000'},
         {'id': 5,
+         'created_at': None,
+         'updated_at': None,
+         'deleted_at': None,
+         'deleted': 0,
          'address': 'DE:AD:BE:EF:00:05',
          'uuid': '00000000-0000-0000-0000-0000000000000005',
          'network_id': 1,
@@ -222,7 +250,7 @@ def get_associated(context, network_id, host=None, address=None):
     return result
 
 
-class LinuxNetworkTestCase(test.TestCase):
+class LinuxNetworkTestCase(test.NoDBTestCase):
 
     def setUp(self):
         super(LinuxNetworkTestCase, self).setUp()
@@ -231,7 +259,7 @@ class LinuxNetworkTestCase(test.TestCase):
         self.context = context.RequestContext('testuser', 'testproject',
                                               is_admin=True)
 
-        def get_vifs(_context, instance_uuid):
+        def get_vifs(_context, instance_uuid, use_slave):
             return [vif for vif in vifs if vif['instance_uuid'] ==
                         instance_uuid]
 
@@ -323,7 +351,7 @@ class LinuxNetworkTestCase(test.TestCase):
         )
         actual_hosts = self.driver.get_dhcp_hosts(self.context, networks[0])
 
-        self.assertEquals(actual_hosts, expected)
+        self.assertEqual(actual_hosts, expected)
 
     def test_get_dhcp_hosts_for_nw01(self):
         self.flags(use_single_default_gateway=True)
@@ -336,7 +364,7 @@ class LinuxNetworkTestCase(test.TestCase):
                 "192.168.1.102,net:NW-5"
         )
         actual_hosts = self.driver.get_dhcp_hosts(self.context, networks[1])
-        self.assertEquals(actual_hosts, expected)
+        self.assertEqual(actual_hosts, expected)
 
     def test_get_dns_hosts_for_nw00(self):
         expected = (
@@ -345,7 +373,7 @@ class LinuxNetworkTestCase(test.TestCase):
                 "192.168.0.102\tfake_instance00.novalocal"
         )
         actual_hosts = self.driver.get_dns_hosts(self.context, networks[0])
-        self.assertEquals(actual_hosts, expected)
+        self.assertEqual(actual_hosts, expected)
 
     def test_get_dns_hosts_for_nw01(self):
         expected = (
@@ -354,20 +382,20 @@ class LinuxNetworkTestCase(test.TestCase):
                 "192.168.1.102\tfake_instance01.novalocal"
         )
         actual_hosts = self.driver.get_dns_hosts(self.context, networks[1])
-        self.assertEquals(actual_hosts, expected)
+        self.assertEqual(actual_hosts, expected)
 
     def test_get_dhcp_opts_for_nw00(self):
         expected_opts = 'NW-3,3\nNW-4,3'
         actual_opts = self.driver.get_dhcp_opts(self.context, networks[0])
 
-        self.assertEquals(actual_opts, expected_opts)
+        self.assertEqual(actual_opts, expected_opts)
 
     def test_get_dhcp_opts_for_nw01(self):
         self.flags(host='fake_instance01')
         expected_opts = "NW-5,3"
         actual_opts = self.driver.get_dhcp_opts(self.context, networks[1])
 
-        self.assertEquals(actual_opts, expected_opts)
+        self.assertEqual(actual_opts, expected_opts)
 
     def test_get_dhcp_leases_for_nw00(self):
         timestamp = timeutils.utcnow()
@@ -406,23 +434,26 @@ class LinuxNetworkTestCase(test.TestCase):
 
     def test_dhcp_opts_not_default_gateway_network(self):
         expected = "NW-0,3"
-        data = get_associated(self.context, 0)[0]
-        actual = self.driver._host_dhcp_opts(data)
-        self.assertEquals(actual, expected)
+        fixedip = fixed_ip_obj.FixedIPList.get_by_network(self.context,
+                                                          {'id': 0})[0]
+        actual = self.driver._host_dhcp_opts(fixedip)
+        self.assertEqual(actual, expected)
 
     def test_host_dhcp_without_default_gateway_network(self):
         expected = ','.join(['DE:AD:BE:EF:00:00',
                              'fake_instance00.novalocal',
                              '192.168.0.100'])
-        data = get_associated(self.context, 0)[0]
-        actual = self.driver._host_dhcp(data)
-        self.assertEquals(actual, expected)
+        fixedip = fixed_ip_obj.FixedIPList.get_by_network(self.context,
+                                                          {'id': 0})[0]
+        actual = self.driver._host_dhcp(fixedip)
+        self.assertEqual(actual, expected)
 
     def test_host_dns_without_default_gateway_network(self):
         expected = "192.168.0.100\tfake_instance00.novalocal"
-        data = get_associated(self.context, 0)[0]
-        actual = self.driver._host_dns(data)
-        self.assertEquals(actual, expected)
+        fixedip = fixed_ip_obj.FixedIPList.get_by_network(self.context,
+                                                          {'id': 0})[0]
+        actual = self.driver._host_dns(fixedip)
+        self.assertEqual(actual, expected)
 
     def test_linux_bridge_driver_plug(self):
         """Makes sure plug doesn't drop FORWARD by default.
@@ -443,6 +474,22 @@ class LinuxNetworkTestCase(test.TestCase):
         driver.plug({"bridge": "br100", "bridge_interface": "eth0"},
                     "fakemac")
 
+    def test_linux_ovs_driver_plug_exception(self):
+        self.flags(fake_network=False)
+
+        def fake_execute(*args, **kwargs):
+            raise processutils.ProcessExecutionError('error')
+
+        def fake_device_exists(*args, **kwargs):
+            return False
+
+        self.stubs.Set(utils, 'execute', fake_execute)
+        self.stubs.Set(linux_net, 'device_exists', fake_device_exists)
+        driver = linux_net.LinuxOVSInterfaceDriver()
+        self.assertRaises(exception.AgentError,
+                          driver.plug, {'uuid': 'fake_network_uuid'},
+                          'fake_mac')
+
     def test_vlan_override(self):
         """Makes sure vlan_interface flag overrides network bridge_interface.
 
@@ -453,8 +500,8 @@ class LinuxNetworkTestCase(test.TestCase):
 
         info = {}
 
-        @classmethod
-        def test_ensure(_self, vlan, bridge, interface, network, mac_address):
+        @staticmethod
+        def test_ensure(vlan, bridge, interface, network, mac_address):
             info['passed_interface'] = interface
 
         self.stubs.Set(linux_net.LinuxBridgeInterfaceDriver,
@@ -483,8 +530,8 @@ class LinuxNetworkTestCase(test.TestCase):
 
         info = {}
 
-        @classmethod
-        def test_ensure(_self, bridge, interface, network, gateway):
+        @staticmethod
+        def test_ensure(bridge, interface, network, gateway):
             info['passed_interface'] = interface
 
         self.stubs.Set(linux_net.LinuxBridgeInterfaceDriver,
@@ -514,7 +561,12 @@ class LinuxNetworkTestCase(test.TestCase):
             executes.append(args)
             return "", ""
 
+        def fake_add_dhcp_mangle_rule(*args, **kwargs):
+            executes.append(args)
+
         self.stubs.Set(linux_net, '_execute', fake_execute)
+        self.stubs.Set(linux_net, '_add_dhcp_mangle_rule',
+                       fake_add_dhcp_mangle_rule)
 
         self.stubs.Set(os, 'chmod', lambda *a, **kw: None)
         self.stubs.Set(linux_net, 'write_to_file', lambda *a, **kw: None)
@@ -550,7 +602,7 @@ class LinuxNetworkTestCase(test.TestCase):
 
             if extra_expected:
                 expected += extra_expected
-            self.assertEqual([tuple(expected)], executes)
+            self.assertEqual([(dev,), tuple(expected)], executes)
 
     def test_dnsmasq_execute(self):
         self._test_dnsmasq_execute()
@@ -595,8 +647,8 @@ class LinuxNetworkTestCase(test.TestCase):
 
         driver = linux_net.LinuxBridgeInterfaceDriver()
 
-        @classmethod
-        def fake_ensure(_self, bridge, interface, network, gateway):
+        @staticmethod
+        def fake_ensure(bridge, interface, network, gateway):
             return bridge
 
         self.stubs.Set(linux_net.LinuxBridgeInterfaceDriver,
@@ -634,13 +686,13 @@ class LinuxNetworkTestCase(test.TestCase):
              '-s 192.168.1.1 -j DROP' % iface,
         ]
         for inp in expected_inputs:
-            self.assertTrue(inp in inputs[0])
+            self.assertIn(inp, inputs[0])
 
         executes = []
         inputs = []
 
-        @classmethod
-        def fake_remove(_self, bridge, gateway):
+        @staticmethod
+        def fake_remove(bridge, gateway):
             return
 
         self.stubs.Set(linux_net.LinuxBridgeInterfaceDriver,
@@ -659,7 +711,7 @@ class LinuxNetworkTestCase(test.TestCase):
         ]
         self.assertEqual(executes, expected)
         for inp in expected_inputs:
-            self.assertFalse(inp in inputs[0])
+            self.assertNotIn(inp, inputs[0])
 
     def test_isolated_host_iptables_logdrop(self):
         # Ensure that a different drop action for iptables doesn't change
@@ -686,8 +738,8 @@ class LinuxNetworkTestCase(test.TestCase):
 
         driver = linux_net.LinuxBridgeInterfaceDriver()
 
-        @classmethod
-        def fake_ensure(_self, bridge, interface, network, gateway):
+        @staticmethod
+        def fake_ensure(bridge, interface, network, gateway):
             return bridge
 
         self.stubs.Set(linux_net.LinuxBridgeInterfaceDriver,
@@ -725,13 +777,13 @@ class LinuxNetworkTestCase(test.TestCase):
               '-s 192.168.1.1 -j LOGDROP' % iface),
         ]
         for inp in expected_inputs:
-            self.assertTrue(inp in inputs[0])
+            self.assertIn(inp, inputs[0])
 
         executes = []
         inputs = []
 
-        @classmethod
-        def fake_remove(_self, bridge, gateway):
+        @staticmethod
+        def fake_remove(bridge, gateway):
             return
 
         self.stubs.Set(linux_net.LinuxBridgeInterfaceDriver,
@@ -750,7 +802,7 @@ class LinuxNetworkTestCase(test.TestCase):
         ]
         self.assertEqual(executes, expected)
         for inp in expected_inputs:
-            self.assertFalse(inp in inputs[0])
+            self.assertNotIn(inp, inputs[0])
 
     def _test_initialize_gateway(self, existing, expected, routes=''):
         self.flags(fake_network=False)
@@ -762,6 +814,8 @@ class LinuxNetworkTestCase(test.TestCase):
                 return existing, ""
             if args[0] == 'ip' and args[1] == 'route' and args[2] == 'show':
                 return routes, ""
+            if args[0] == 'sysctl':
+                return '1\n', ''
         self.stubs.Set(utils, 'execute', fake_execute)
         network = {'dhcp_server': '192.168.1.1',
                    'cidr': '192.168.1.0/24',
@@ -778,7 +832,7 @@ class LinuxNetworkTestCase(test.TestCase):
             "    inet6 dead::beef:dead:beef:dead/64 scope link\n"
             "    valid_lft forever preferred_lft forever\n")
         expected = [
-            ('sysctl', '-w', 'net.ipv4.ip_forward=1'),
+            ('sysctl', '-n', 'net.ipv4.ip_forward'),
             ('ip', 'addr', 'show', 'dev', 'eth0', 'scope', 'global'),
             ('ip', 'route', 'show', 'dev', 'eth0'),
             ('ip', 'addr', 'del', '192.168.0.1/24',
@@ -802,7 +856,7 @@ class LinuxNetworkTestCase(test.TestCase):
             "    inet6 dead::beef:dead:beef:dead/64 scope link\n"
             "    valid_lft forever preferred_lft forever\n")
         expected = [
-            ('sysctl', '-w', 'net.ipv4.ip_forward=1'),
+            ('sysctl', '-n', 'net.ipv4.ip_forward'),
             ('ip', 'addr', 'show', 'dev', 'eth0', 'scope', 'global'),
             ('ip', 'route', 'show', 'dev', 'eth0'),
             ('ip', 'route', 'del', 'default', 'dev', 'eth0'),
@@ -831,7 +885,7 @@ class LinuxNetworkTestCase(test.TestCase):
             "    inet6 dead::beef:dead:beef:dead/64 scope link\n"
             "    valid_lft forever preferred_lft forever\n")
         expected = [
-            ('sysctl', '-w', 'net.ipv4.ip_forward=1'),
+            ('sysctl', '-n', 'net.ipv4.ip_forward'),
             ('ip', 'addr', 'show', 'dev', 'eth0', 'scope', 'global'),
             ('ip', '-f', 'inet6', 'addr', 'change',
              '2001:db8::/64', 'dev', 'eth0'),
@@ -845,7 +899,7 @@ class LinuxNetworkTestCase(test.TestCase):
             "    inet6 dead::beef:dead:beef:dead/64 scope link\n"
             "    valid_lft forever preferred_lft forever\n")
         expected = [
-            ('sysctl', '-w', 'net.ipv4.ip_forward=1'),
+            ('sysctl', '-n', 'net.ipv4.ip_forward'),
             ('ip', 'addr', 'show', 'dev', 'eth0', 'scope', 'global'),
             ('ip', 'route', 'show', 'dev', 'eth0'),
             ('ip', 'addr', 'add', '192.168.1.1/24',
@@ -874,7 +928,7 @@ class LinuxNetworkTestCase(test.TestCase):
         manager._apply()
         self.mox.ReplayAll()
         empty_ret = manager.apply()
-        self.assertEqual(empty_ret, None)
+        self.assertIsNone(empty_ret)
 
     def test_apply_not_run(self):
         manager = linux_net.IptablesManager()
@@ -937,3 +991,123 @@ class LinuxNetworkTestCase(test.TestCase):
         expected = ('-s 0.0.0.0/0 -d 169.254.169.254/32 -p tcp -m tcp '
                     '--dport 80 -j REDIRECT --to-ports 8775')
         self._test_add_metadata_forward_rule(expected)
+
+    def test_ensure_bridge_brings_up_interface(self):
+        calls = {
+            'device_exists': [mock.call('bridge')],
+            '_execute': [
+                mock.call('brctl', 'addif', 'bridge', 'eth0',
+                          run_as_root=True, check_exit_code=False),
+                mock.call('ip', 'link', 'set', 'eth0', 'up',
+                          run_as_root=True, check_exit_code=False),
+                mock.call('ip', 'route', 'show', 'dev', 'eth0'),
+                mock.call('ip', 'addr', 'show', 'dev', 'eth0', 'scope',
+                          'global'),
+                ]
+            }
+        with contextlib.nested(
+            mock.patch.object(linux_net, 'device_exists', return_value=True),
+            mock.patch.object(linux_net, '_execute', return_value=('', ''))
+        ) as (device_exists, _execute):
+            driver = linux_net.LinuxBridgeInterfaceDriver()
+            driver.ensure_bridge('bridge', 'eth0')
+            device_exists.assert_has_calls(calls['device_exists'])
+            _execute.assert_has_calls(calls['_execute'])
+
+    def test_set_device_mtu_configured(self):
+        self.flags(network_device_mtu=10000)
+        calls = [
+                mock.call('ip', 'link', 'set', 'fake-dev', 'mtu',
+                          10000, run_as_root=True,
+                          check_exit_code=[0, 2, 254])
+                ]
+        with mock.patch.object(utils, 'execute', return_value=('', '')) as ex:
+            linux_net._set_device_mtu('fake-dev')
+            ex.assert_has_calls(calls)
+
+    def test_set_device_mtu_default(self):
+        calls = []
+        with mock.patch.object(utils, 'execute', return_value=('', '')) as ex:
+            linux_net._set_device_mtu('fake-dev')
+            ex.assert_has_calls(calls)
+
+    def _ovs_vif_port(self, calls):
+        with mock.patch.object(utils, 'execute', return_value=('', '')) as ex:
+            linux_net.create_ovs_vif_port('fake-bridge', 'fake-dev',
+                                          'fake-iface-id', 'fake-mac',
+                                          'fake-instance-uuid')
+            ex.assert_has_calls(calls)
+
+    def test_ovs_vif_port(self):
+        calls = [
+                mock.call('ovs-vsctl', '--timeout=120', '--', '--if-exists',
+                          'del-port', 'fake-dev', '--', 'add-port',
+                          'fake-bridge', 'fake-dev',
+                          '--', 'set', 'Interface', 'fake-dev',
+                          'external-ids:iface-id=fake-iface-id',
+                          'external-ids:iface-status=active',
+                          'external-ids:attached-mac=fake-mac',
+                          'external-ids:vm-uuid=fake-instance-uuid',
+                          run_as_root=True)
+                ]
+        self._ovs_vif_port(calls)
+
+    def test_ovs_vif_port_with_mtu(self):
+        self.flags(network_device_mtu=10000)
+        calls = [
+                mock.call('ovs-vsctl', '--timeout=120', '--', '--if-exists',
+                          'del-port', 'fake-dev', '--', 'add-port',
+                          'fake-bridge', 'fake-dev',
+                          '--', 'set', 'Interface', 'fake-dev',
+                          'external-ids:iface-id=fake-iface-id',
+                          'external-ids:iface-status=active',
+                          'external-ids:attached-mac=fake-mac',
+                          'external-ids:vm-uuid=fake-instance-uuid',
+                          run_as_root=True),
+                mock.call('ip', 'link', 'set', 'fake-dev', 'mtu',
+                          10000, run_as_root=True,
+                          check_exit_code=[0, 2, 254])
+                ]
+        self._ovs_vif_port(calls)
+
+    def _create_veth_pair(self, calls):
+        with mock.patch.object(utils, 'execute', return_value=('', '')) as ex:
+            linux_net._create_veth_pair('fake-dev1', 'fake-dev2')
+            ex.assert_has_calls(calls)
+
+    def test_create_veth_pair(self):
+        calls = [
+            mock.call('ip', 'link', 'add', 'fake-dev1', 'type', 'veth',
+                      'peer', 'name', 'fake-dev2', run_as_root=True),
+            mock.call('ip', 'link', 'set', 'fake-dev1', 'up',
+                      run_as_root=True),
+            mock.call('ip', 'link', 'set', 'fake-dev1', 'promisc', 'on',
+                      run_as_root=True),
+            mock.call('ip', 'link', 'set', 'fake-dev2', 'up',
+                      run_as_root=True),
+            mock.call('ip', 'link', 'set', 'fake-dev2', 'promisc', 'on',
+                      run_as_root=True)
+        ]
+        self._create_veth_pair(calls)
+
+    def test_create_veth_pair_with_mtu(self):
+        self.flags(network_device_mtu=10000)
+        calls = [
+            mock.call('ip', 'link', 'add', 'fake-dev1', 'type', 'veth',
+                      'peer', 'name', 'fake-dev2', run_as_root=True),
+            mock.call('ip', 'link', 'set', 'fake-dev1', 'up',
+                      run_as_root=True),
+            mock.call('ip', 'link', 'set', 'fake-dev1', 'promisc', 'on',
+                      run_as_root=True),
+            mock.call('ip', 'link', 'set', 'fake-dev1', 'mtu',
+                      10000, run_as_root=True,
+                      check_exit_code=[0, 2, 254]),
+            mock.call('ip', 'link', 'set', 'fake-dev2', 'up',
+                      run_as_root=True),
+            mock.call('ip', 'link', 'set', 'fake-dev2', 'promisc', 'on',
+                      run_as_root=True),
+            mock.call('ip', 'link', 'set', 'fake-dev2', 'mtu',
+                      10000, run_as_root=True,
+                      check_exit_code=[0, 2, 254])
+        ]
+        self._create_veth_pair(calls)

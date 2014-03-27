@@ -18,12 +18,12 @@ Tests For CellsManager
 import copy
 import datetime
 
+import mock
 from oslo.config import cfg
 
 from nova.cells import messaging
 from nova.cells import utils as cells_utils
 from nova import context
-from nova.openstack.common import rpc
 from nova.openstack.common import timeutils
 from nova import test
 from nova.tests.cells import fakes
@@ -43,7 +43,7 @@ FAKE_TASK_LOGS = [dict(id=1, host='host1'),
                   dict(id=2, host='host2')]
 
 
-class CellsManagerClassTestCase(test.TestCase):
+class CellsManagerClassTestCase(test.NoDBTestCase):
     """Test case for CellsManager class."""
 
     def setUp(self):
@@ -73,11 +73,11 @@ class CellsManagerClassTestCase(test.TestCase):
         self.cells_manager.get_cell_info_for_neighbors(self.ctxt)
 
     def test_post_start_hook_child_cell(self):
-        self.mox.StubOutWithMock(self.driver, 'start_consumers')
+        self.mox.StubOutWithMock(self.driver, 'start_servers')
         self.mox.StubOutWithMock(context, 'get_admin_context')
         self.mox.StubOutWithMock(self.cells_manager, '_update_our_parents')
 
-        self.driver.start_consumers(self.msg_runner)
+        self.driver.start_servers(self.msg_runner)
         context.get_admin_context().AndReturn(self.ctxt)
         self.cells_manager._update_our_parents(self.ctxt)
         self.mox.ReplayAll()
@@ -88,14 +88,14 @@ class CellsManagerClassTestCase(test.TestCase):
         msg_runner = cells_manager.msg_runner
         driver = cells_manager.driver
 
-        self.mox.StubOutWithMock(driver, 'start_consumers')
+        self.mox.StubOutWithMock(driver, 'start_servers')
         self.mox.StubOutWithMock(context, 'get_admin_context')
         self.mox.StubOutWithMock(msg_runner,
                                  'ask_children_for_capabilities')
         self.mox.StubOutWithMock(msg_runner,
                                  'ask_children_for_capacities')
 
-        driver.start_consumers(msg_runner)
+        driver.start_servers(msg_runner)
         context.get_admin_context().AndReturn(self.ctxt)
         msg_runner.ask_children_for_capabilities(self.ctxt)
         msg_runner.ask_children_for_capacities(self.ctxt)
@@ -234,7 +234,7 @@ class CellsManagerClassTestCase(test.TestCase):
 
         self.cells_manager._heal_instances(fake_context)
         self.assertEqual(call_info['shuffle'], True)
-        self.assertEqual(call_info['project_id'], None)
+        self.assertIsNone(call_info['project_id'])
         self.assertEqual(call_info['updated_since'], updated_since)
         self.assertEqual(call_info['get_instances'], 1)
         # Only first 2
@@ -244,7 +244,7 @@ class CellsManagerClassTestCase(test.TestCase):
         call_info['sync_instances'] = []
         self.cells_manager._heal_instances(fake_context)
         self.assertEqual(call_info['shuffle'], True)
-        self.assertEqual(call_info['project_id'], None)
+        self.assertIsNone(call_info['project_id'])
         self.assertEqual(call_info['updated_since'], updated_since)
         self.assertEqual(call_info['get_instances'], 2)
         # Now the last 1 and the first 1
@@ -342,13 +342,23 @@ class CellsManagerClassTestCase(test.TestCase):
             params_to_update=params_to_update)
         self.assertEqual(expected_response, response)
 
+    def test_service_delete(self):
+        fake_cell = 'fake-cell'
+        service_id = '1'
+        cell_service_id = cells_utils.cell_with_item(fake_cell, service_id)
+
+        with mock.patch.object(self.msg_runner,
+                               'service_delete') as service_delete:
+            self.cells_manager.service_delete(self.ctxt, cell_service_id)
+            service_delete.assert_called_once_with(
+                self.ctxt, fake_cell, service_id)
+
     def test_proxy_rpc_to_manager(self):
         self.mox.StubOutWithMock(self.msg_runner,
                                  'proxy_rpc_to_manager')
         fake_response = self._get_fake_response()
         cell_and_host = cells_utils.cell_with_item('fake-cell', 'fake-host')
-        topic = rpc.queue_get_for(self.ctxt, CONF.compute_topic,
-                                  cell_and_host)
+        topic = "%s.%s" % (CONF.compute_topic, cell_and_host)
         self.msg_runner.proxy_rpc_to_manager(self.ctxt, 'fake-cell',
                 'fake-host', topic, 'fake-rpc-msg',
                 True, -1).AndReturn(fake_response)
@@ -732,3 +742,69 @@ class CellsManagerClassTestCase(test.TestCase):
         self.mox.ReplayAll()
         self.cells_manager.soft_delete_instance(self.ctxt,
                                                 instance='fake-instance')
+
+    def test_resize_instance(self):
+        self.mox.StubOutWithMock(self.msg_runner, 'resize_instance')
+        self.msg_runner.resize_instance(self.ctxt, 'fake-instance',
+                                       'fake-flavor', 'fake-updates')
+        self.mox.ReplayAll()
+        self.cells_manager.resize_instance(
+                self.ctxt, instance='fake-instance', flavor='fake-flavor',
+                extra_instance_updates='fake-updates')
+
+    def test_live_migrate_instance(self):
+        self.mox.StubOutWithMock(self.msg_runner, 'live_migrate_instance')
+        self.msg_runner.live_migrate_instance(self.ctxt, 'fake-instance',
+                                              'fake-block', 'fake-commit',
+                                              'fake-host')
+        self.mox.ReplayAll()
+        self.cells_manager.live_migrate_instance(
+                self.ctxt, instance='fake-instance',
+                block_migration='fake-block', disk_over_commit='fake-commit',
+                host_name='fake-host')
+
+    def test_revert_resize(self):
+        self.mox.StubOutWithMock(self.msg_runner, 'revert_resize')
+        self.msg_runner.revert_resize(self.ctxt, 'fake-instance')
+        self.mox.ReplayAll()
+        self.cells_manager.revert_resize(self.ctxt, instance='fake-instance')
+
+    def test_confirm_resize(self):
+        self.mox.StubOutWithMock(self.msg_runner, 'confirm_resize')
+        self.msg_runner.confirm_resize(self.ctxt, 'fake-instance')
+        self.mox.ReplayAll()
+        self.cells_manager.confirm_resize(self.ctxt, instance='fake-instance')
+
+    def test_reset_network(self):
+        self.mox.StubOutWithMock(self.msg_runner, 'reset_network')
+        self.msg_runner.reset_network(self.ctxt, 'fake-instance')
+        self.mox.ReplayAll()
+        self.cells_manager.reset_network(self.ctxt, instance='fake-instance')
+
+    def test_inject_network_info(self):
+        self.mox.StubOutWithMock(self.msg_runner, 'inject_network_info')
+        self.msg_runner.inject_network_info(self.ctxt, 'fake-instance')
+        self.mox.ReplayAll()
+        self.cells_manager.inject_network_info(self.ctxt,
+                                               instance='fake-instance')
+
+    def test_snapshot_instance(self):
+        self.mox.StubOutWithMock(self.msg_runner, 'snapshot_instance')
+        self.msg_runner.snapshot_instance(self.ctxt, 'fake-instance',
+                                          'fake-id')
+        self.mox.ReplayAll()
+        self.cells_manager.snapshot_instance(self.ctxt,
+                                             instance='fake-instance',
+                                             image_id='fake-id')
+
+    def test_backup_instance(self):
+        self.mox.StubOutWithMock(self.msg_runner, 'backup_instance')
+        self.msg_runner.backup_instance(self.ctxt, 'fake-instance',
+                                        'fake-id', 'backup-type',
+                                        'rotation')
+        self.mox.ReplayAll()
+        self.cells_manager.backup_instance(self.ctxt,
+                                           instance='fake-instance',
+                                           image_id='fake-id',
+                                           backup_type='backup-type',
+                                           rotation='rotation')

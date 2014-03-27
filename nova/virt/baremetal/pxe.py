@@ -1,6 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
-# Copyright 2012 Hewlett-Packard Development Company, L.P.
+# Copyright 2012,2014 Hewlett-Packard Development Company, L.P.
 # Copyright (c) 2012 NTT DOCOMO, INC.
 # All Rights Reserved.
 #
@@ -23,16 +21,19 @@ Class for PXE bare-metal nodes.
 import datetime
 import os
 
+import jinja2
 from oslo.config import cfg
 
 from nova.compute import flavors
 from nova import exception
+from nova.objects import flavor as flavor_obj
 from nova.openstack.common.db import exception as db_exc
 from nova.openstack.common import fileutils
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova.openstack.common import loopingcall
 from nova.openstack.common import timeutils
+from nova import utils
 from nova.virt.baremetal import baremetal_states
 from nova.virt.baremetal import base
 from nova.virt.baremetal import db
@@ -48,10 +49,15 @@ pxe_opts = [
                             'net-dhcp.ubuntu.template',
                help='Template file for injected network config'),
     cfg.StrOpt('pxe_append_params',
-               help='additional append parameters for baremetal PXE boot'),
+               default='nofb nomodeset vga=normal',
+               help='Additional append parameters for baremetal PXE boot'),
     cfg.StrOpt('pxe_config_template',
                default='$pybasedir/nova/virt/baremetal/pxe_config.template',
                help='Template file for PXE configuration'),
+    cfg.BoolOpt('use_file_injection',
+                help='If True, enable file injection for network info, '
+                'files and admin password',
+                default=False),
     cfg.IntOpt('pxe_deploy_timeout',
                 help='Timeout for PXE deployments. Default: 0 (unlimited)',
                 default=0),
@@ -59,6 +65,10 @@ pxe_opts = [
                 help='If set, pass the network configuration details to the '
                 'initramfs via cmdline.',
                 default=False),
+    cfg.StrOpt('pxe_bootfile_name',
+               help='This gets passed to Neutron as the bootfile dhcp '
+               'parameter.',
+               default='pxelinux.0'),
     ]
 
 LOG = logging.getLogger(__name__)
@@ -70,16 +80,6 @@ CONF = cfg.CONF
 CONF.register_group(baremetal_group)
 CONF.register_opts(pxe_opts, baremetal_group)
 CONF.import_opt('use_ipv6', 'nova.netconf')
-
-CHEETAH = None
-
-
-def _get_cheetah():
-    global CHEETAH
-    if CHEETAH is None:
-        from Cheetah import Template
-        CHEETAH = Template.Template
-    return CHEETAH
 
 
 def build_pxe_network_config(network_info):
@@ -124,35 +124,29 @@ def build_pxe_config(deployment_id, deployment_key, deployment_iscsi_iqn,
             'pxe_append_params': CONF.baremetal.pxe_append_params,
             'pxe_network_config': network_config,
             }
-    cheetah = _get_cheetah()
-    pxe_config = str(cheetah(
-            open(CONF.baremetal.pxe_config_template).read(),
-            searchList=[{'pxe_options': pxe_options,
-                         'ROOT': '${ROOT}',
-            }]))
-    return pxe_config
+    tmpl_path, tmpl_file = os.path.split(CONF.baremetal.pxe_config_template)
+    env = jinja2.Environment(loader=jinja2.FileSystemLoader(tmpl_path))
+    template = env.get_template(tmpl_file)
+    return template.render({'pxe_options': pxe_options,
+                            'ROOT': '${ROOT}'})
 
 
 def build_network_config(network_info):
     interfaces = bm_utils.map_network_interfaces(network_info, CONF.use_ipv6)
-    cheetah = _get_cheetah()
-    network_config = str(cheetah(
-            open(CONF.baremetal.net_config_template).read(),
-            searchList=[
-                {'interfaces': interfaces,
-                 'use_ipv6': CONF.use_ipv6,
-                }
-            ]))
-    return network_config
+    tmpl_path, tmpl_file = os.path.split(CONF.baremetal.net_config_template)
+    env = jinja2.Environment(loader=jinja2.FileSystemLoader(tmpl_path))
+    template = env.get_template(tmpl_file)
+    return template.render({'interfaces': interfaces,
+                            'use_ipv6': CONF.use_ipv6})
 
 
-def get_deploy_aki_id(instance_type):
-    return instance_type.get('extra_specs', {}).\
+def get_deploy_aki_id(flavor):
+    return flavor.get('extra_specs', {}).\
             get('baremetal:deploy_kernel_id', CONF.baremetal.deploy_kernel)
 
 
-def get_deploy_ari_id(instance_type):
-    return instance_type.get('extra_specs', {}).\
+def get_deploy_ari_id(flavor):
+    return flavor.get('extra_specs', {}).\
             get('baremetal:deploy_ramdisk_id', CONF.baremetal.deploy_ramdisk)
 
 
@@ -172,9 +166,10 @@ def get_pxe_config_file_path(instance):
 
 
 def get_partition_sizes(instance):
-    instance_type = flavors.extract_flavor(instance)
-    root_mb = instance_type['root_gb'] * 1024
-    swap_mb = instance_type['swap']
+    flavor = flavors.extract_flavor(instance)
+    root_mb = flavor['root_gb'] * 1024
+    swap_mb = flavor['swap']
+    ephemeral_mb = flavor['ephemeral_gb'] * 1024
 
     # NOTE(deva): For simpler code paths on the deployment side,
     #             we always create a swap partition. If the flavor
@@ -182,7 +177,7 @@ def get_partition_sizes(instance):
     if swap_mb < 1:
         swap_mb = 1
 
-    return (root_mb, swap_mb)
+    return (root_mb, swap_mb, ephemeral_mb)
 
 
 def get_pxe_mac_path(mac):
@@ -194,13 +189,13 @@ def get_pxe_mac_path(mac):
         )
 
 
-def get_tftp_image_info(instance, instance_type):
+def get_tftp_image_info(instance, flavor):
     """Generate the paths for tftp files for this instance
 
     Raises NovaException if
     - instance does not contain kernel_id or ramdisk_id
     - deploy_kernel_id or deploy_ramdisk_id can not be read from
-      instance_type['extra_specs'] and defaults are not set
+      flavor['extra_specs'] and defaults are not set
 
     """
     image_info = {
@@ -212,8 +207,8 @@ def get_tftp_image_info(instance, instance_type):
     try:
         image_info['kernel'][0] = str(instance['kernel_id'])
         image_info['ramdisk'][0] = str(instance['ramdisk_id'])
-        image_info['deploy_kernel'][0] = get_deploy_aki_id(instance_type)
-        image_info['deploy_ramdisk'][0] = get_deploy_ari_id(instance_type)
+        image_info['deploy_kernel'][0] = get_deploy_aki_id(flavor)
+        image_info['deploy_ramdisk'][0] = get_deploy_ari_id(flavor)
     except KeyError:
         pass
 
@@ -288,7 +283,8 @@ class PXE(base.NodeDriver):
                              target=image_path,
                              image_id=image_meta['id'],
                              user_id=instance['user_id'],
-                             project_id=instance['project_id']
+                             project_id=instance['project_id'],
+                             clean=True,
                         )
 
         return [image_meta['id'], image_path]
@@ -329,7 +325,7 @@ class PXE(base.NodeDriver):
                     image=get_image_file_path(instance),
                     key=ssh_key,
                     net=net_config,
-                    metadata=instance['metadata'],
+                    metadata=utils.instance_meta(instance),
                     admin_password=admin_password,
                     files=injected_files,
                     partition=partition,
@@ -338,19 +334,29 @@ class PXE(base.NodeDriver):
     def cache_images(self, context, node, instance,
             admin_password, image_meta, injected_files, network_info):
         """Prepare all the images for this instance."""
-        instance_type = self.virtapi.instance_type_get(
-            context, instance['instance_type_id'])
-        tftp_image_info = get_tftp_image_info(instance, instance_type)
+        flavor = flavor_obj.Flavor.get_by_id(context,
+                                             instance['instance_type_id'])
+        tftp_image_info = get_tftp_image_info(instance, flavor)
         self._cache_tftp_images(context, instance, tftp_image_info)
 
         self._cache_image(context, instance, image_meta)
-        self._inject_into_image(context, node, instance, network_info,
-                injected_files, admin_password)
+        if CONF.baremetal.use_file_injection:
+            self._inject_into_image(context, node, instance, network_info,
+                   injected_files, admin_password)
 
     def destroy_images(self, context, node, instance):
         """Delete instance's image file."""
         bm_utils.unlink_without_raise(get_image_file_path(instance))
         bm_utils.rmtree_without_raise(get_image_dir_path(instance))
+
+    def dhcp_options_for_instance(self, instance):
+        return [{'opt_name': 'bootfile-name',
+                 'opt_value': CONF.baremetal.pxe_bootfile_name},
+                 {'opt_name': 'server-ip-address',
+                  'opt_value': CONF.my_ip},
+                 {'opt_name': 'tftp-server',
+                  'opt_value': CONF.my_ip}
+                 ]
 
     def activate_bootloader(self, context, node, instance, network_info):
         """Configure PXE boot loader for an instance
@@ -373,10 +379,10 @@ class PXE(base.NodeDriver):
             ./pxelinux.cfg/
                  {mac} -> ../{uuid}/config
         """
-        instance_type = self.virtapi.instance_type_get(
-            context, instance['instance_type_id'])
-        image_info = get_tftp_image_info(instance, instance_type)
-        (root_mb, swap_mb) = get_partition_sizes(instance)
+        flavor = flavor_obj.Flavor.get_by_id(context,
+                                             instance['instance_type_id'])
+        image_info = get_tftp_image_info(instance, flavor)
+        (root_mb, swap_mb, ephemeral_mb) = get_partition_sizes(instance)
         pxe_config_file_path = get_pxe_config_file_path(instance)
         image_file_path = get_image_file_path(instance)
 
@@ -387,7 +393,8 @@ class PXE(base.NodeDriver):
                  'image_path': image_file_path,
                  'pxe_config_path': pxe_config_file_path,
                  'root_mb': root_mb,
-                 'swap_mb': swap_mb})
+                 'swap_mb': swap_mb,
+                 'ephemeral_mb': ephemeral_mb})
         pxe_config = build_pxe_config(
                     node['id'],
                     deployment_key,
@@ -418,14 +425,14 @@ class PXE(base.NodeDriver):
         except exception.NodeNotFound:
             pass
 
-        # NOTE(danms): the instance_type extra_specs do not need to be
+        # NOTE(danms): the flavor extra_specs do not need to be
         # present/correct at deactivate time, so pass something empty
         # to avoid an extra lookup
-        instance_type = dict(extra_specs={
+        flavor = dict(extra_specs={
             'baremetal:deploy_ramdisk_id': 'ignore',
             'baremetal:deploy_kernel_id': 'ignore'})
         try:
-            image_info = get_tftp_image_info(instance, instance_type)
+            image_info = get_tftp_image_info(instance, flavor)
         except exception.NovaException:
             pass
         else:

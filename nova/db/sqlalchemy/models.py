@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011 X.commerce, a business unit of eBay Inc.
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
@@ -45,6 +43,14 @@ class NovaBase(models.SoftDeleteMixin,
                models.ModelBase):
     metadata = None
 
+    def save(self, session=None):
+        from nova.db.sqlalchemy import api
+
+        if session is None:
+            session = api.get_session()
+
+        super(NovaBase, self).save(session=session)
+
 
 class Service(BASE, NovaBase):
     """Represents a running service on a host."""
@@ -58,9 +64,9 @@ class Service(BASE, NovaBase):
         )
 
     id = Column(Integer, primary_key=True)
-    host = Column(String(255), nullable=True)  # , ForeignKey('hosts.id'))
-    binary = Column(String(255), nullable=True)
-    topic = Column(String(255), nullable=True)
+    host = Column(String(255))  # , ForeignKey('hosts.id'))
+    binary = Column(String(255))
+    topic = Column(String(255))
     report_count = Column(Integer, nullable=False, default=0)
     disabled = Column(Boolean, default=False)
     disabled_reason = Column(String(255))
@@ -88,15 +94,16 @@ class ComputeNode(BASE, NovaBase):
     local_gb_used = Column(Integer, nullable=False)
     hypervisor_type = Column(MediumText(), nullable=False)
     hypervisor_version = Column(Integer, nullable=False)
-    hypervisor_hostname = Column(String(255), nullable=True)
+    hypervisor_hostname = Column(String(255))
 
     # Free Ram, amount of activity (resize, migration, boot, etc) and
     # the number of running VM's are a good starting point for what's
     # important when making scheduling decisions.
-    free_ram_mb = Column(Integer, nullable=True)
-    free_disk_gb = Column(Integer, nullable=True)
-    current_workload = Column(Integer, nullable=True)
-    running_vms = Column(Integer, nullable=True)
+    free_ram_mb = Column(Integer)
+    free_disk_gb = Column(Integer)
+    current_workload = Column(Integer)
+    running_vms = Column(Integer)
+
     # Note(masumotok): Expected Strings example:
     #
     # '{"arch":"x86_64",
@@ -108,35 +115,21 @@ class ComputeNode(BASE, NovaBase):
     # above, since it is copied from <cpu> tag of getCapabilities()
     # (See libvirt.virtConnection).
     cpu_info = Column(MediumText(), nullable=False)
-    disk_available_least = Column(Integer, nullable=True)
+    disk_available_least = Column(Integer)
     host_ip = Column(types.IPAddress())
     supported_instances = Column(Text)
+    metrics = Column(Text)
 
+    # Note(yongli): json string PCI Stats
+    # '{"vendor_id":"8086", "product_id":"1234", "count":3 }'
+    pci_stats = Column(Text)
 
-class ComputeNodeStat(BASE, NovaBase):
-    """Stats related to the current workload of a compute host that are
-    intended to aid in making scheduler decisions.
-    """
-    __tablename__ = 'compute_node_stats'
-    __table_args__ = (
-        Index('ix_compute_node_stats_compute_node_id', 'compute_node_id'),
-        Index('compute_node_stats_node_id_and_deleted_idx',
-              'compute_node_id', 'deleted')
-    )
+    # extra_resources is a json string containing arbitrary
+    # data about additional resources.
+    extra_resources = Column(Text)
 
-    id = Column(Integer, primary_key=True)
-    key = Column(String(255), nullable=False)
-    value = Column(String(255), nullable=True)
-    compute_node_id = Column(Integer, ForeignKey('compute_nodes.id'),
-                             nullable=False)
-
-    primary_join = ('and_(ComputeNodeStat.compute_node_id == '
-                    'ComputeNode.id, ComputeNodeStat.deleted == 0)')
-    stats = relationship("ComputeNode", backref="stats",
-            primaryjoin=primary_join)
-
-    def __str__(self):
-        return "{%d: %s = %s}" % (self.compute_node_id, self.key, self.value)
+    # json-encode string containing compute node statistics
+    stats = Column(Text, default='{}')
 
 
 class Certificate(BASE, NovaBase):
@@ -148,9 +141,9 @@ class Certificate(BASE, NovaBase):
     )
     id = Column(Integer, primary_key=True)
 
-    user_id = Column(String(255), nullable=True)
-    project_id = Column(String(255), nullable=True)
-    file_name = Column(String(255), nullable=True)
+    user_id = Column(String(255))
+    project_id = Column(String(255))
+    file_name = Column(String(255))
 
 
 class Instance(BASE, NovaBase):
@@ -200,103 +193,104 @@ class Instance(BASE, NovaBase):
                 base_name = self.uuid
         return base_name
 
+    @property
     def _extra_keys(self):
         return ['name']
 
-    user_id = Column(String(255), nullable=True)
-    project_id = Column(String(255), nullable=True)
+    user_id = Column(String(255))
+    project_id = Column(String(255))
 
-    image_ref = Column(String(255), nullable=True)
-    kernel_id = Column(String(255), nullable=True)
-    ramdisk_id = Column(String(255), nullable=True)
-    hostname = Column(String(255), nullable=True)
+    image_ref = Column(String(255))
+    kernel_id = Column(String(255))
+    ramdisk_id = Column(String(255))
+    hostname = Column(String(255))
 
-    launch_index = Column(Integer, nullable=True)
-    key_name = Column(String(255), nullable=True)
+    launch_index = Column(Integer)
+    key_name = Column(String(255))
     key_data = Column(MediumText())
 
-    power_state = Column(Integer, nullable=True)
-    vm_state = Column(String(255), nullable=True)
-    task_state = Column(String(255), nullable=True)
+    power_state = Column(Integer)
+    vm_state = Column(String(255))
+    task_state = Column(String(255))
 
-    memory_mb = Column(Integer, nullable=True)
-    vcpus = Column(Integer, nullable=True)
-    root_gb = Column(Integer, nullable=True)
-    ephemeral_gb = Column(Integer, nullable=True)
+    memory_mb = Column(Integer)
+    vcpus = Column(Integer)
+    root_gb = Column(Integer)
+    ephemeral_gb = Column(Integer)
+    ephemeral_key_uuid = Column(String(36))
 
     # This is not related to hostname, above.  It refers
     #  to the nova node.
-    host = Column(String(255), nullable=True)  # , ForeignKey('hosts.id'))
+    host = Column(String(255))  # , ForeignKey('hosts.id'))
     # To identify the "ComputeNode" which the instance resides in.
     # This equals to ComputeNode.hypervisor_hostname.
-    node = Column(String(255), nullable=True)
+    node = Column(String(255))
 
     # *not* flavorid, this is the internal primary_key
-    instance_type_id = Column(Integer, nullable=True)
+    instance_type_id = Column(Integer)
 
-    user_data = Column(MediumText(), nullable=True)
+    user_data = Column(MediumText())
 
-    reservation_id = Column(String(255), nullable=True)
+    reservation_id = Column(String(255))
 
-    scheduled_at = Column(DateTime, nullable=True)
-    launched_at = Column(DateTime, nullable=True)
-    terminated_at = Column(DateTime, nullable=True)
+    scheduled_at = Column(DateTime)
+    launched_at = Column(DateTime)
+    terminated_at = Column(DateTime)
 
-    availability_zone = Column(String(255), nullable=True)
+    availability_zone = Column(String(255))
 
     # User editable field for display in user-facing UIs
-    display_name = Column(String(255), nullable=True)
-    display_description = Column(String(255), nullable=True)
+    display_name = Column(String(255))
+    display_description = Column(String(255))
 
     # To remember on which host an instance booted.
     # An instance may have moved to another host by live migration.
-    launched_on = Column(MediumText(), nullable=True)
+    launched_on = Column(MediumText())
 
     # NOTE(jdillaman): locked deprecated in favor of locked_by,
     # to be removed in Icehouse
-    locked = Column(Boolean, nullable=True)
-    locked_by = Column(Enum('owner', 'admin'), nullable=True)
+    locked = Column(Boolean)
+    locked_by = Column(Enum('owner', 'admin'))
 
-    os_type = Column(String(255), nullable=True)
-    architecture = Column(String(255), nullable=True)
-    vm_mode = Column(String(255), nullable=True)
+    os_type = Column(String(255))
+    architecture = Column(String(255))
+    vm_mode = Column(String(255))
     uuid = Column(String(36))
 
-    root_device_name = Column(String(255), nullable=True)
-    default_ephemeral_device = Column(String(255), nullable=True)
-    default_swap_device = Column(String(255), nullable=True)
-    config_drive = Column(String(255), nullable=True)
+    root_device_name = Column(String(255))
+    default_ephemeral_device = Column(String(255))
+    default_swap_device = Column(String(255))
+    config_drive = Column(String(255))
 
     # User editable field meant to represent what ip should be used
     # to connect to the instance
-    access_ip_v4 = Column(types.IPAddress(), nullable=True)
-    access_ip_v6 = Column(types.IPAddress(), nullable=True)
+    access_ip_v4 = Column(types.IPAddress())
+    access_ip_v6 = Column(types.IPAddress())
 
-    auto_disk_config = Column(Boolean(), nullable=True)
-    progress = Column(Integer, nullable=True)
+    auto_disk_config = Column(Boolean())
+    progress = Column(Integer)
 
     # EC2 instance_initiated_shutdown_terminate
     # True: -> 'terminate'
     # False: -> 'stop'
     # Note(maoy): currently Nova will always stop instead of terminate
     # no matter what the flag says. So we set the default to False.
-    shutdown_terminate = Column(Boolean(), default=False, nullable=True)
+    shutdown_terminate = Column(Boolean(), default=False)
 
     # EC2 disable_api_termination
-    disable_terminate = Column(Boolean(), default=False, nullable=True)
+    disable_terminate = Column(Boolean(), default=False)
 
     # OpenStack compute cell name.  This will only be set at the top of
     # the cells tree and it'll be a full cell name such as 'api!hop1!hop2'
-    cell_name = Column(String(255), nullable=True)
-    internal_id = Column(Integer, nullable=True)
+    cell_name = Column(String(255))
+    internal_id = Column(Integer)
 
     # Records whether an instance has been deleted from disk
     cleaned = Column(Integer, default=0)
 
 
 class InstanceInfoCache(BASE, NovaBase):
-    """
-    Represents a cache of information about an instance
+    """Represents a cache of information about an instance
     """
     __tablename__ = 'instance_info_caches'
     __table_args__ = (
@@ -341,8 +335,8 @@ class InstanceTypes(BASE, NovaBase):
     # Public facing id will be renamed public_id
     flavorid = Column(String(255))
     swap = Column(Integer, nullable=False, default=0)
-    rxtx_factor = Column(Float, nullable=True, default=1)
-    vcpu_weight = Column(Integer, nullable=True)
+    rxtx_factor = Column(Float, default=1)
+    vcpu_weight = Column(Integer)
     disabled = Column(Boolean, default=False)
     is_public = Column(Boolean, default=True)
 
@@ -406,10 +400,10 @@ class Quota(BASE, NovaBase):
     )
     id = Column(Integer, primary_key=True)
 
-    project_id = Column(String(255), nullable=True)
+    project_id = Column(String(255))
 
     resource = Column(String(255), nullable=False)
-    hard_limit = Column(Integer, nullable=True)
+    hard_limit = Column(Integer)
 
 
 class ProjectUserQuota(BASE, NovaBase):
@@ -431,7 +425,7 @@ class ProjectUserQuota(BASE, NovaBase):
     user_id = Column(String(255), nullable=False)
 
     resource = Column(String(255), nullable=False)
-    hard_limit = Column(Integer, nullable=True)
+    hard_limit = Column(Integer)
 
 
 class QuotaClass(BASE, NovaBase):
@@ -448,10 +442,10 @@ class QuotaClass(BASE, NovaBase):
     )
     id = Column(Integer, primary_key=True)
 
-    class_name = Column(String(255), nullable=True)
+    class_name = Column(String(255))
 
-    resource = Column(String(255), nullable=True)
-    hard_limit = Column(Integer, nullable=True)
+    resource = Column(String(255))
+    hard_limit = Column(Integer)
 
 
 class QuotaUsage(BASE, NovaBase):
@@ -463,8 +457,8 @@ class QuotaUsage(BASE, NovaBase):
     )
     id = Column(Integer, primary_key=True)
 
-    project_id = Column(String(255), nullable=True)
-    user_id = Column(String(255), nullable=True)
+    project_id = Column(String(255))
+    user_id = Column(String(255))
     resource = Column(String(255), nullable=False)
 
     in_use = Column(Integer, nullable=False)
@@ -474,7 +468,7 @@ class QuotaUsage(BASE, NovaBase):
     def total(self):
         return self.in_use + self.reserved
 
-    until_refresh = Column(Integer, nullable=True)
+    until_refresh = Column(Integer)
 
 
 class Reservation(BASE, NovaBase):
@@ -495,7 +489,7 @@ class Reservation(BASE, NovaBase):
     resource = Column(String(255))
 
     delta = Column(Integer, nullable=False)
-    expire = Column(DateTime, nullable=True)
+    expire = Column(DateTime)
 
     usage = relationship(
         "QuotaUsage",
@@ -509,7 +503,7 @@ class Snapshot(BASE, NovaBase):
     __tablename__ = 'snapshots'
     __table_args__ = ()
     id = Column(String(36), primary_key=True, nullable=False)
-    deleted = Column(String(36), default="", nullable=True)
+    deleted = Column(String(36), default="")
 
     @property
     def name(self):
@@ -519,17 +513,17 @@ class Snapshot(BASE, NovaBase):
     def volume_name(self):
         return CONF.volume_name_template % self.volume_id
 
-    user_id = Column(String(255), nullable=True)
-    project_id = Column(String(255), nullable=True)
+    user_id = Column(String(255))
+    project_id = Column(String(255))
 
     volume_id = Column(String(36), nullable=False)
-    status = Column(String(255), nullable=True)
-    progress = Column(String(255), nullable=True)
-    volume_size = Column(Integer, nullable=True)
-    scheduled_at = Column(DateTime, nullable=True)
+    status = Column(String(255))
+    progress = Column(String(255))
+    volume_size = Column(Integer)
+    scheduled_at = Column(DateTime)
 
-    display_name = Column(String(255), nullable=True)
-    display_description = Column(String(255), nullable=True)
+    display_name = Column(String(255))
+    display_description = Column(String(255))
 
 
 class BlockDeviceMapping(BASE, NovaBase):
@@ -580,13 +574,13 @@ class BlockDeviceMapping(BASE, NovaBase):
 
     snapshot_id = Column(String(36))
 
-    volume_id = Column(String(36), nullable=True)
-    volume_size = Column(Integer, nullable=True)
+    volume_id = Column(String(36))
+    volume_size = Column(Integer)
 
-    image_id = Column('image_id', String(36))
+    image_id = Column(String(36))
 
     # for no device to suppress devices.
-    no_device = Column(Boolean, nullable=True)
+    no_device = Column(Boolean)
 
     connection_info = Column(MediumText())
 
@@ -603,7 +597,7 @@ class IscsiTarget(BASE, NovaBase):
     id = Column(Integer, primary_key=True, nullable=False)
     target_num = Column(Integer)
     host = Column(String(255))
-    volume_id = Column(String(36), ForeignKey('volumes.id'), nullable=True)
+    volume_id = Column(String(36), ForeignKey('volumes.id'))
     volume = relationship(Volume,
                           backref=backref('iscsi_target', uselist=False),
                           foreign_keys=volume_id,
@@ -733,15 +727,14 @@ class Migration(BASE, NovaBase):
     # NOTE(tr3buchet): the ____compute variables are instance['host']
     source_compute = Column(String(255))
     dest_compute = Column(String(255))
-    # nodes are equivalent to a compute node's 'hypvervisor_hostname'
+    # nodes are equivalent to a compute node's 'hypervisor_hostname'
     source_node = Column(String(255))
     dest_node = Column(String(255))
     # NOTE(tr3buchet): dest_host, btw, is an ip address
     dest_host = Column(String(255))
     old_instance_type_id = Column(Integer())
     new_instance_type_id = Column(Integer())
-    instance_uuid = Column(String(36), ForeignKey('instances.uuid'),
-            nullable=True)
+    instance_uuid = Column(String(36), ForeignKey('instances.uuid'))
     #TODO(_cerberus_): enum
     status = Column(String(255))
 
@@ -808,11 +801,10 @@ class VirtualInterface(BASE, NovaBase):
         Index('virtual_interfaces_instance_uuid_fkey', 'instance_uuid'),
     )
     id = Column(Integer, primary_key=True, nullable=False)
-    address = Column(String(255), nullable=True)
-    network_id = Column(Integer, nullable=True)
-    instance_uuid = Column(String(36), ForeignKey('instances.uuid'),
-                           nullable=True)
-    uuid = Column(String(36), nullable=True)
+    address = Column(String(255))
+    network_id = Column(Integer)
+    instance_uuid = Column(String(36), ForeignKey('instances.uuid'))
+    uuid = Column(String(36))
 
 
 # TODO(vish): can these both come from the same baseclass?
@@ -836,10 +828,9 @@ class FixedIp(BASE, NovaBase):
     )
     id = Column(Integer, primary_key=True)
     address = Column(types.IPAddress())
-    network_id = Column(Integer, nullable=True)
-    virtual_interface_id = Column(Integer, nullable=True)
-    instance_uuid = Column(String(36), ForeignKey('instances.uuid'),
-                           nullable=True)
+    network_id = Column(Integer)
+    virtual_interface_id = Column(Integer)
+    instance_uuid = Column(String(36), ForeignKey('instances.uuid'))
     # associated means that a fixed_ip has its instance_id column set
     # allocated means that a fixed_ip has its virtual_interface_id column set
     #TODO(sshturm) add default in db
@@ -879,10 +870,10 @@ class FloatingIp(BASE, NovaBase):
     )
     id = Column(Integer, primary_key=True)
     address = Column(types.IPAddress())
-    fixed_ip_id = Column(Integer, nullable=True)
+    fixed_ip_id = Column(Integer)
     project_id = Column(String(255))
     host = Column(String(255))  # , ForeignKey('hosts.id'))
-    auto_assigned = Column(Boolean, default=False, nullable=True)
+    auto_assigned = Column(Boolean, default=False)
     #TODO(sshturm) add default in db
     pool = Column(String(255))
     interface = Column(String(255))
@@ -904,9 +895,9 @@ class DNSDomain(BASE, NovaBase):
     )
     deleted = Column(Boolean, default=False)
     domain = Column(String(255), primary_key=True)
-    scope = Column(String(255), nullable=True)
-    availability_zone = Column(String(255), nullable=True)
-    project_id = Column(String(255), nullable=True)
+    scope = Column(String(255))
+    availability_zone = Column(String(255))
+    project_id = Column(String(255))
 
 
 class ConsolePool(BASE, NovaBase):
@@ -918,13 +909,13 @@ class ConsolePool(BASE, NovaBase):
             name="uniq_console_pools0host0console_type0compute_host0deleted"),
     )
     id = Column(Integer, primary_key=True)
-    address = Column(types.IPAddress(), nullable=True)
-    username = Column(String(255), nullable=True)
-    password = Column(String(255), nullable=True)
-    console_type = Column(String(255), nullable=True)
-    public_hostname = Column(String(255), nullable=True)
-    host = Column(String(255), nullable=True)
-    compute_host = Column(String(255), nullable=True)
+    address = Column(types.IPAddress())
+    username = Column(String(255))
+    password = Column(String(255))
+    console_type = Column(String(255))
+    public_hostname = Column(String(255))
+    host = Column(String(255))
+    compute_host = Column(String(255))
 
 
 class Console(BASE, NovaBase):
@@ -934,13 +925,11 @@ class Console(BASE, NovaBase):
         Index('consoles_instance_uuid_idx', 'instance_uuid'),
     )
     id = Column(Integer, primary_key=True)
-    instance_name = Column(String(255), nullable=True)
-    instance_uuid = Column(String(36), ForeignKey('instances.uuid'),
-                           nullable=True)
-    password = Column(String(255), nullable=True)
-    port = Column(Integer, nullable=True)
-    pool_id = Column(Integer, ForeignKey('console_pools.id'),
-                           nullable=True)
+    instance_name = Column(String(255))
+    instance_uuid = Column(String(36), ForeignKey('instances.uuid'))
+    password = Column(String(255))
+    port = Column(Integer)
+    pool_id = Column(Integer, ForeignKey('console_pools.id'))
     pool = relationship(ConsolePool, backref=backref('consoles'))
 
 
@@ -951,10 +940,9 @@ class InstanceMetadata(BASE, NovaBase):
         Index('instance_metadata_instance_uuid_idx', 'instance_uuid'),
     )
     id = Column(Integer, primary_key=True)
-    key = Column(String(255), nullable=True)
-    value = Column(String(255), nullable=True)
-    instance_uuid = Column(String(36), ForeignKey('instances.uuid'),
-                           nullable=True)
+    key = Column(String(255))
+    value = Column(String(255))
+    instance_uuid = Column(String(36), ForeignKey('instances.uuid'))
     instance = relationship(Instance, backref="metadata",
                             foreign_keys=instance_uuid,
                             primaryjoin='and_('
@@ -1064,6 +1052,9 @@ class AggregateMetadata(BASE, NovaBase):
     """Represents a metadata key/value pair for an aggregate."""
     __tablename__ = 'aggregate_metadata'
     __table_args__ = (
+        schema.UniqueConstraint("aggregate_id", "key", "deleted",
+            name="uniq_aggregate_metadata0aggregate_id0key0deleted"
+            ),
         Index('aggregate_metadata_key_idx', 'key'),
     )
     id = Column(Integer, primary_key=True)
@@ -1090,6 +1081,7 @@ class Aggregate(BASE, NovaBase):
                              'AggregateMetadata.deleted == 0,'
                              'Aggregate.deleted == 0)')
 
+    @property
     def _extra_keys(self):
         return ['hosts', 'metadetails', 'availability_zone']
 
@@ -1134,14 +1126,14 @@ class BandwidthUsage(BASE, NovaBase):
               'start_period'),
     )
     id = Column(Integer, primary_key=True, nullable=False)
-    uuid = Column(String(36), nullable=True)
-    mac = Column(String(255), nullable=True)
+    uuid = Column(String(36))
+    mac = Column(String(255))
     start_period = Column(DateTime, nullable=False)
-    last_refreshed = Column(DateTime, nullable=True)
-    bw_in = Column(BigInteger, nullable=True)
-    bw_out = Column(BigInteger, nullable=True)
-    last_ctr_in = Column(BigInteger, nullable=True)
-    last_ctr_out = Column(BigInteger, nullable=True)
+    last_refreshed = Column(DateTime)
+    bw_in = Column(BigInteger)
+    bw_out = Column(BigInteger)
+    last_ctr_in = Column(BigInteger)
+    last_ctr_out = Column(BigInteger)
 
 
 class VolumeUsage(BASE, NovaBase):
@@ -1200,12 +1192,11 @@ class InstanceFault(BASE, NovaBase):
 
     id = Column(Integer, primary_key=True, nullable=False)
     instance_uuid = Column(String(36),
-                           ForeignKey('instances.uuid'),
-                           nullable=True)
+                           ForeignKey('instances.uuid'))
     code = Column(Integer(), nullable=False)
-    message = Column(String(255), nullable=True)
-    details = Column(MediumText(), nullable=True)
-    host = Column(String(255), nullable=True)
+    message = Column(String(255))
+    details = Column(MediumText())
+    host = Column(String(255))
 
 
 class InstanceAction(BASE, NovaBase):
@@ -1221,16 +1212,15 @@ class InstanceAction(BASE, NovaBase):
     )
 
     id = Column(Integer, primary_key=True, nullable=False, autoincrement=True)
-    action = Column(String(255), nullable=True)
+    action = Column(String(255))
     instance_uuid = Column(String(36),
-                           ForeignKey('instances.uuid'),
-                           nullable=True)
-    request_id = Column(String(255), nullable=True)
-    user_id = Column(String(255), nullable=True)
-    project_id = Column(String(255), nullable=True)
-    start_time = Column(DateTime, default=timeutils.utcnow, nullable=True)
-    finish_time = Column(DateTime, nullable=True)
-    message = Column(String(255), nullable=True)
+                           ForeignKey('instances.uuid'))
+    request_id = Column(String(255))
+    user_id = Column(String(255))
+    project_id = Column(String(255))
+    start_time = Column(DateTime, default=timeutils.utcnow)
+    finish_time = Column(DateTime)
+    message = Column(String(255))
 
 
 class InstanceActionEvent(BASE, NovaBase):
@@ -1239,13 +1229,14 @@ class InstanceActionEvent(BASE, NovaBase):
     __table_args__ = ()
 
     id = Column(Integer, primary_key=True, nullable=False, autoincrement=True)
-    event = Column(String(255), nullable=True)
-    action_id = Column(Integer, ForeignKey('instance_actions.id'),
-                       nullable=True)
-    start_time = Column(DateTime, default=timeutils.utcnow, nullable=True)
-    finish_time = Column(DateTime, nullable=True)
-    result = Column(String(255), nullable=True)
-    traceback = Column(Text, nullable=True)
+    event = Column(String(255))
+    action_id = Column(Integer, ForeignKey('instance_actions.id'))
+    start_time = Column(DateTime, default=timeutils.utcnow)
+    finish_time = Column(DateTime)
+    result = Column(String(255))
+    traceback = Column(Text)
+    host = Column(String(255))
+    details = Column(Text)
 
 
 class InstanceIdMapping(BASE, NovaBase):
@@ -1279,8 +1270,8 @@ class TaskLog(BASE, NovaBase):
     period_ending = Column(DateTime, default=timeutils.utcnow,
                            nullable=False)
     message = Column(String(255), nullable=False)
-    task_items = Column(Integer(), default=0, nullable=True)
-    errors = Column(Integer(), default=0, nullable=True)
+    task_items = Column(Integer(), default=0)
+    errors = Column(Integer(), default=0)
 
 
 class InstanceGroupMember(BASE, NovaBase):
@@ -1290,7 +1281,7 @@ class InstanceGroupMember(BASE, NovaBase):
         Index('instance_group_member_instance_idx', 'instance_id'),
     )
     id = Column(Integer, primary_key=True, nullable=False)
-    instance_id = Column(String(255), nullable=True)
+    instance_id = Column(String(255))
     group_id = Column(Integer, ForeignKey('instance_groups.id'),
                       nullable=False)
 
@@ -1302,7 +1293,7 @@ class InstanceGroupPolicy(BASE, NovaBase):
         Index('instance_group_policy_policy_idx', 'policy'),
     )
     id = Column(Integer, primary_key=True, nullable=False)
-    policy = Column(String(255), nullable=True)
+    policy = Column(String(255))
     group_id = Column(Integer, ForeignKey('instance_groups.id'),
                       nullable=False)
 
@@ -1314,8 +1305,8 @@ class InstanceGroupMetadata(BASE, NovaBase):
         Index('instance_group_metadata_key_idx', 'key'),
     )
     id = Column(Integer, primary_key=True, nullable=False)
-    key = Column(String(255), nullable=True)
-    value = Column(String(255), nullable=True)
+    key = Column(String(255))
+    value = Column(String(255))
     group_id = Column(Integer, ForeignKey('instance_groups.id'),
                       nullable=False)
 
@@ -1362,3 +1353,45 @@ class InstanceGroup(BASE, NovaBase):
     @property
     def members(self):
         return [m.instance_id for m in self._members]
+
+
+class PciDevice(BASE, NovaBase):
+    """Represents a PCI host device that can be passed through to instances.
+    """
+    __tablename__ = 'pci_devices'
+    __table_args__ = (
+        Index('ix_pci_devices_compute_node_id_deleted',
+              'compute_node_id', 'deleted'),
+        Index('ix_pci_devices_instance_uuid_deleted',
+              'instance_uuid', 'deleted'),
+        schema.UniqueConstraint(
+            "compute_node_id", "address", "deleted",
+            name="uniq_pci_devices0compute_node_id0address0deleted")
+    )
+    id = Column(Integer, primary_key=True)
+
+    compute_node_id = Column(Integer, ForeignKey('compute_nodes.id'),
+                             nullable=False)
+
+    # physical address of device domain:bus:slot.func (0000:09:01.1)
+    address = Column(String(12), nullable=False)
+
+    vendor_id = Column(String(4), nullable=False)
+    product_id = Column(String(4), nullable=False)
+    dev_type = Column(String(8), nullable=False)
+    dev_id = Column(String(255))
+
+    # label is abstract device name, that is used to unify devices with the
+    # same functionality with different addresses or host.
+    label = Column(String(255), nullable=False)
+
+    status = Column(String(36), nullable=False)
+
+    extra_info = Column(Text)
+
+    instance_uuid = Column(String(36))
+    instance = relationship(Instance, backref="pci_devices",
+                            foreign_keys=instance_uuid,
+                            primaryjoin='and_('
+                            'PciDevice.instance_uuid == Instance.uuid,'
+                            'PciDevice.deleted == 0)')

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -124,7 +122,7 @@ class AvailabilityZoneController(wsgi.Controller):
         result = []
         for zone in available_zones:
             hosts = {}
-            for host in zone_hosts[zone]:
+            for host in zone_hosts.get(zone, []):
                 hosts[host] = {}
                 for service in host_services[zone + host]:
                     alive = self.servicegroup_api.service_is_up(service)

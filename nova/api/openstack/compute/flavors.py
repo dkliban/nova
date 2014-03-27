@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -17,7 +15,6 @@
 
 import webob
 
-from nova.api.openstack import common
 from nova.api.openstack.compute.views import flavors as flavors_view
 from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
@@ -113,6 +110,10 @@ class Controller(wsgi.Controller):
     def _get_flavors(self, req):
         """Helper function that returns a list of flavor dicts."""
         filters = {}
+        sort_key = req.params.get('sort_key') or 'flavorid'
+        sort_dir = req.params.get('sort_dir') or 'asc'
+        limit = req.params.get('limit') or None
+        marker = req.params.get('marker') or None
 
         context = req.environ['nova.context']
         if context.is_admin:
@@ -137,11 +138,14 @@ class Controller(wsgi.Controller):
                 msg = _('Invalid minDisk filter [%s]') % req.params['minDisk']
                 raise webob.exc.HTTPBadRequest(explanation=msg)
 
-        limited_flavors = flavors.get_all_flavors(context, filters=filters)
-        flavors_list = limited_flavors.values()
-        sorted_flavors = sorted(flavors_list,
-                                key=lambda item: item['flavorid'])
-        limited_flavors = common.limited_by_marker(sorted_flavors, req)
+        try:
+            limited_flavors = flavors.get_all_flavors_sorted_list(context,
+                filters=filters, sort_key=sort_key, sort_dir=sort_dir,
+                limit=limit, marker=marker)
+        except exception.MarkerNotFound:
+            msg = _('marker [%s] not found') % marker
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
         return limited_flavors
 
 

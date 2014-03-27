@@ -1,4 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
 # coding=utf-8
 
 # Copyright (c) 2012 NTT DOCOMO, INC.
@@ -21,15 +20,15 @@ import re
 from oslo.config import cfg
 
 from nova import context as nova_context
-from nova.db import api as nova_db_api
 from nova import exception
+from nova import network
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
 from nova.openstack.common import processutils
 from nova import utils
 from nova.virt.baremetal import db as bmdb
-from nova.virt.libvirt import utils as libvirt_utils
+from nova.virt import volumeutils
 
 opts = [
     cfg.BoolOpt('use_unsafe_iscsi',
@@ -39,7 +38,8 @@ opts = [
                       'volumes are exported with globally opened ACL'),
     cfg.StrOpt('iscsi_iqn_prefix',
                default='iqn.2010-10.org.openstack.baremetal',
-               help='iSCSI IQN prefix used in baremetal volume connections.'),
+               help='The iSCSI IQN prefix used in baremetal volume '
+                    'connections.'),
     ]
 
 baremetal_group = cfg.OptGroup(name='baremetal',
@@ -51,7 +51,7 @@ CONF.register_opts(opts, baremetal_group)
 
 CONF.import_opt('host', 'nova.netconf')
 CONF.import_opt('use_ipv6', 'nova.netconf')
-CONF.import_opt('libvirt_volume_drivers', 'nova.virt.libvirt.driver')
+CONF.import_opt('volume_drivers', 'nova.virt.libvirt.driver', group='libvirt')
 
 LOG = logging.getLogger(__name__)
 
@@ -174,6 +174,13 @@ def _get_iqn(instance_name, mountpoint):
     return iqn
 
 
+def _get_fixed_ips(instance):
+    context = nova_context.get_admin_context()
+    nw_info = network.API().get_instance_nw_info(context, instance)
+    ips = nw_info.fixed_ips()
+    return ips
+
+
 class VolumeDriver(object):
 
     def __init__(self, virtapi):
@@ -183,10 +190,10 @@ class VolumeDriver(object):
 
     def get_volume_connector(self, instance):
         if not self._initiator:
-            self._initiator = libvirt_utils.get_iscsi_initiator()
+            self._initiator = volumeutils.get_iscsi_initiator()
             if not self._initiator:
-                LOG.warn(_('Could not determine iscsi initiator name '
-                           'for instance %s') % instance)
+                LOG.warn(_('Could not determine iscsi initiator name'),
+                         instance=instance)
         return {
             'ip': CONF.my_ip,
             'initiator': self._initiator,
@@ -201,12 +208,12 @@ class VolumeDriver(object):
 
 
 class LibvirtVolumeDriver(VolumeDriver):
-    """The VolumeDriver deligates to nova.virt.libvirt.volume."""
+    """The VolumeDriver delegates to nova.virt.libvirt.volume."""
 
     def __init__(self, virtapi):
         super(LibvirtVolumeDriver, self).__init__(virtapi)
         self.volume_drivers = {}
-        for driver_str in CONF.libvirt_volume_drivers:
+        for driver_str in CONF.libvirt.volume_drivers:
             driver_type, _sep, driver = driver_str.partition('=')
             driver_class = importutils.import_class(driver)
             self.volume_drivers[driver_type] = driver_class(self)
@@ -221,18 +228,28 @@ class LibvirtVolumeDriver(VolumeDriver):
         return method(connection_info, *args, **kwargs)
 
     def attach_volume(self, connection_info, instance, mountpoint):
-        ctx = nova_context.get_admin_context()
-        fixed_ips = nova_db_api.fixed_ip_get_by_instance(ctx, instance['uuid'])
+        fixed_ips = _get_fixed_ips(instance)
         if not fixed_ips:
             if not CONF.baremetal.use_unsafe_iscsi:
                 raise exception.NovaException(_(
                     'No fixed PXE IP is associated to %s') % instance['uuid'])
 
         mount_device = mountpoint.rpartition("/")[2]
-        self._volume_driver_method('connect_volume',
-                                   connection_info,
-                                   mount_device)
-        device_path = connection_info['data']['device_path']
+        disk_info = {
+            'dev': mount_device,
+            'bus': 'baremetal',
+            'type': 'baremetal',
+            }
+        conf = self._connect_volume(connection_info, disk_info)
+        self._publish_iscsi(instance, mountpoint, fixed_ips,
+                            conf.source_path)
+
+    def _connect_volume(self, connection_info, disk_info):
+        return self._volume_driver_method('connect_volume',
+                                          connection_info,
+                                          disk_info)
+
+    def _publish_iscsi(self, instance, mountpoint, fixed_ips, device_path):
         iqn = _get_iqn(instance['name'], mountpoint)
         tid = _get_next_tid()
         _create_iscsi_export_tgtadm(device_path, tid, iqn)
@@ -253,19 +270,28 @@ class LibvirtVolumeDriver(VolumeDriver):
     def detach_volume(self, connection_info, instance, mountpoint):
         mount_device = mountpoint.rpartition("/")[2]
         try:
-            iqn = _get_iqn(instance['name'], mountpoint)
-            tid = _find_tid(iqn)
-            if tid is not None:
-                _delete_iscsi_export_tgtadm(tid)
-            else:
-                LOG.warn(_('detach volume could not find tid for %s') % iqn)
+            self._depublish_iscsi(instance, mountpoint)
         finally:
-            self._volume_driver_method('disconnect_volume',
-                                       connection_info,
-                                       mount_device)
+            self._disconnect_volume(connection_info, mount_device)
+
+    def _disconnect_volume(self, connection_info, disk_dev):
+        return self._volume_driver_method('disconnect_volume',
+                                          connection_info,
+                                          disk_dev)
+
+    def _depublish_iscsi(self, instance, mountpoint):
+        iqn = _get_iqn(instance['name'], mountpoint)
+        tid = _find_tid(iqn)
+        if tid is not None:
+            _delete_iscsi_export_tgtadm(tid)
+        else:
+            LOG.warn(_('detach volume could not find tid for %s'), iqn,
+                     instance=instance)
 
     def get_all_block_devices(self):
-        """
-        Return all block devices in use on this node.
-        """
+        """Return all block devices in use on this node."""
         return _list_backingstore_path()
+
+    def get_hypervisor_version(self):
+        """A dummy method for LibvirtBaseVolumeDriver.connect_volume."""
+        return 1

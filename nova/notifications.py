@@ -1,7 +1,6 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 OpenStack Foundation
 # All Rights Reserved.
+# Copyright 2013 Red Hat, Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -29,11 +28,12 @@ from nova import db
 from nova.image import glance
 from nova import network
 from nova.network import model as network_model
+from nova.openstack.common import context as common_context
 from nova.openstack.common import excutils
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log
-from nova.openstack.common.notifier import api as notifier_api
 from nova.openstack.common import timeutils
+from nova import rpc
 from nova import utils
 
 LOG = log.getLogger(__name__)
@@ -48,11 +48,46 @@ notify_opts = [
     cfg.BoolOpt('notify_api_faults', default=False,
         help='If set, send api.fault notifications on caught exceptions '
              'in the API service.'),
+    cfg.StrOpt('default_notification_level',
+               default='INFO',
+               help='Default notification level for outgoing notifications'),
+    cfg.StrOpt('default_publisher_id',
+               help='Default publisher_id for outgoing notifications'),
 ]
 
 
 CONF = cfg.CONF
 CONF.register_opts(notify_opts)
+
+
+def notify_decorator(name, fn):
+    """Decorator for notify which is used from utils.monkey_patch().
+
+        :param name: name of the function
+        :param function: - object of the function
+        :returns: function -- decorated function
+
+    """
+    def wrapped_func(*args, **kwarg):
+        body = {}
+        body['args'] = []
+        body['kwarg'] = {}
+        for arg in args:
+            body['args'].append(arg)
+        for key in kwarg:
+            body['kwarg'][key] = kwarg[key]
+
+        ctxt = common_context.get_context_from_function_and_args(
+            fn, args, kwarg)
+
+        notifier = rpc.get_notifier(publisher_id=(CONF.default_publisher_id
+                                                  or CONF.host))
+        method = notifier.getattr(CONF.default_notification_level.lower(),
+                                  'info')
+        method(ctxt, name, body)
+
+        return fn(*args, **kwarg)
+    return wrapped_func
 
 
 def send_api_fault(url, status, exception):
@@ -63,10 +98,7 @@ def send_api_fault(url, status, exception):
 
     payload = {'url': url, 'exception': str(exception), 'status': status}
 
-    publisher_id = notifier_api.publisher_id("api")
-
-    notifier_api.notify(None, publisher_id, 'api.fault', notifier_api.ERROR,
-                        payload)
+    rpc.get_notifier('api').error(None, 'api.fault', payload)
 
 
 def send_update(context, old_instance, new_instance, service=None, host=None):
@@ -192,10 +224,8 @@ def _send_instance_update_notification(context, instance, old_vm_state=None,
     if old_display_name:
         payload["old_display_name"] = old_display_name
 
-    publisher_id = notifier_api.publisher_id(service, host)
-
-    notifier_api.notify(context, publisher_id, 'compute.instance.update',
-            notifier_api.INFO, payload)
+    rpc.get_notifier(service, host).info(context,
+                                         'compute.instance.update', payload)
 
 
 def audit_period_bounds(current_period=False):
@@ -250,6 +280,8 @@ def bandwidth_usage(instance_ref, audit_start,
     from nova.objects import instance as instance_obj
     if isinstance(instance_ref, instance_obj.Instance):
         nw_info = instance_ref.info_cache.network_info
+        if nw_info is None:
+            nw_info = network_model.NetworkInfo()
     else:
         nw_info = _get_nwinfo_old_skool()
 
@@ -309,6 +341,7 @@ def info_from_instance(context, instance_ref, network_info,
 
     instance_type = flavors.extract_flavor(instance_ref)
     instance_type_name = instance_type.get('name', '')
+    instance_flavorid = instance_type.get('flavorid', '')
 
     if system_metadata is None:
         system_metadata = utils.instance_sys_meta(instance_ref)
@@ -327,6 +360,7 @@ def info_from_instance(context, instance_ref, network_info,
         # Type properties
         instance_type=instance_type_name,
         instance_type_id=instance_ref['instance_type_id'],
+        instance_flavor_id=instance_flavorid,
         architecture=instance_ref['architecture'],
 
         # Capacity properties
@@ -346,10 +380,11 @@ def info_from_instance(context, instance_ref, network_info,
 
         # Date properties
         created_at=str(instance_ref['created_at']),
-        # Nova's deleted vs terminated instance terminology is confusing,
-        # this should be when the instance was deleted (i.e. terminated_at),
-        # not when the db record was deleted. (mdragon)
-        deleted_at=null_safe_isotime(instance_ref.get('terminated_at')),
+        # Terminated and Deleted are slightly different (although being
+        # terminated and not deleted is a transient state), so include
+        # both and let the recipient decide which they want to use.
+        terminated_at=null_safe_isotime(instance_ref.get('terminated_at')),
+        deleted_at=null_safe_isotime(instance_ref.get('deleted_at')),
         launched_at=null_safe_isotime(instance_ref.get('launched_at')),
 
         # Image properties
@@ -380,7 +415,7 @@ def info_from_instance(context, instance_ref, network_info,
     instance_info["image_meta"] = image_meta_props
 
     # add instance metadata
-    instance_info['metadata'] = instance_ref['metadata']
+    instance_info['metadata'] = utils.instance_meta(instance_ref)
 
     instance_info.update(kw)
     return instance_info

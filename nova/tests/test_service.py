@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -23,6 +21,7 @@ Unit Tests for remote procedure calls using queue
 import sys
 import testtools
 
+import mock
 import mox
 from oslo.config import cfg
 
@@ -30,10 +29,13 @@ from nova import context
 from nova import db
 from nova import exception
 from nova import manager
+from nova import rpc
 from nova import service
 from nova import test
 from nova.tests import utils
 from nova import wsgi
+
+from nova.openstack.common import service as _service
 
 test_service_opts = [
     cfg.StrOpt("fake_manager",
@@ -81,6 +83,16 @@ class ServiceManagerTestCase(test.TestCase):
         serv.start()
         self.assertEqual(serv.test_method(), 'service')
 
+    def test_service_with_min_down_time(self):
+        CONF.set_override('service_down_time', 10)
+        CONF.set_override('report_interval', 10)
+        serv = service.Service('test',
+                               'test',
+                               'test',
+                               'nova.tests.test_service.FakeManager')
+        serv.start()
+        self.assertEqual(CONF.service_down_time, 25)
+
 
 class ServiceFlagsTestCase(test.TestCase):
     def test_service_enabled_on_create_based_on_flag(self):
@@ -92,7 +104,7 @@ class ServiceFlagsTestCase(test.TestCase):
         app.stop()
         ref = db.service_get(context.get_admin_context(), app.service_id)
         db.service_destroy(context.get_admin_context(), app.service_id)
-        self.assert_(not ref['disabled'])
+        self.assertTrue(not ref['disabled'])
 
     def test_service_disabled_on_create_based_on_flag(self):
         self.flags(enable_new_services=False)
@@ -103,7 +115,7 @@ class ServiceFlagsTestCase(test.TestCase):
         app.stop()
         ref = db.service_get(context.get_admin_context(), app.service_id)
         db.service_destroy(context.get_admin_context(), app.service_id)
-        self.assert_(ref['disabled'])
+        self.assertTrue(ref['disabled'])
 
 
 class ServiceTestCase(test.TestCase):
@@ -125,7 +137,7 @@ class ServiceTestCase(test.TestCase):
         app = service.Service.create(host=self.host, binary=self.binary,
                 topic=self.topic)
 
-        self.assert_(app)
+        self.assertTrue(app)
 
     def _service_start_mocks(self):
         service_create = {'host': self.host,
@@ -150,18 +162,19 @@ class ServiceTestCase(test.TestCase):
                 'FakeManager', use_mock_anything=True)
         self.mox.StubOutWithMock(self.manager_mock, 'init_host')
         self.mox.StubOutWithMock(self.manager_mock, 'pre_start_hook')
-        self.mox.StubOutWithMock(self.manager_mock, 'create_rpc_dispatcher')
         self.mox.StubOutWithMock(self.manager_mock, 'post_start_hook')
 
         FakeManager(host=self.host).AndReturn(self.manager_mock)
+
+        self.manager_mock.service_name = self.topic
+        self.manager_mock.additional_endpoints = []
 
         # init_host is called before any service record is created
         self.manager_mock.init_host()
         self._service_start_mocks()
         # pre_start_hook is called after service record is created,
         # but before RPC consumer is created
-        self.manager_mock.pre_start_hook(rpc_connection=mox.IgnoreArg())
-        self.manager_mock.create_rpc_dispatcher(None)
+        self.manager_mock.pre_start_hook()
         # post_start_hook is called after RPC consumer is created.
         self.manager_mock.post_start_hook()
 
@@ -172,6 +185,113 @@ class ServiceTestCase(test.TestCase):
                                self.topic,
                                'nova.tests.test_service.FakeManager')
         serv.start()
+
+    def test_service_check_create_race(self):
+        self.manager_mock = self.mox.CreateMock(FakeManager)
+        self.mox.StubOutWithMock(sys.modules[__name__], 'FakeManager',
+                                 use_mock_anything=True)
+        self.mox.StubOutWithMock(self.manager_mock, 'init_host')
+        self.mox.StubOutWithMock(self.manager_mock, 'pre_start_hook')
+        self.mox.StubOutWithMock(self.manager_mock, 'post_start_hook')
+
+        FakeManager(host=self.host).AndReturn(self.manager_mock)
+
+        # init_host is called before any service record is created
+        self.manager_mock.init_host()
+
+        db.service_get_by_args(mox.IgnoreArg(), self.host, self.binary
+                               ).AndRaise(exception.NotFound)
+        ex = exception.ServiceTopicExists(host='foo', topic='bar')
+        db.service_create(mox.IgnoreArg(), mox.IgnoreArg()
+                          ).AndRaise(ex)
+
+        class TestException(Exception):
+            pass
+
+        db.service_get_by_args(mox.IgnoreArg(), self.host, self.binary
+                               ).AndRaise(TestException)
+
+        self.mox.ReplayAll()
+
+        serv = service.Service(self.host,
+                               self.binary,
+                               self.topic,
+                               'nova.tests.test_service.FakeManager')
+        self.assertRaises(TestException, serv.start)
+
+    def test_parent_graceful_shutdown(self):
+        self.manager_mock = self.mox.CreateMock(FakeManager)
+        self.mox.StubOutWithMock(sys.modules[__name__],
+                'FakeManager', use_mock_anything=True)
+        self.mox.StubOutWithMock(self.manager_mock, 'init_host')
+        self.mox.StubOutWithMock(self.manager_mock, 'pre_start_hook')
+        self.mox.StubOutWithMock(self.manager_mock, 'post_start_hook')
+
+        self.mox.StubOutWithMock(_service.Service, 'stop')
+
+        FakeManager(host=self.host).AndReturn(self.manager_mock)
+
+        self.manager_mock.service_name = self.topic
+        self.manager_mock.additional_endpoints = []
+
+        # init_host is called before any service record is created
+        self.manager_mock.init_host()
+        self._service_start_mocks()
+        # pre_start_hook is called after service record is created,
+        # but before RPC consumer is created
+        self.manager_mock.pre_start_hook()
+        # post_start_hook is called after RPC consumer is created.
+        self.manager_mock.post_start_hook()
+
+        _service.Service.stop()
+
+        self.mox.ReplayAll()
+
+        serv = service.Service(self.host,
+                               self.binary,
+                               self.topic,
+                               'nova.tests.test_service.FakeManager')
+        serv.start()
+
+        serv.stop()
+
+    @mock.patch('nova.servicegroup.API')
+    @mock.patch('nova.conductor.api.LocalAPI.service_get_by_args')
+    def test_parent_graceful_shutdown_with_cleanup_host(self,
+                                                        mock_svc_get_by_args,
+                                                        mock_API):
+        mock_svc_get_by_args.return_value = {'id': 'some_value'}
+        mock_manager = mock.Mock()
+
+        serv = service.Service(self.host,
+                               self.binary,
+                               self.topic,
+                               'nova.tests.test_service.FakeManager')
+
+        serv.manager = mock_manager
+        serv.manager.additional_endpoints = []
+
+        serv.start()
+        serv.manager.init_host.assert_called_with()
+
+        serv.stop()
+        serv.manager.cleanup_host.assert_called_with()
+
+    @mock.patch('nova.servicegroup.API')
+    @mock.patch('nova.conductor.api.LocalAPI.service_get_by_args')
+    @mock.patch.object(rpc, 'get_server')
+    def test_service_stop_waits_for_rpcserver(
+            self, mock_rpc, mock_svc_get_by_args, mock_API):
+        mock_svc_get_by_args.return_value = {'id': 'some_value'}
+        serv = service.Service(self.host,
+                               self.binary,
+                               self.topic,
+                               'nova.tests.test_service.FakeManager')
+        serv.start()
+        serv.stop()
+        serv.rpcserver.start.assert_called_once_with()
+        serv.rpcserver.stop.assert_called_once_with()
+        serv.rpcserver.wait.assert_called_once_with()
 
 
 class TestWSGIService(test.TestCase):
@@ -185,6 +305,11 @@ class TestWSGIService(test.TestCase):
         test_service.start()
         self.assertNotEqual(0, test_service.port)
         test_service.stop()
+
+    def test_service_start_with_illegal_workers(self):
+        CONF.set_override("osapi_compute_workers", -1)
+        self.assertRaises(exception.InvalidInput,
+                          service.WSGIService, "osapi_compute")
 
     @testtools.skipIf(not utils.is_ipv6_supported(), "no ipv6 support")
     def test_service_random_port_with_ipv6(self):
@@ -205,5 +330,5 @@ class TestLauncher(test.TestCase):
 
     def test_launch_app(self):
         service.serve(self.service)
-        self.assertNotEquals(0, self.service.port)
+        self.assertNotEqual(0, self.service.port)
         service._launcher.stop()

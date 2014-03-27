@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011 Citrix Systems, Inc.
 # Copyright 2011 OpenStack Foundation
 #
@@ -25,10 +23,12 @@ Collection of classes to handle image upload/download to/from Image service
 import httplib
 import urllib
 import urllib2
-import urlparse
+
+import six.moves.urllib.parse as urlparse
 
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
+from nova import utils
 
 LOG = logging.getLogger(__name__)
 
@@ -87,10 +87,6 @@ class VMwareHTTPFile(object):
         except Exception as exc:
             LOG.exception(exc)
 
-    def __del__(self):
-        """Close the file handle on garbage collection."""
-        self.close()
-
     def _build_vim_cookie_headers(self, vim_cookies):
         """Build ESX host session cookie headers."""
         cookie_header = ""
@@ -117,7 +113,10 @@ class VMwareHTTPWriteFile(VMwareHTTPFile):
 
     def __init__(self, host, data_center_name, datastore_name, cookies,
                  file_path, file_size, scheme="https"):
-        base_url = "%s://%s/folder/%s" % (scheme, host, file_path)
+        if utils.is_valid_ipv6(host):
+            base_url = "%s://[%s]/folder/%s" % (scheme, host, file_path)
+        else:
+            base_url = "%s://%s/folder/%s" % (scheme, host, file_path)
         param_list = {"dcPath": data_center_name, "dsName": datastore_name}
         base_url = base_url + "?" + urllib.urlencode(param_list)
         _urlparse = urlparse.urlparse(base_url)

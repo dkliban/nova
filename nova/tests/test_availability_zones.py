@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 Netease Corporation
 # All Rights Reserved.
 #
@@ -83,6 +81,25 @@ class AvailabilityZoneTestCases(test.TestCase):
         return db.aggregate_host_delete(self.context,
                                         aggregate['id'], service['host'])
 
+    def test_rest_availability_zone_reset_cache(self):
+        az._get_cache().add('cache', 'fake_value')
+        az.reset_cache()
+        self.assertIsNone(az._get_cache().get('cache'))
+
+    def test_update_host_availability_zone_cache(self):
+        """Test availability zone cache could be update."""
+        service = self._create_service_with_topic('compute', self.host)
+
+        # Create a new aggregate with an AZ and add the host to the AZ
+        az_name = 'az1'
+        cache_key = az._make_cache_key(self.host)
+        agg_az1 = self._create_az('agg-az1', az_name)
+        self._add_to_aggregate(service, agg_az1)
+        az.update_host_availability_zone_cache(self.context, self.host)
+        self.assertEqual(az._get_cache().get(cache_key), 'az1')
+        az.update_host_availability_zone_cache(self.context, self.host, 'az2')
+        self.assertEqual(az._get_cache().get(cache_key), 'az2')
+
     def test_set_availability_zone_compute_service(self):
         """Test for compute service get right availability zone."""
         service = self._create_service_with_topic('compute', self.host)
@@ -91,16 +108,26 @@ class AvailabilityZoneTestCases(test.TestCase):
         # The service is not add into aggregate, so confirm it is default
         # availability zone.
         new_service = az.set_availability_zones(self.context, services)[0]
-        self.assertEquals(new_service['availability_zone'],
-                          self.default_az)
+        self.assertEqual(new_service['availability_zone'],
+                         self.default_az)
 
         # The service is added into aggregate, confirm return the aggregate
         # availability zone.
         self._add_to_aggregate(service, self.agg)
         new_service = az.set_availability_zones(self.context, services)[0]
-        self.assertEquals(new_service['availability_zone'],
-                          self.availability_zone)
+        self.assertEqual(new_service['availability_zone'],
+                         self.availability_zone)
 
+        self._destroy_service(service)
+
+    def test_set_availability_zone_unicode_key(self):
+        """Test set availability zone cache key is unicode."""
+        service = self._create_service_with_topic('network', self.host)
+        services = db.service_get_all(self.context)
+        new_service = az.set_availability_zones(self.context, services)[0]
+        self.assertIsInstance(services[0]['host'], unicode)
+        cached_key = az._make_cache_key(services[0]['host'])
+        self.assertIsInstance(cached_key, str)
         self._destroy_service(service)
 
     def test_set_availability_zone_not_compute_service(self):
@@ -108,19 +135,19 @@ class AvailabilityZoneTestCases(test.TestCase):
         service = self._create_service_with_topic('network', self.host)
         services = db.service_get_all(self.context)
         new_service = az.set_availability_zones(self.context, services)[0]
-        self.assertEquals(new_service['availability_zone'],
-                          self.default_in_az)
+        self.assertEqual(new_service['availability_zone'],
+                         self.default_in_az)
         self._destroy_service(service)
 
     def test_get_host_availability_zone(self):
         """Test get right availability zone by given host."""
-        self.assertEquals(self.default_az,
+        self.assertEqual(self.default_az,
                         az.get_host_availability_zone(self.context, self.host))
 
         service = self._create_service_with_topic('compute', self.host)
         self._add_to_aggregate(service, self.agg)
 
-        self.assertEquals(self.availability_zone,
+        self.assertEqual(self.availability_zone,
                         az.get_host_availability_zone(self.context, self.host))
 
     def test_update_host_availability_zone(self):
@@ -131,12 +158,12 @@ class AvailabilityZoneTestCases(test.TestCase):
         az_name = 'az1'
         agg_az1 = self._create_az('agg-az1', az_name)
         self._add_to_aggregate(service, agg_az1)
-        self.assertEquals(az_name,
+        self.assertEqual(az_name,
                     az.get_host_availability_zone(self.context, self.host))
         # Update AZ
         new_az_name = 'az2'
         self._update_az(agg_az1, new_az_name)
-        self.assertEquals(new_az_name,
+        self.assertEqual(new_az_name,
                     az.get_host_availability_zone(self.context, self.host))
 
     def test_delete_host_availability_zone(self):
@@ -147,11 +174,11 @@ class AvailabilityZoneTestCases(test.TestCase):
         az_name = 'az1'
         agg_az1 = self._create_az('agg-az1', az_name)
         self._add_to_aggregate(service, agg_az1)
-        self.assertEquals(az_name,
+        self.assertEqual(az_name,
                     az.get_host_availability_zone(self.context, self.host))
         # Delete the AZ via deleting the aggregate
         self._delete_from_aggregate(service, agg_az1)
-        self.assertEquals(self.default_az,
+        self.assertEqual(self.default_az,
                     az.get_host_availability_zone(self.context, self.host))
 
     def test_get_availability_zones(self):
@@ -192,12 +219,12 @@ class AvailabilityZoneTestCases(test.TestCase):
 
         zones, not_zones = az.get_availability_zones(self.context)
 
-        self.assertEquals(zones, ['nova-test', 'nova-test2'])
-        self.assertEquals(not_zones, ['nova-test3', 'nova'])
+        self.assertEqual(zones, ['nova-test', 'nova-test2'])
+        self.assertEqual(not_zones, ['nova-test3', 'nova'])
 
         zones = az.get_availability_zones(self.context, True)
 
-        self.assertEquals(zones, ['nova-test', 'nova-test2'])
+        self.assertEqual(zones, ['nova-test', 'nova-test2'])
 
     def test_get_instance_availability_zone_default_value(self):
         """Test get right availability zone by given an instance."""

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -35,7 +33,7 @@ from nova.openstack.common.gettextutils import _
 from nova.openstack.common import importutils
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
-from nova.openstack.common import rpc
+from nova import rpc
 
 CONF = cfg.CONF
 CONF.import_opt('host', 'nova.netconf')
@@ -45,14 +43,8 @@ LOG = logging.getLogger(__name__)
 
 def add_lease(mac, ip_address):
     """Set the IP that was assigned by the DHCP server."""
-    if CONF.fake_rabbit:
-        LOG.debug(_("leasing ip"))
-        network_manager = importutils.import_object(CONF.network_manager)
-        network_manager.lease_fixed_ip(context.get_admin_context(),
-                                       ip_address)
-    else:
-        api = network_rpcapi.NetworkAPI()
-        api.lease_fixed_ip(context.get_admin_context(), ip_address, CONF.host)
+    api = network_rpcapi.NetworkAPI()
+    api.lease_fixed_ip(context.get_admin_context(), ip_address, CONF.host)
 
 
 def old_lease(mac, ip_address):
@@ -65,15 +57,9 @@ def old_lease(mac, ip_address):
 
 def del_lease(mac, ip_address):
     """Called when a lease expires."""
-    if CONF.fake_rabbit:
-        LOG.debug(_("releasing ip"))
-        network_manager = importutils.import_object(CONF.network_manager)
-        network_manager.release_fixed_ip(context.get_admin_context(),
-                                         ip_address)
-    else:
-        api = network_rpcapi.NetworkAPI()
-        api.release_fixed_ip(context.get_admin_context(), ip_address,
-                             CONF.host)
+    api = network_rpcapi.NetworkAPI()
+    api.release_fixed_ip(context.get_admin_context(), ip_address,
+                         CONF.host)
 
 
 def init_leases(network_id):

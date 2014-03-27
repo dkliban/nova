@@ -17,6 +17,7 @@ from oslo.config import cfg
 
 from nova import exception
 from nova.image import glance
+from nova import utils
 from nova.virt.xenapi import vm_utils
 
 CONF = cfg.CONF
@@ -58,7 +59,16 @@ class GlanceStore(object):
 
         props = params['properties'] = {}
         props['auto_disk_config'] = instance['auto_disk_config']
-        props['os_type'] = instance['os_type'] or CONF.default_os_type
+        props['os_type'] = instance.get('os_type', None) or (
+                CONF.xenserver.default_os_type)
+
+        compression_level = vm_utils.get_compression_level()
+        if compression_level:
+            props['xenapi_image_compression_level'] = compression_level
+
+        auto_disk_config = utils.get_auto_disk_config_from_instance(instance)
+        if utils.is_auto_disk_config_disabled(auto_disk_config):
+            props["auto_disk_config"] = "disabled"
 
         try:
             self._call_glance_plugin(session, 'upload_vhd', params)

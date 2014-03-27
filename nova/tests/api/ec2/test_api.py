@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -19,6 +17,7 @@
 """Unit tests for the API endpoint."""
 
 import random
+import re
 import StringIO
 
 import boto
@@ -41,6 +40,7 @@ from nova import block_device
 from nova import context
 from nova import exception
 from nova.openstack.common import timeutils
+from nova.openstack.common import versionutils
 from nova import test
 from nova.tests import matchers
 
@@ -100,7 +100,7 @@ class XmlConversionTestCase(test.TestCase):
     """Unit test api xml conversion."""
     def test_number_conversion(self):
         conv = ec2utils._try_convert
-        self.assertEqual(conv('None'), None)
+        self.assertIsNone(conv('None'))
         self.assertEqual(conv('True'), True)
         self.assertEqual(conv('TRUE'), True)
         self.assertEqual(conv('true'), True)
@@ -177,6 +177,36 @@ class Ec2utilsTestCase(test.TestCase):
             properties1)
         self.assertEqual(root_device_name, '/dev/sdb')
 
+    def test_regex_from_ec2_regex(self):
+        def _test_re(ec2_regex, expected, literal, match=True):
+            regex = ec2utils.regex_from_ec2_regex(ec2_regex)
+            self.assertEqual(regex, expected)
+            if match:
+                self.assertIsNotNone(re.match(regex, literal))
+            else:
+                self.assertIsNone(re.match(regex, literal))
+
+        # wildcards
+        _test_re('foo', '\Afoo\Z(?s)', 'foo')
+        _test_re('foo', '\Afoo\Z(?s)', 'baz', match=False)
+        _test_re('foo?bar', '\Afoo.bar\Z(?s)', 'foo bar')
+        _test_re('foo?bar', '\Afoo.bar\Z(?s)', 'foo   bar', match=False)
+        _test_re('foo*bar', '\Afoo.*bar\Z(?s)', 'foo QUUX bar')
+
+        # backslashes and escaped wildcards
+        _test_re('foo\\', '\Afoo\\\\\Z(?s)', 'foo\\')
+        _test_re('foo*bar', '\Afoo.*bar\Z(?s)', 'zork QUUX bar', match=False)
+        _test_re('foo\\?bar', '\Afoo[?]bar\Z(?s)', 'foo?bar')
+        _test_re('foo\\?bar', '\Afoo[?]bar\Z(?s)', 'foo bar', match=False)
+        _test_re('foo\\*bar', '\Afoo[*]bar\Z(?s)', 'foo*bar')
+        _test_re('foo\\*bar', '\Afoo[*]bar\Z(?s)', 'foo bar', match=False)
+
+        # analog to the example given in the EC2 API docs
+        ec2_regex = '\*nova\?\\end'
+        expected = r'\A[*]nova[?]\\end\Z(?s)'
+        literal = r'*nova?\end'
+        _test_re(ec2_regex, expected, literal)
+
     def test_mapping_prepend_dev(self):
         mappings = [
             {'virtual': 'ami',
@@ -241,7 +271,10 @@ class ApiEc2TestCase(test.TestCase):
         self.http = FakeHttplibConnection(
                 self.app, '%s:8773' % (self.host), False)
         # pylint: disable=E1103
-        if boto.Version >= '2':
+        if versionutils.is_compatible('2.14', boto.Version, same_major=False):
+            self.ec2.new_http_connection(host or self.host, 8773,
+                is_secure).AndReturn(self.http)
+        elif versionutils.is_compatible('2', boto.Version, same_major=False):
             self.ec2.new_http_connection(host or '%s:8773' % (self.host),
                 is_secure).AndReturn(self.http)
         else:
@@ -249,10 +282,9 @@ class ApiEc2TestCase(test.TestCase):
         return self.http
 
     def test_return_valid_isoformat(self):
-        """
-            Ensure that the ec2 api returns datetime in xs:dateTime
-            (which apparently isn't datetime.isoformat())
-            NOTE(ken-pepple): https://bugs.launchpad.net/nova/+bug/721297
+        """Ensure that the ec2 api returns datetime in xs:dateTime
+           (which apparently isn't datetime.isoformat())
+           NOTE(ken-pepple): https://bugs.launchpad.net/nova/+bug/721297
         """
         conv = apirequest._database_to_isoformat
         # sqlite database representation with microseconds
@@ -271,8 +303,8 @@ class ApiEc2TestCase(test.TestCase):
         # Any request should be fine
         self.ec2.get_all_instances()
         self.assertTrue(self.ec2.APIVersion in self.http.getresponsebody(),
-                       'The version in the xmlns of the response does '
-                       'not match the API version given in the request.')
+                        'The version in the xmlns of the response does '
+                        'not match the API version given in the request.')
 
     def test_describe_instances(self):
         """Test that, after creating a user and a project, the describe
@@ -300,7 +332,7 @@ class ApiEc2TestCase(test.TestCase):
         self.ec2.create_key_pair(keyname)
         rv = self.ec2.get_all_key_pairs()
         results = [k for k in rv if k.name == keyname]
-        self.assertEquals(len(results), 1)
+        self.assertEqual(len(results), 1)
 
     def test_create_duplicate_key_pair(self):
         """Test that, after successfully generating a keypair,
@@ -327,8 +359,8 @@ class ApiEc2TestCase(test.TestCase):
 
         rv = self.ec2.get_all_security_groups()
 
-        self.assertEquals(len(rv), 1)
-        self.assertEquals(rv[0].name, 'default')
+        self.assertEqual(len(rv), 1)
+        self.assertEqual(rv[0].name, 'default')
 
     def test_create_delete_security_group(self):
         # Test that we can create a security group.
@@ -344,8 +376,8 @@ class ApiEc2TestCase(test.TestCase):
         self.mox.ReplayAll()
 
         rv = self.ec2.get_all_security_groups()
-        self.assertEquals(len(rv), 2)
-        self.assertTrue(security_group_name in [group.name for group in rv])
+        self.assertEqual(len(rv), 2)
+        self.assertIn(security_group_name, [group.name for group in rv])
 
         self.expect_http()
         self.mox.ReplayAll()
@@ -405,8 +437,7 @@ class ApiEc2TestCase(test.TestCase):
                 'test group')
 
     def test_authorize_revoke_security_group_cidr(self):
-        """
-        Test that we can add and remove CIDR based rules
+        """Test that we can add and remove CIDR based rules
         to a security group
         """
         self.expect_http()
@@ -475,11 +506,11 @@ class ApiEc2TestCase(test.TestCase):
 
         group = [grp for grp in rv if grp.name == security_group_name][0]
 
-        self.assertEquals(len(group.rules), 8)
-        self.assertEquals(int(group.rules[0].from_port), 80)
-        self.assertEquals(int(group.rules[0].to_port), 81)
-        self.assertEquals(len(group.rules[0].grants), 1)
-        self.assertEquals(str(group.rules[0].grants[0]), '0.0.0.0/0')
+        self.assertEqual(len(group.rules), 8)
+        self.assertEqual(int(group.rules[0].from_port), 80)
+        self.assertEqual(int(group.rules[0].to_port), 81)
+        self.assertEqual(len(group.rules[0].grants), 1)
+        self.assertEqual(str(group.rules[0].grants[0]), '0.0.0.0/0')
 
         self.expect_http()
         self.mox.ReplayAll()
@@ -509,8 +540,7 @@ class ApiEc2TestCase(test.TestCase):
         self.assertEqual(rv[0].name, 'default')
 
     def test_authorize_revoke_security_group_cidr_v6(self):
-        """
-        Test that we can add and remove CIDR based rules
+        """Test that we can add and remove CIDR based rules
         to a security group for IPv6
         """
         self.expect_http()
@@ -534,11 +564,11 @@ class ApiEc2TestCase(test.TestCase):
         rv = self.ec2.get_all_security_groups()
 
         group = [grp for grp in rv if grp.name == security_group_name][0]
-        self.assertEquals(len(group.rules), 1)
-        self.assertEquals(int(group.rules[0].from_port), 80)
-        self.assertEquals(int(group.rules[0].to_port), 81)
-        self.assertEquals(len(group.rules[0].grants), 1)
-        self.assertEquals(str(group.rules[0].grants[0]), '::/0')
+        self.assertEqual(len(group.rules), 1)
+        self.assertEqual(int(group.rules[0].from_port), 80)
+        self.assertEqual(int(group.rules[0].to_port), 81)
+        self.assertEqual(len(group.rules[0].grants), 1)
+        self.assertEqual(str(group.rules[0].grants[0]), '::/0')
 
         self.expect_http()
         self.mox.ReplayAll()
@@ -561,8 +591,7 @@ class ApiEc2TestCase(test.TestCase):
         self.assertEqual(rv[0].name, 'default')
 
     def test_authorize_revoke_security_group_foreign_group(self):
-        """
-        Test that we can grant and revoke another security group access
+        """Test that we can grant and revoke another security group access
         to a security group
         """
         self.expect_http()
@@ -599,10 +628,10 @@ class ApiEc2TestCase(test.TestCase):
         # be good enough for that.
         for group in rv:
             if group.name == security_group_name:
-                self.assertEquals(len(group.rules), 3)
-                self.assertEquals(len(group.rules[0].grants), 1)
-                self.assertEquals(str(group.rules[0].grants[0]), '%s-%s' %
-                                  (other_security_group_name, 'fake'))
+                self.assertEqual(len(group.rules), 3)
+                self.assertEqual(len(group.rules[0].grants), 1)
+                self.assertEqual(str(group.rules[0].grants[0]),
+                                 '%s-%s' % (other_security_group_name, 'fake'))
 
         self.expect_http()
         self.mox.ReplayAll()

@@ -1,4 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
 # coding=utf-8
 
 # Copyright (c) 2011-2013 University of Southern California / ISI
@@ -30,7 +29,7 @@ from nova.virt.baremetal import utils as bm_utils
 CONF = cfg.CONF
 
 
-class BareMetalPduTestCase(test.TestCase):
+class BareMetalPduTestCase(test.NoDBTestCase):
 
     def setUp(self):
         super(BareMetalPduTestCase, self).setUp()

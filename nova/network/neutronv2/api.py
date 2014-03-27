@@ -14,15 +14,15 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 #
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
 
 import time
 
+from neutronclient.common import exceptions as neutron_client_exc
 from oslo.config import cfg
+import six
 
 from nova.compute import flavors
 from nova import conductor
-from nova import context
 from nova.db import base
 from nova import exception
 from nova.network import api as network_api
@@ -39,53 +39,48 @@ from nova.openstack.common import uuidutils
 neutron_opts = [
     cfg.StrOpt('neutron_url',
                default='http://127.0.0.1:9696',
-               deprecated_name='quantum_url',
                help='URL for connecting to neutron'),
     cfg.IntOpt('neutron_url_timeout',
                default=30,
-               deprecated_name='quantum_url_timeout',
-               help='timeout value for connecting to neutron in seconds'),
+               help='Timeout value for connecting to neutron in seconds'),
     cfg.StrOpt('neutron_admin_username',
-               deprecated_name='quantum_admin_username',
-               help='username for connecting to neutron in admin context'),
+               help='Username for connecting to neutron in admin context'),
     cfg.StrOpt('neutron_admin_password',
-               deprecated_name='quantum_admin_password',
-               help='password for connecting to neutron in admin context',
+               help='Password for connecting to neutron in admin context',
                secret=True),
+    cfg.StrOpt('neutron_admin_tenant_id',
+               help='Tenant id for connecting to neutron in admin context'),
     cfg.StrOpt('neutron_admin_tenant_name',
-               deprecated_name='quantum_admin_tenant_name',
-               help='tenant name for connecting to neutron in admin context'),
+               help='Tenant name for connecting to neutron in admin context. '
+                    'This option is mutually exclusive with '
+                    'neutron_admin_tenant_id. Note that with Keystone V3 '
+                    'tenant names are only unique within a domain.'),
     cfg.StrOpt('neutron_region_name',
-               deprecated_name='quantum_region_name',
-               help='region name for connecting to neutron in admin context'),
+               help='Region name for connecting to neutron in admin context'),
     cfg.StrOpt('neutron_admin_auth_url',
-               deprecated_name='quantum_admin_auth_url',
                default='http://localhost:5000/v2.0',
-               help='auth url for connecting to neutron in admin context'),
+               help='Authorization URL for connecting to neutron in admin '
+               'context'),
     cfg.BoolOpt('neutron_api_insecure',
                 default=False,
-                deprecated_name='quantum_api_insecure',
-                help='if set, ignore any SSL validation issues'),
+                help='If set, ignore any SSL validation issues'),
     cfg.StrOpt('neutron_auth_strategy',
                default='keystone',
-               deprecated_name='quantum_auth_strategy',
-               help='auth strategy for connecting to '
+               help='Authorization strategy for connecting to '
                     'neutron in admin context'),
     # TODO(berrange) temporary hack until Neutron can pass over the
     # name of the OVS bridge it is configured with
     cfg.StrOpt('neutron_ovs_bridge',
                default='br-int',
-               deprecated_name='quantum_ovs_bridge',
                help='Name of Integration Bridge used by Open vSwitch'),
     cfg.IntOpt('neutron_extension_sync_interval',
                 default=600,
-                deprecated_name='quantum_extension_sync_interval',
                 help='Number of seconds before querying neutron for'
                      ' extensions'),
     cfg.StrOpt('neutron_ca_certificates_file',
-                help='Location of ca certicates file to use for neutronclient'
-                     ' requests.'),
-    ]
+                help='Location of CA certificates file to use for '
+                     'neutron client requests.'),
+   ]
 
 CONF = cfg.CONF
 CONF.register_opts(neutron_opts)
@@ -99,39 +94,42 @@ update_instance_info_cache = network_api.update_instance_cache_with_nw_info
 
 class API(base.Base):
     """API for interacting with the neutron 2.x API."""
-
-    conductor_api = conductor.API()
-    security_group_api = openstack_driver.get_openstack_security_group_driver()
+    _sentinel = object()
 
     def __init__(self):
         super(API, self).__init__()
         self.last_neutron_extension_sync = None
         self.extensions = {}
+        self.conductor_api = conductor.API()
+        self.security_group_api = (
+            openstack_driver.get_openstack_security_group_driver())
 
     def setup_networks_on_host(self, context, instance, host=None,
                                teardown=False):
         """Setup or teardown the network structures."""
 
     def _get_available_networks(self, context, project_id,
-                                net_ids=None):
+                                net_ids=None, neutron=None):
         """Return a network list available for the tenant.
         The list contains networks owned by the tenant and public networks.
         If net_ids specified, it searches networks with requested IDs only.
         """
-        neutron = neutronv2.get_client(context)
+        if not neutron:
+            neutron = neutronv2.get_client(context)
 
-        # If user has specified to attach instance only to specific
-        # networks, add them to **search_opts
-        # (1) Retrieve non-public network list owned by the tenant.
-        search_opts = {"tenant_id": project_id, 'shared': False}
         if net_ids:
-            search_opts['id'] = net_ids
-        nets = neutron.list_networks(**search_opts).get('networks', [])
-        # (2) Retrieve public network list.
-        search_opts = {'shared': True}
-        if net_ids:
-            search_opts['id'] = net_ids
-        nets += neutron.list_networks(**search_opts).get('networks', [])
+            # If user has specified to attach instance only to specific
+            # networks then only add these to **search_opts. This search will
+            # also include 'shared' networks.
+            search_opts = {'id': net_ids}
+            nets = neutron.list_networks(**search_opts).get('networks', [])
+        else:
+            # (1) Retrieve non-public network list owned by the tenant.
+            search_opts = {'tenant_id': project_id, 'shared': False}
+            nets = neutron.list_networks(**search_opts).get('networks', [])
+            # (2) Retrieve public network list.
+            search_opts = {'shared': True}
+            nets += neutron.list_networks(**search_opts).get('networks', [])
 
         _ensure_requested_network_ordering(
             lambda x: x['id'],
@@ -140,7 +138,53 @@ class API(base.Base):
 
         return nets
 
-    @refresh_cache
+    def _create_port(self, port_client, instance, network_id, port_req_body,
+                     fixed_ip=None, security_group_ids=None,
+                     available_macs=None, dhcp_opts=None):
+        """Attempts to create a port for the instance on the given network.
+
+        :param port_client: The client to use to create the port.
+        :param instance: Create the port for the given instance.
+        :param network_id: Create the port on the given network.
+        :param port_req_body: Pre-populated port request. Should have the
+            device_id, device_owner, and any required neutron extension values.
+        :param fixed_ip: Optional fixed IP to use from the given network.
+        :param security_group_ids: Optional list of security group IDs to
+            apply to the port.
+        :param available_macs: Optional set of available MAC addresses to use.
+        :param dhcp_opts: Optional DHCP options.
+        :returns: ID of the created port.
+        :raises PortLimitExceeded: If neutron fails with an OverQuota error.
+        """
+        try:
+            if fixed_ip:
+                port_req_body['port']['fixed_ips'] = [{'ip_address': fixed_ip}]
+            port_req_body['port']['network_id'] = network_id
+            port_req_body['port']['admin_state_up'] = True
+            port_req_body['port']['tenant_id'] = instance['project_id']
+            if security_group_ids:
+                port_req_body['port']['security_groups'] = security_group_ids
+            if available_macs is not None:
+                if not available_macs:
+                    raise exception.PortNotFree(
+                        instance=instance['display_name'])
+                mac_address = available_macs.pop()
+                port_req_body['port']['mac_address'] = mac_address
+            if dhcp_opts is not None:
+                port_req_body['port']['extra_dhcp_opts'] = dhcp_opts
+            port_id = port_client.create_port(port_req_body)['port']['id']
+            LOG.debug(_('Successfully created port: %s') % port_id,
+                      instance=instance)
+            return port_id
+        except neutron_client_exc.NeutronClientException as e:
+            # NOTE(mriedem): OverQuota in neutron is a 409
+            if e.status_code == 409:
+                LOG.warning(_('Neutron error: quota exceeded'))
+                raise exception.PortLimitExceeded()
+            with excutils.save_and_reraise_exception():
+                LOG.exception(_('Neutron error creating port on network %s'),
+                              network_id, instance=instance)
+
     def allocate_for_instance(self, context, instance, **kwargs):
         """Allocate network resources for the instance.
 
@@ -155,6 +199,11 @@ class API(base.Base):
             function correctly if more than one network is being used with
             the bare metal hypervisor (which is the only one known to limit
             MAC addresses).
+        :param dhcp_options: None or a set of key/value pairs that should
+            determine the DHCP BOOTP response, eg. for PXE booting an instance
+            configured with the baremetal hypervisor. It is expected that these
+            are already formatted for the neutron v2 api.
+            See nova/virt/driver.py:dhcp_options_for_instance for an example.
         """
         hypervisor_macs = kwargs.get('macs', None)
         available_macs = None
@@ -171,6 +220,7 @@ class API(base.Base):
             raise exception.InvalidInput(
                 reason=msg % instance['display_name'])
         requested_networks = kwargs.get('requested_networks')
+        dhcp_opts = kwargs.get('dhcp_options', None)
         ports = {}
         fixed_ips = {}
         net_ids = []
@@ -178,6 +228,8 @@ class API(base.Base):
             for network_id, fixed_ip, port_id in requested_networks:
                 if port_id:
                     port = neutron.show_port(port_id)['port']
+                    if port.get('device_id'):
+                        raise exception.PortInUse(port_id=port_id)
                     if hypervisor_macs is not None:
                         if port['mac_address'] not in hypervisor_macs:
                             raise exception.PortNotUsable(port_id=port_id,
@@ -200,7 +252,7 @@ class API(base.Base):
 
         if not nets:
             LOG.warn(_("No network configured!"), instance=instance)
-            return []
+            return network_model.NetworkInfo([])
 
         security_groups = kwargs.get('security_groups', [])
         security_group_ids = []
@@ -218,10 +270,11 @@ class API(base.Base):
             for user_security_group in user_security_groups:
                 if user_security_group['name'] == security_group:
                     if name_match:
-                        msg = (_("Multiple security groups found matching"
-                                 " '%s'. Use an ID to be more specific."),
-                                 security_group)
-                        raise exception.NoUniqueMatch(msg)
+                        raise exception.NoUniqueMatch(
+                            _("Multiple security groups found matching"
+                              " '%s'. Use an ID to be more specific.") %
+                               security_group)
+
                     name_match = user_security_group['id']
                 if user_security_group['id'] == security_group:
                     uuid_match = user_security_group['id']
@@ -238,6 +291,7 @@ class API(base.Base):
 
         touched_port_ids = []
         created_port_ids = []
+        ports_in_requested_order = []
         for network in nets:
             # If security groups are requested on an instance then the
             # network must has a subnet associated with it. Some plugins
@@ -256,41 +310,30 @@ class API(base.Base):
                                       'device_owner': zone}}
             try:
                 port = ports.get(network_id)
-                self._populate_neutron_extension_values(instance,
+                self._populate_neutron_extension_values(context, instance,
                                                         port_req_body)
                 # Requires admin creds to set port bindings
                 port_client = (neutron if not
-                               self._has_port_binding_extension() else
+                               self._has_port_binding_extension(context) else
                                neutronv2.get_client(context, admin=True))
                 if port:
                     port_client.update_port(port['id'], port_req_body)
                     touched_port_ids.append(port['id'])
+                    ports_in_requested_order.append(port['id'])
                 else:
-                    fixed_ip = fixed_ips.get(network_id)
-                    if fixed_ip:
-                        port_req_body['port']['fixed_ips'] = [{'ip_address':
-                                                               fixed_ip}]
-                    port_req_body['port']['network_id'] = network_id
-                    port_req_body['port']['admin_state_up'] = True
-                    port_req_body['port']['tenant_id'] = instance['project_id']
-                    if security_group_ids:
-                        port_req_body['port']['security_groups'] = (
-                            security_group_ids)
-                    if available_macs is not None:
-                        if not available_macs:
-                            raise exception.PortNotFree(
-                                instance=instance['display_name'])
-                        mac_address = available_macs.pop()
-                        port_req_body['port']['mac_address'] = mac_address
-                    created_port_ids.append(
-                        port_client.create_port(port_req_body)['port']['id'])
+                    created_port = self._create_port(
+                            port_client, instance, network_id,
+                            port_req_body, fixed_ips.get(network_id),
+                            security_group_ids, available_macs, dhcp_opts)
+                    created_port_ids.append(created_port)
+                    ports_in_requested_order.append(created_port)
             except Exception:
                 with excutils.save_and_reraise_exception():
                     for port_id in touched_port_ids:
                         try:
                             port_req_body = {'port': {'device_id': None}}
                             # Requires admin creds to set port bindings
-                            if self._has_port_binding_extension():
+                            if self._has_port_binding_extension(context):
                                 port_req_body['port']['binding:host_id'] = None
                                 port_client = neutronv2.get_client(
                                     context, admin=True)
@@ -308,7 +351,8 @@ class API(base.Base):
                             msg = _("Failed to delete port %s")
                             LOG.exception(msg, port_id)
 
-        nw_info = self._get_instance_nw_info(context, instance, networks=nets)
+        nw_info = self.get_instance_nw_info(context, instance, networks=nets,
+                                            port_ids=ports_in_requested_order)
         # NOTE(danms): Only return info about ports we created in this run.
         # In the initial allocation case, this will be everything we created,
         # and in later runs will only be what was created that time. Thus,
@@ -318,34 +362,35 @@ class API(base.Base):
                                           if port['id'] in created_port_ids +
                                                            touched_port_ids])
 
-    def _refresh_neutron_extensions_cache(self):
+    def _refresh_neutron_extensions_cache(self, context):
         """Refresh the neutron extensions cache when necessary."""
         if (not self.last_neutron_extension_sync or
             ((time.time() - self.last_neutron_extension_sync)
              >= CONF.neutron_extension_sync_interval)):
-            neutron = neutronv2.get_client(context.get_admin_context())
+            neutron = neutronv2.get_client(context)
             extensions_list = neutron.list_extensions()['extensions']
             self.last_neutron_extension_sync = time.time()
             self.extensions.clear()
             self.extensions = dict((ext['name'], ext)
                                    for ext in extensions_list)
 
-    def _has_port_binding_extension(self, refresh_cache=False):
+    def _has_port_binding_extension(self, context, refresh_cache=False):
         if refresh_cache:
-            self._refresh_neutron_extensions_cache()
+            self._refresh_neutron_extensions_cache(context)
         return constants.PORTBINDING_EXT in self.extensions
 
-    def _populate_neutron_extension_values(self, instance, port_req_body):
+    def _populate_neutron_extension_values(self, context, instance,
+                                           port_req_body):
         """Populate neutron extension values for the instance.
 
         If the extension contains nvp-qos then get the rxtx_factor.
         """
-        self._refresh_neutron_extensions_cache()
+        self._refresh_neutron_extensions_cache(context)
         if 'nvp-qos' in self.extensions:
-            instance_type = flavors.extract_flavor(instance)
-            rxtx_factor = instance_type.get('rxtx_factor')
+            flavor = flavors.extract_flavor(instance)
+            rxtx_factor = flavor.get('rxtx_factor')
             port_req_body['port']['rxtx_factor'] = rxtx_factor
-        if self._has_port_binding_extension():
+        if self._has_port_binding_extension(context):
             port_req_body['port']['binding:host_id'] = instance.get('host')
 
     def deallocate_for_instance(self, context, instance, **kwargs):
@@ -353,7 +398,8 @@ class API(base.Base):
         LOG.debug(_('deallocate_for_instance() for %s'),
                   instance['display_name'])
         search_opts = {'device_id': instance['uuid']}
-        data = neutronv2.get_client(context).list_ports(**search_opts)
+        neutron = neutronv2.get_client(context)
+        data = neutron.list_ports(**search_opts)
         ports = [port['id'] for port in data.get('ports', [])]
 
         requested_networks = kwargs.get('requested_networks') or {}
@@ -362,34 +408,40 @@ class API(base.Base):
 
         for port in ports:
             try:
-                neutronv2.get_client(context).delete_port(port)
-            except Exception:
-                LOG.exception(_("Failed to delete neutron port %(portid)s")
-                              % {'portid': port})
+                neutron.delete_port(port)
+            except neutronv2.exceptions.NeutronClientException as e:
+                if e.status_code == 404:
+                    LOG.warning(_("Port %s does not exist"), port)
+                else:
+                    with excutils.save_and_reraise_exception():
+                        LOG.exception(_("Failed to delete neutron port %s"),
+                                      port)
 
-    @refresh_cache
+        # NOTE(arosen): This clears out the network_cache only if the instance
+        # hasn't already been deleted. This is needed when an instance fails to
+        # launch and is rescheduled onto another compute node. If the instance
+        # has already been deleted this call does nothing.
+        update_instance_info_cache(self, context, instance,
+                                   network_model.NetworkInfo([]))
+
     def allocate_port_for_instance(self, context, instance, port_id,
-                                   network_id=None, requested_ip=None,
-                                   conductor_api=None):
+                                   network_id=None, requested_ip=None):
         """Allocate a port for the instance."""
         return self.allocate_for_instance(context, instance,
-                requested_networks=[(network_id, requested_ip, port_id)],
-                conductor_api=conductor_api)
+                requested_networks=[(network_id, requested_ip, port_id)])
 
-    @refresh_cache
-    def deallocate_port_for_instance(self, context, instance, port_id,
-                                     conductor_api=None):
+    def deallocate_port_for_instance(self, context, instance, port_id):
         """Remove a specified port from the instance.
 
         Return network information for the instance
         """
         try:
             neutronv2.get_client(context).delete_port(port_id)
-        except Exception as ex:
+        except Exception:
             LOG.exception(_("Failed to delete neutron port %s") %
                           port_id)
 
-        return self._get_instance_nw_info(context, instance)
+        return self.get_instance_nw_info(context, instance)
 
     def list_ports(self, context, **search_opts):
         """List ports for the client based on search options."""
@@ -399,24 +451,71 @@ class API(base.Base):
         """Return the port for the client given the port id."""
         return neutronv2.get_client(context).show_port(port_id)
 
-    def get_instance_nw_info(self, context, instance, networks=None):
+    @refresh_cache
+    def get_instance_nw_info(self, context, instance, networks=None,
+                             port_ids=None, use_slave=False):
         """Return network information for specified instance
            and update cache.
         """
-        result = self._get_instance_nw_info(context, instance, networks)
-        update_instance_info_cache(self, context, instance, result,
-                                   update_cells=False)
+        # NOTE(geekinutah): It would be nice if use_slave had us call
+        #                   special APIs that pummeled slaves instead of
+        #                   the master. For now we just ignore this arg.
+        result = self._get_instance_nw_info(context, instance, networks,
+                                            port_ids)
         return result
 
-    def _get_instance_nw_info(self, context, instance, networks=None):
-        LOG.debug(_('get_instance_nw_info() for %s'),
-                  instance['display_name'])
-        nw_info = self._build_network_info_model(context, instance, networks)
+    def _get_instance_nw_info(self, context, instance, networks=None,
+                              port_ids=None):
+        # keep this caching-free version of the get_instance_nw_info method
+        # because it is used by the caching logic itself.
+        LOG.debug(_('get_instance_nw_info() for %s'), instance['display_name'])
+        nw_info = self._build_network_info_model(context, instance, networks,
+                                                 port_ids)
         return network_model.NetworkInfo.hydrate(nw_info)
 
+    def _gather_port_ids_and_networks(self, context, instance, networks=None,
+                                      port_ids=None):
+        """Return an instance's complete list of port_ids and networks."""
+
+        if ((networks is None and port_ids is not None) or
+            (port_ids is None and networks is not None)):
+            message = ("This method needs to be called with either "
+                       "networks=None and port_ids=None or port_ids and "
+                       " networks as not none.")
+            raise exception.NovaException(message=message)
+
+        # Unfortunately, this is sometimes in unicode and sometimes not
+        if isinstance(instance['info_cache']['network_info'], six.text_type):
+            ifaces = jsonutils.loads(instance['info_cache']['network_info'])
+        else:
+            ifaces = instance['info_cache']['network_info']
+
+        # This code path is only done when refreshing the network_cache
+        if port_ids is None:
+            port_ids = [iface['id'] for iface in ifaces]
+            net_ids = [iface['network']['id'] for iface in ifaces]
+
+        if networks is None:
+            networks = self._get_available_networks(context,
+                                                    instance['project_id'],
+                                                    net_ids)
+        # an interface was added/removed from instance.
+        else:
+            # Since networks does not contain the existing networks on the
+            # instance we use their values from the cache and add it.
+            networks = networks + [
+                {'id': iface['network']['id'],
+                 'name': iface['network']['label'],
+                 'tenant_id': iface['network']['meta']['tenant_id']}
+                for iface in ifaces]
+
+            # Include existing interfaces so they are not removed from the db.
+            port_ids = [iface['id'] for iface in ifaces] + port_ids
+
+        return networks, port_ids
+
     @refresh_cache
-    def add_fixed_ip_to_instance(self, context, instance, network_id,
-                                 conductor_api=None):
+    def add_fixed_ip_to_instance(self, context, instance, network_id):
         """Add a fixed ip to the instance from specified network."""
         search_opts = {'network_id': network_id}
         data = neutronv2.get_client(context).list_subnets(**search_opts)
@@ -451,8 +550,7 @@ class API(base.Base):
                 instance_id=instance['uuid'])
 
     @refresh_cache
-    def remove_fixed_ip_from_instance(self, context, instance, address,
-                                      conductor_api=None):
+    def remove_fixed_ip_from_instance(self, context, instance, address):
         """Remove a fixed ip from the instance."""
         zone = 'compute:%s' % instance['availability_zone']
         search_opts = {'device_id': instance['uuid'],
@@ -479,13 +577,21 @@ class API(base.Base):
         raise exception.FixedIpNotFoundForSpecificInstance(
                 instance_uuid=instance['uuid'], ip=address)
 
-    def validate_networks(self, context, requested_networks):
-        """Validate that the tenant can use the requested networks."""
+    def validate_networks(self, context, requested_networks, num_instances):
+        """Validate that the tenant can use the requested networks.
+
+        Return the number of instances than can be successfully allocated
+        with the requested network configuration.
+        """
         LOG.debug(_('validate_networks() for %s'),
                   requested_networks)
 
+        neutron = neutronv2.get_client(context)
+        ports_needed_per_instance = 0
+
         if not requested_networks:
-            nets = self._get_available_networks(context, context.project_id)
+            nets = self._get_available_networks(context, context.project_id,
+                                                neutron=neutron)
             if len(nets) > 1:
                 # Attaching to more than one network by default doesn't
                 # make sense, as the order will be arbitrary and the guest OS
@@ -493,40 +599,72 @@ class API(base.Base):
                 msg = _("Multiple possible networks found, use a Network "
                          "ID to be more specific.")
                 raise exception.NetworkAmbiguous(msg)
-            return
+            else:
+                ports_needed_per_instance = 1
 
-        net_ids = []
+        else:
+            net_ids = []
 
-        for (net_id, _i, port_id) in requested_networks:
-            if port_id:
-                try:
-                    port = (neutronv2.get_client(context)
-                                     .show_port(port_id)
-                                     .get('port'))
-                except neutronv2.exceptions.NeutronClientException as e:
-                    if e.status_code == 404:
-                        port = None
-                if not port:
-                    raise exception.PortNotFound(port_id=port_id)
-                if port.get('device_id', None):
-                    raise exception.PortInUse(port_id=port_id)
-                net_id = port['network_id']
-            if net_id in net_ids:
-                raise exception.NetworkDuplicated(network_id=net_id)
-            net_ids.append(net_id)
+            for (net_id, _i, port_id) in requested_networks:
+                if port_id:
+                    try:
+                        port = neutron.show_port(port_id).get('port')
+                    except neutronv2.exceptions.NeutronClientException as e:
+                        if e.status_code == 404:
+                            port = None
+                        else:
+                            with excutils.save_and_reraise_exception():
+                                LOG.exception(_("Failed to access port %s"),
+                                              port_id)
+                    if not port:
+                        raise exception.PortNotFound(port_id=port_id)
+                    if port.get('device_id', None):
+                        raise exception.PortInUse(port_id=port_id)
+                    if not port.get('fixed_ips'):
+                        raise exception.PortRequiresFixedIP(port_id=port_id)
+                    net_id = port['network_id']
+                else:
+                    ports_needed_per_instance += 1
 
-        # Now check to see if all requested networks exist
-        nets = self._get_available_networks(context,
-                                context.project_id, net_ids)
+                if net_id in net_ids:
+                    raise exception.NetworkDuplicated(network_id=net_id)
+                net_ids.append(net_id)
 
-        if len(nets) != len(net_ids):
-            requsted_netid_set = set(net_ids)
-            returned_netid_set = set([net['id'] for net in nets])
-            lostid_set = requsted_netid_set - returned_netid_set
-            id_str = ''
-            for _id in lostid_set:
-                id_str = id_str and id_str + ', ' + _id or _id
-            raise exception.NetworkNotFound(network_id=id_str)
+            # Now check to see if all requested networks exist
+            nets = self._get_available_networks(context,
+                                    context.project_id, net_ids,
+                                    neutron=neutron)
+            for net in nets:
+                if not net.get('subnets'):
+                    raise exception.NetworkRequiresSubnet(
+                        network_uuid=net['id'])
+
+            if len(nets) != len(net_ids):
+                requsted_netid_set = set(net_ids)
+                returned_netid_set = set([net['id'] for net in nets])
+                lostid_set = requsted_netid_set - returned_netid_set
+                id_str = ''
+                for _id in lostid_set:
+                    id_str = id_str and id_str + ', ' + _id or _id
+                raise exception.NetworkNotFound(network_id=id_str)
+
+        # Note(PhilD): Ideally Nova would create all required ports as part of
+        # network validation, but port creation requires some details
+        # from the hypervisor.  So we just check the quota and return
+        # how many of the requested number of instances can be created
+
+        ports = neutron.list_ports(tenant_id=context.project_id)['ports']
+        quotas = neutron.show_quota(tenant_id=context.project_id)['quota']
+        if quotas.get('port') == -1:
+            # Unlimited Port Quota
+            return num_instances
+        else:
+            free_ports = quotas.get('port') - len(ports)
+            ports_needed = ports_needed_per_instance * num_instances
+            if free_ports >= ports_needed:
+                return num_instances
+            else:
+                return free_ports // ports_needed_per_instance
 
     def _get_instance_uuids_by_ip(self, context, address):
         """Retrieve instance uuids associated with the given ip address.
@@ -627,6 +765,11 @@ class API(base.Base):
         """Disassociate a network for client."""
         raise NotImplementedError()
 
+    def associate(self, context, network_uuid, host=_sentinel,
+                  project=_sentinel):
+        """Associate a network for client."""
+        raise NotImplementedError()
+
     def get_fixed_ip(self, context, id):
         """Get a fixed ip from the id."""
         raise NotImplementedError()
@@ -671,6 +814,9 @@ class API(base.Base):
         except neutronv2.exceptions.NeutronClientException as e:
             if e.status_code == 404:
                 raise exception.FloatingIpNotFound(id=id)
+            else:
+                with excutils.save_and_reraise_exception():
+                    LOG.exception(_('Unable to access floating IP %s'), id)
         pool_dict = self._setup_net_dict(client,
                                          fip['floating_network_id'])
         port_dict = self._setup_port_dict(client, fip['port_id'])
@@ -727,7 +873,7 @@ class API(base.Base):
                 for fip in fips]
 
     def get_floating_ips_by_fixed_address(self, context, fixed_address):
-        return []
+        raise NotImplementedError()
 
     def get_instance_id_by_floating_address(self, context, address):
         """Return the instance id a floating ip's fixed ip is allocated to."""
@@ -797,7 +943,10 @@ class API(base.Base):
         except neutronv2.exceptions.NeutronClientException as e:
             if e.status_code == 404:
                 return []
-            raise
+            with excutils.save_and_reraise_exception():
+                LOG.exception(_('Unable to access floating IP %(fixed_ip)s '
+                                'for port %(port_id)s'),
+                              {'fixed_ip': fixed_ip, 'port_id': port})
         return data['floatingips']
 
     def release_floating_ip(self, context, address,
@@ -840,7 +989,7 @@ class API(base.Base):
 
     def migrate_instance_finish(self, context, instance, migration):
         """Finish migrating the network of an instance."""
-        if not self._has_port_binding_extension(refresh_cache=True):
+        if not self._has_port_binding_extension(context, refresh_cache=True):
             return
         neutron = neutronv2.get_client(context, admin=True)
         search_opts = {'device_id': instance['uuid'],
@@ -848,10 +997,11 @@ class API(base.Base):
         data = neutron.list_ports(**search_opts)
         ports = data['ports']
         for p in ports:
-            port_req_body = {'port': {'binding:host_id': instance.get('host')}}
+            port_req_body = {'port': {'binding:host_id':
+                                      migration['dest_compute']}}
             try:
                 neutron.update_port(p['id'], port_req_body)
-            except Exception as ex:
+            except Exception:
                 with excutils.save_and_reraise_exception():
                     msg = _("Unable to update host of port %s")
                     LOG.exception(msg, p['id'])
@@ -881,12 +1031,18 @@ class API(base.Base):
         return subnets
 
     def _nw_info_build_network(self, port, networks, subnets):
-        # NOTE(danms): This loop can't fail to find a network since we
-        # filtered ports to only the ones matching networks in our parent
+        network_name = None
         for net in networks:
             if port['network_id'] == net['id']:
                 network_name = net['name']
+                tenant_id = net['tenant_id']
                 break
+        else:
+            tenant_id = port['tenant_id']
+            LOG.warning(_("Network %(id)s not matched with the tenants "
+                          "network! The ports tenant %(tenant_id)s will be "
+                          "used."),
+                        {'id': port['network_id'], 'tenant_id': tenant_id})
 
         bridge = None
         ovs_interfaceid = None
@@ -910,55 +1066,73 @@ class API(base.Base):
             bridge=bridge,
             injected=CONF.flat_injected,
             label=network_name,
-            tenant_id=net['tenant_id']
+            tenant_id=tenant_id
             )
         network['subnets'] = subnets
+        port_profile = port.get('binding:profile')
+        if port_profile:
+            physical_network = port_profile.get('physical_network')
+            if physical_network:
+                network['physical_network'] = physical_network
+
         if should_create_bridge is not None:
             network['should_create_bridge'] = should_create_bridge
         return network, ovs_interfaceid
 
-    def _build_network_info_model(self, context, instance, networks=None):
+    def _build_network_info_model(self, context, instance, networks=None,
+                                  port_ids=None):
+        """Return list of ordered VIFs attached to instance.
+
+        :param context - request context.
+        :param instance - instance we are returning network info for.
+        :param networks - List of networks being attached to an instance.
+                          If value is None this value will be populated
+                          from the existing cached value.
+        :param port_ids - List of port_ids that are being attached to an
+                          instance in order of attachment. If value is None
+                          this value will be populated from the existing
+                          cached value.
+        """
+
         search_opts = {'tenant_id': instance['project_id'],
                        'device_id': instance['uuid'], }
         client = neutronv2.get_client(context, admin=True)
         data = client.list_ports(**search_opts)
-        ports = data.get('ports', [])
-        if networks is None:
-            # retrieve networks from info_cache to get correct nic order
-            network_cache = self.conductor_api.instance_get_by_uuid(
-                context, instance['uuid'])['info_cache']['network_info']
-            network_cache = jsonutils.loads(network_cache)
-            net_ids = [iface['network']['id'] for iface in network_cache]
-            networks = self._get_available_networks(context,
-                                                    instance['project_id'])
 
-        # ensure ports are in preferred network order, and filter out
-        # those not attached to one of the provided list of networks
-        else:
-            net_ids = [n['id'] for n in networks]
-        ports = [port for port in ports if port['network_id'] in net_ids]
-        _ensure_requested_network_ordering(lambda x: x['network_id'],
-                                           ports, net_ids)
-
+        current_neutron_ports = data.get('ports', [])
+        networks, port_ids = self._gather_port_ids_and_networks(
+                context, instance, networks, port_ids)
         nw_info = network_model.NetworkInfo()
-        for port in ports:
-            network_IPs = self._nw_info_get_ips(client, port)
-            subnets = self._nw_info_get_subnets(context, port, network_IPs)
 
-            devname = "tap" + port['id']
-            devname = devname[:network_model.NIC_NAME_LEN]
+        for current_neutron_port in current_neutron_ports:
+            if current_neutron_port['id'] in port_ids:
+                vif_active = False
+                if (current_neutron_port['admin_state_up'] is False
+                    or current_neutron_port['status'] == 'ACTIVE'):
+                    vif_active = True
 
-            network, ovs_interfaceid = self._nw_info_build_network(port,
-                                                                   networks,
-                                                                   subnets)
+                network_IPs = self._nw_info_get_ips(client,
+                                                    current_neutron_port)
+                subnets = self._nw_info_get_subnets(context,
+                                                    current_neutron_port,
+                                                    network_IPs)
 
-            nw_info.append(network_model.VIF(
-                id=port['id'],
-                address=port['mac_address'],
-                network=network,
-                type=port.get('binding:vif_type'),
-                ovs_interfaceid=ovs_interfaceid,
-                devname=devname))
+                devname = "tap" + current_neutron_port['id']
+                devname = devname[:network_model.NIC_NAME_LEN]
+
+                network, ovs_interfaceid = (
+                    self._nw_info_build_network(current_neutron_port,
+                                                networks, subnets))
+
+                nw_info.append(network_model.VIF(
+                    id=current_neutron_port['id'],
+                    address=current_neutron_port['mac_address'],
+                    network=network,
+                    type=current_neutron_port.get('binding:vif_type'),
+                    ovs_interfaceid=ovs_interfaceid,
+                    devname=devname,
+                    active=vif_active))
+
         return nw_info
 
     def _get_subnets_from_port(self, context, port):

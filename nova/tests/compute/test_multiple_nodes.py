@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 NTT DOCOMO, INC.
 # All Rights Reserved.
 #
@@ -43,7 +41,7 @@ class FakeDriverSingleNodeTestCase(BaseTestCase):
 
     def test_get_host_stats(self):
         stats = self.driver.get_host_stats()
-        self.assertTrue(isinstance(stats, dict))
+        self.assertIsInstance(stats, dict)
         self.assertEqual(stats['hypervisor_hostname'], 'xyz')
 
     def test_get_available_resource(self):
@@ -59,7 +57,7 @@ class FakeDriverMultiNodeTestCase(BaseTestCase):
 
     def test_get_host_stats(self):
         stats = self.driver.get_host_stats()
-        self.assertTrue(isinstance(stats, list))
+        self.assertIsInstance(stats, list)
         self.assertEqual(len(stats), 2)
         self.assertEqual(stats[0]['hypervisor_hostname'], 'aaa')
         self.assertEqual(stats[1]['hypervisor_hostname'], 'bbb')

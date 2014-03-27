@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010-2011 OpenStack Foundation
 # Copyright 2011 Piston Cloud Computing, Inc.
 # All Rights Reserved.
@@ -18,24 +16,23 @@
 
 import base64
 import datetime
-import mox
-import testtools
-import urlparse
 import uuid
 
 import iso8601
-from lxml import etree
+import mox
 from oslo.config import cfg
+import six.moves.urllib.parse as urlparse
+import testtools
 import webob
 
 from nova.api.openstack import compute
 from nova.api.openstack.compute import plugins
-from nova.api.openstack.compute.plugins.v3 import availability_zone
+from nova.api.openstack.compute.plugins.v3 import access_ips
 from nova.api.openstack.compute.plugins.v3 import ips
 from nova.api.openstack.compute.plugins.v3 import keypairs
 from nova.api.openstack.compute.plugins.v3 import servers
 from nova.api.openstack.compute import views
-from nova.api.openstack import xmlutil
+from nova.api.openstack import extensions
 from nova.compute import api as compute_api
 from nova.compute import flavors
 from nova.compute import task_states
@@ -51,7 +48,7 @@ from nova.objects import instance as instance_obj
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import jsonutils
 from nova.openstack.common import policy as common_policy
-from nova.openstack.common import rpc
+from nova.openstack.common import timeutils
 from nova import policy
 from nova import test
 from nova.tests.api.openstack import fakes
@@ -59,19 +56,12 @@ from nova.tests import fake_instance
 from nova.tests import fake_network
 from nova.tests.image import fake
 from nova.tests import matchers
-from nova.tests import utils
+from nova import utils as nova_utils
 
 CONF = cfg.CONF
 CONF.import_opt('password_length', 'nova.utils')
-CONF.import_opt('scheduler_topic', 'nova.scheduler.rpcapi')
 
 FAKE_UUID = fakes.FAKE_UUID
-NS = "{http://docs.openstack.org/compute/api/v1.1}"
-ATOMNS = "{http://www.w3.org/2005/Atom}"
-XPATH_NS = {
-    'atom': 'http://www.w3.org/2005/Atom',
-    'ns': 'http://docs.openstack.org/compute/api/v1.1'
-}
 
 INSTANCE_IDS = {FAKE_UUID: 1}
 FIELDS = instance_obj.INSTANCE_DEFAULT_FIELDS
@@ -85,15 +75,21 @@ def return_servers_empty(context, *args, **kwargs):
     return []
 
 
-def return_security_group(context, instance_id, security_group_id):
-    pass
+def instance_update_and_get_original(context, instance_uuid, values,
+                                     update_cells=True,
+                                     columns_to_join=None,
+                                     ):
+    inst = fakes.stub_instance(INSTANCE_IDS.get(instance_uuid),
+                               name=values.get('display_name'))
+    inst = dict(inst, **values)
+    return (inst, inst)
 
 
 def instance_update(context, instance_uuid, values, update_cells=True):
     inst = fakes.stub_instance(INSTANCE_IDS.get(instance_uuid),
                                name=values.get('display_name'))
     inst = dict(inst, **values)
-    return (inst, inst)
+    return inst
 
 
 def fake_compute_api(cls, req, id):
@@ -104,7 +100,14 @@ def fake_start_stop_not_ready(self, context, instance):
     raise exception.InstanceNotReady(instance_id=instance["uuid"])
 
 
-def fake_instance_get_by_uuid_not_found(context, uuid, columns_to_join):
+def fake_start_stop_invalid_state(self, context, instance):
+    raise exception.InstanceInvalidState(
+        instance_uuid=instance['uuid'], attr='fake_attr',
+        method='fake_method', state='fake_state')
+
+
+def fake_instance_get_by_uuid_not_found(context, uuid,
+                                        columns_to_join, use_slave=False):
     raise exception.InstanceNotFound(instance_id=uuid)
 
 
@@ -144,14 +147,14 @@ class Base64ValidationTest(test.TestCase):
     def test_decode_base64_invalid(self):
         invalid = "A random string"
         result = self.controller._decode_base64(invalid)
-        self.assertEqual(result, None)
+        self.assertIsNone(result)
 
     def test_decode_base64_illegal_bytes(self):
         value = "A random string"
         encoded = base64.b64encode(value)
         white = ">\x01%s*%s()" % (encoded[:2], encoded[2:])
         result = self.controller._decode_base64(white)
-        self.assertEqual(result, None)
+        self.assertIsNone(result)
 
 
 class NeutronV2Subclass(neutron_api.API):
@@ -173,46 +176,43 @@ class ControllerTest(test.TestCase):
                        return_servers)
         self.stubs.Set(db, 'instance_get_by_uuid',
                        return_server)
-        self.stubs.Set(db, 'instance_add_security_group',
-                       return_security_group)
         self.stubs.Set(db, 'instance_update_and_get_original',
-                       instance_update)
+                       instance_update_and_get_original)
 
         ext_info = plugins.LoadedExtensionInfo()
         self.controller = servers.ServersController(extension_info=ext_info)
         self.ips_controller = ips.IPsController()
         policy.reset()
         policy.init()
-        fake_network.stub_out_nw_api_get_instance_nw_info(self.stubs,
-                                                          spectacular=True)
+        fake_network.stub_out_nw_api_get_instance_nw_info(self.stubs)
 
 
 class ServersControllerTest(ControllerTest):
 
-        #    def test_can_check_loaded_extensions(self):
-        #self.ext_mgr.extensions = {'os-fake': None}
-        #self.assertTrue(self.controller.ext_mgr.is_loaded('os-fake'))
-        #self.assertFalse(self.controller.ext_mgr.is_loaded('os-not-loaded'))
+    def setUp(self):
+        super(ServersControllerTest, self).setUp()
+        CONF.set_override('glance_host', 'localhost')
+        nova_utils.reset_is_neutron()
 
     def test_requested_networks_prefix(self):
         uuid = 'br-00000000-0000-0000-0000-000000000000'
         requested_networks = [{'uuid': uuid}]
         res = self.controller._get_requested_networks(requested_networks)
-        self.assertTrue((uuid, None) in res)
+        self.assertIn((uuid, None), res)
 
     def test_requested_networks_neutronv2_enabled_with_port(self):
         self.flags(network_api_class='nova.network.neutronv2.api.API')
         port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
         requested_networks = [{'port': port}]
         res = self.controller._get_requested_networks(requested_networks)
-        self.assertEquals(res, [(None, None, port)])
+        self.assertEqual(res, [(None, None, port)])
 
     def test_requested_networks_neutronv2_enabled_with_network(self):
         self.flags(network_api_class='nova.network.neutronv2.api.API')
         network = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
         requested_networks = [{'uuid': network}]
         res = self.controller._get_requested_networks(requested_networks)
-        self.assertEquals(res, [(network, None, None)])
+        self.assertEqual(res, [(network, None, None)])
 
     def test_requested_networks_neutronv2_enabled_with_network_and_port(self):
         self.flags(network_api_class='nova.network.neutronv2.api.API')
@@ -220,7 +220,7 @@ class ServersControllerTest(ControllerTest):
         port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
         requested_networks = [{'uuid': network, 'port': port}]
         res = self.controller._get_requested_networks(requested_networks)
-        self.assertEquals(res, [(None, None, port)])
+        self.assertEqual(res, [(None, None, port)])
 
     def test_requested_networks_neutronv2_enabled_conflict_on_fixed_ip(self):
         self.flags(network_api_class='nova.network.neutronv2.api.API')
@@ -249,7 +249,7 @@ class ServersControllerTest(ControllerTest):
         port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
         requested_networks = [{'uuid': network, 'port': port}]
         res = self.controller._get_requested_networks(requested_networks)
-        self.assertEquals(res, [(None, None, port)])
+        self.assertEqual(res, [(None, None, port)])
 
     def test_requested_networks_neutronv2_subclass_with_port(self):
         cls = 'nova.tests.api.openstack.compute.test_servers.NeutronV2Subclass'
@@ -257,12 +257,27 @@ class ServersControllerTest(ControllerTest):
         port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
         requested_networks = [{'port': port}]
         res = self.controller._get_requested_networks(requested_networks)
-        self.assertEquals(res, [(None, None, port)])
+        self.assertEqual(res, [(None, None, port)])
 
     def test_get_server_by_uuid(self):
         req = fakes.HTTPRequestV3.blank('/servers/%s' % FAKE_UUID)
         res_dict = self.controller.show(req, FAKE_UUID)
         self.assertEqual(res_dict['server']['id'], FAKE_UUID)
+
+    def test_get_server_joins_pci_devices(self):
+        self.expected_attrs = None
+
+        def fake_get(_self, *args, **kwargs):
+            self.expected_attrs = kwargs['expected_attrs']
+            ctxt = context.RequestContext('fake', 'fake')
+            return fake_instance.fake_instance_obj(ctxt)
+
+        self.stubs.Set(compute_api.API, 'get', fake_get)
+
+        req = fakes.HTTPRequestV3.blank('/servers/%s' % FAKE_UUID)
+        self.controller.show(req, FAKE_UUID)
+
+        self.assertIn('pci_devices', self.expected_attrs)
 
     def test_unique_host_id(self):
         """Create two servers with the same host and different
@@ -286,27 +301,18 @@ class ServersControllerTest(ControllerTest):
         self.assertNotEqual(server1['server']['host_id'],
                             server2['server']['host_id'])
 
-    def test_get_server_by_id(self):
-        self.flags(use_ipv6=True)
-        image_bookmark = "http://localhost/images/10"
-        flavor_bookmark = "http://localhost/flavors/1"
-
-        uuid = FAKE_UUID
-        req = fakes.HTTPRequestV3.blank('/servers/%s' % uuid)
-        res_dict = self.controller.show(req, uuid)
-
-        expected_server = {
+    def _get_server_data_dict(self, uuid, image_bookmark, flavor_bookmark,
+                              status="ACTIVE", progress=100):
+        return {
             "server": {
                 "id": uuid,
                 "user_id": "fake_user",
                 "tenant_id": "fake_project",
                 "updated": "2010-11-11T11:00:00Z",
                 "created": "2010-10-10T12:00:00Z",
-                "progress": 0,
+                "progress": progress,
                 "name": "server1",
-                "status": "BUILD",
-                "access_ip_v4": "",
-                "access_ip_v6": "",
+                "status": status,
                 "host_id": '',
                 "image": {
                     "id": "10",
@@ -320,7 +326,7 @@ class ServersControllerTest(ControllerTest):
                 "flavor": {
                     "id": "1",
                   "links": [
-                                            {
+                      {
                           "rel": "bookmark",
                           "href": flavor_bookmark,
                       },
@@ -350,10 +356,25 @@ class ServersControllerTest(ControllerTest):
             }
         }
 
+    def test_get_server_by_id(self):
+        self.flags(use_ipv6=True)
+        image_bookmark = "http://localhost:9292/images/10"
+        flavor_bookmark = "http://localhost/flavors/1"
+
+        uuid = FAKE_UUID
+        req = fakes.HTTPRequestV3.blank('/servers/%s' % uuid)
+        res_dict = self.controller.show(req, uuid)
+
+        expected_server = self._get_server_data_dict(uuid,
+                                                     image_bookmark,
+                                                     flavor_bookmark,
+                                                     status="BUILD",
+                                                     progress=0)
+
         self.assertThat(res_dict, matchers.DictMatches(expected_server))
 
     def test_get_server_with_active_status_by_id(self):
-        image_bookmark = "http://localhost/images/10"
+        image_bookmark = "http://localhost:9292/images/10"
         flavor_bookmark = "http://localhost/flavors/1"
 
         new_return_server = fakes.fake_instance_get(
@@ -363,66 +384,14 @@ class ServersControllerTest(ControllerTest):
         uuid = FAKE_UUID
         req = fakes.HTTPRequestV3.blank('/servers/%s' % uuid)
         res_dict = self.controller.show(req, uuid)
-        expected_server = {
-            "server": {
-                "id": uuid,
-                "user_id": "fake_user",
-                "tenant_id": "fake_project",
-                "updated": "2010-11-11T11:00:00Z",
-                "created": "2010-10-10T12:00:00Z",
-                "progress": 100,
-                "name": "server1",
-                "status": "ACTIVE",
-                "access_ip_v4": "",
-                "access_ip_v6": "",
-                "host_id": '',
-                "image": {
-                    "id": "10",
-                    "links": [
-                        {
-                            "rel": "bookmark",
-                            "href": image_bookmark,
-                        },
-                    ],
-                },
-                "flavor": {
-                    "id": "1",
-                  "links": [
-                      {
-                          "rel": "bookmark",
-                          "href": flavor_bookmark,
-                      },
-                  ],
-                },
-                "addresses": {
-                    'test1': [
-                        {'version': 4, 'addr': '192.168.1.100',
-                         'type': 'fixed', 'mac_addr': 'aa:aa:aa:aa:aa:aa'},
-                        {'version': 6, 'addr': '2001:db8:0:1::1',
-                         'type': 'fixed', 'mac_addr': 'aa:aa:aa:aa:aa:aa'},
-                    ]
-                },
-                "metadata": {
-                    "seq": "1",
-                },
-                "links": [
-                    {
-                        "rel": "self",
-                        "href": "http://localhost/v3/servers/%s" % uuid,
-                    },
-                    {
-                        "rel": "bookmark",
-                        "href": "http://localhost/servers/%s" % uuid,
-                    },
-                ],
-            }
-        }
-
+        expected_server = self._get_server_data_dict(uuid,
+                                                     image_bookmark,
+                                                     flavor_bookmark)
         self.assertThat(res_dict, matchers.DictMatches(expected_server))
 
     def test_get_server_with_id_image_ref_by_id(self):
         image_ref = "10"
-        image_bookmark = "http://localhost/images/10"
+        image_bookmark = "http://localhost:9292/images/10"
         flavor_id = "1"
         flavor_bookmark = "http://localhost/flavors/1"
 
@@ -434,60 +403,9 @@ class ServersControllerTest(ControllerTest):
         uuid = FAKE_UUID
         req = fakes.HTTPRequestV3.blank('/servers/%s' % uuid)
         res_dict = self.controller.show(req, uuid)
-        expected_server = {
-            "server": {
-                "id": uuid,
-                "user_id": "fake_user",
-                "tenant_id": "fake_project",
-                "updated": "2010-11-11T11:00:00Z",
-                "created": "2010-10-10T12:00:00Z",
-                "progress": 100,
-                "name": "server1",
-                "status": "ACTIVE",
-                "access_ip_v4": "",
-                "access_ip_v6": "",
-                "host_id": '',
-                "image": {
-                    "id": "10",
-                    "links": [
-                        {
-                            "rel": "bookmark",
-                            "href": image_bookmark,
-                        },
-                    ],
-                },
-                "flavor": {
-                    "id": "1",
-                  "links": [
-                      {
-                          "rel": "bookmark",
-                          "href": flavor_bookmark,
-                      },
-                  ],
-                },
-                "addresses": {
-                    'test1': [
-                        {'version': 4, 'addr': '192.168.1.100',
-                         'type': 'fixed', 'mac_addr': 'aa:aa:aa:aa:aa:aa'},
-                        {'version': 6, 'addr': '2001:db8:0:1::1',
-                         'type': 'fixed', 'mac_addr': 'aa:aa:aa:aa:aa:aa'},
-                    ]
-                },
-                "metadata": {
-                    "seq": "1",
-                },
-                "links": [
-                    {
-                        "rel": "self",
-                        "href": "http://localhost/v3/servers/%s" % uuid,
-                    },
-                    {
-                        "rel": "bookmark",
-                        "href": "http://localhost/servers/%s" % uuid,
-                    },
-                ],
-            }
-        }
+        expected_server = self._get_server_data_dict(uuid,
+                                                     image_bookmark,
+                                                     flavor_bookmark)
 
         self.assertThat(res_dict, matchers.DictMatches(expected_server))
 
@@ -612,7 +530,7 @@ class ServersControllerTest(ControllerTest):
         for i, s in enumerate(res_dict['servers']):
             self.assertEqual(s['id'], fakes.get_fake_uuid(i))
             self.assertEqual(s['name'], 'server%d' % (i + 1))
-            self.assertEqual(s.get('image', None), None)
+            self.assertIsNone(s.get('image', None))
 
             expected_links = [
                 {
@@ -654,7 +572,7 @@ class ServersControllerTest(ControllerTest):
                        return_servers_empty)
 
         req = fakes.HTTPRequestV3.blank('/servers/detail')
-        res_dict = self.controller.index(req)
+        res_dict = self.controller.detail(req)
 
         num_servers = len(res_dict['servers'])
         self.assertEqual(0, num_servers)
@@ -703,7 +621,7 @@ class ServersControllerTest(ControllerTest):
     def test_get_servers_with_too_big_limit(self):
         req = fakes.HTTPRequestV3.blank('/servers?limit=30')
         res_dict = self.controller.index(req)
-        self.assertTrue('servers_links' not in res_dict)
+        self.assertNotIn('servers_links', res_dict)
 
     def test_get_servers_with_bad_limit(self):
         req = fakes.HTTPRequestV3.blank('/servers?limit=asdf')
@@ -732,7 +650,8 @@ class ServersControllerTest(ControllerTest):
 
         def fake_get_all(compute_self, context, search_opts=None,
                          sort_key=None, sort_dir='desc',
-                         limit=None, marker=None, want_objects=False):
+                         limit=None, marker=None, want_objects=False,
+                         expected_attrs=[]):
             db_list = [fakes.stub_instance(100, uuid=server_uuid)]
             return instance_obj._make_instance_list(
                 context, instance_obj.InstanceList(), db_list, FIELDS)
@@ -750,9 +669,10 @@ class ServersControllerTest(ControllerTest):
 
         def fake_get_all(compute_self, context, search_opts=None,
                          sort_key=None, sort_dir='desc',
-                         limit=None, marker=None, want_objects=False):
-            self.assertNotEqual(search_opts, None)
-            self.assertTrue('image' in search_opts)
+                         limit=None, marker=None, want_objects=False,
+                         expected_attrs=[]):
+            self.assertIsNotNone(search_opts)
+            self.assertIn('image', search_opts)
             self.assertEqual(search_opts['image'], '12345')
             db_list = [fakes.stub_instance(100, uuid=server_uuid)]
             return instance_obj._make_instance_list(
@@ -769,26 +689,151 @@ class ServersControllerTest(ControllerTest):
     def test_tenant_id_filter_converts_to_project_id_for_admin(self):
         def fake_get_all(context, filters=None, sort_key=None,
                          sort_dir='desc', limit=None, marker=None,
-                         columns_to_join=None):
-            self.assertNotEqual(filters, None)
-            self.assertEqual(filters['project_id'], 'fake')
+                         columns_to_join=None, use_slave=False,
+                         expected_attrs=[]):
+            self.assertIsNotNone(filters)
+            self.assertEqual(filters['project_id'], 'newfake')
             self.assertFalse(filters.get('tenant_id'))
             return [fakes.stub_instance(100)]
 
         self.stubs.Set(db, 'instance_get_all_by_filters',
                        fake_get_all)
 
-        req = fakes.HTTPRequestV3.blank('/servers?tenant_id=fake',
+        req = fakes.HTTPRequestV3.blank('/servers'
+                                     '?all_tenants=1&tenant_id=newfake',
                                       use_admin_context=True)
         res = self.controller.index(req)
 
+        self.assertIn('servers', res)
+
+    def test_tenant_id_filter_no_admin_context(self):
+        def fake_get_all(context, filters=None, sort_key=None,
+                         sort_dir='desc', limit=None, marker=None,
+                         columns_to_join=None, use_slave=False,
+                         expected_attrs=[]):
+            self.assertNotEqual(filters, None)
+            self.assertEqual(filters['project_id'], 'fake')
+            return [fakes.stub_instance(100)]
+
+        self.stubs.Set(db, 'instance_get_all_by_filters',
+                       fake_get_all)
+
+        req = fakes.HTTPRequestV3.blank('/servers?tenant_id=newfake')
+        res = self.controller.index(req)
         self.assertTrue('servers' in res)
+
+    def test_tenant_id_filter_implies_all_tenants(self):
+        def fake_get_all(context, filters=None, sort_key=None,
+                         sort_dir='desc', limit=None, marker=None,
+                         columns_to_join=None, use_slave=False,
+                         expected_attrs=[]):
+            self.assertNotEqual(filters, None)
+            # The project_id assertion checks that the project_id
+            # filter is set to that specified in the request url and
+            # not that of the context, verifying that the all_tenants
+            # flag was enabled
+            self.assertEqual(filters['project_id'], 'newfake')
+            self.assertFalse(filters.get('tenant_id'))
+            return [fakes.stub_instance(100)]
+
+        self.stubs.Set(db, 'instance_get_all_by_filters',
+                       fake_get_all)
+
+        req = fakes.HTTPRequestV3.blank('/servers?tenant_id=newfake',
+                                      use_admin_context=True)
+        res = self.controller.index(req)
+        self.assertTrue('servers' in res)
+
+    def test_all_tenants_param_normal(self):
+        def fake_get_all(context, filters=None, sort_key=None,
+                         sort_dir='desc', limit=None, marker=None,
+                         columns_to_join=None, use_slave=False,
+                         expected_attrs=[]):
+            self.assertNotIn('project_id', filters)
+            return [fakes.stub_instance(100)]
+
+        self.stubs.Set(db, 'instance_get_all_by_filters',
+                       fake_get_all)
+
+        req = fakes.HTTPRequestV3.blank('/servers?all_tenants',
+                                      use_admin_context=True)
+        res = self.controller.index(req)
+
+        self.assertIn('servers', res)
+
+    def test_all_tenants_param_one(self):
+        def fake_get_all(context, filters=None, sort_key=None,
+                         sort_dir='desc', limit=None, marker=None,
+                         columns_to_join=None, use_slave=False,
+                         expected_attrs=[]):
+            self.assertNotIn('project_id', filters)
+            return [fakes.stub_instance(100)]
+
+        self.stubs.Set(db, 'instance_get_all_by_filters',
+                       fake_get_all)
+
+        req = fakes.HTTPRequestV3.blank('/servers?all_tenants=1',
+                                      use_admin_context=True)
+        res = self.controller.index(req)
+
+        self.assertIn('servers', res)
+
+    def test_all_tenants_param_zero(self):
+        def fake_get_all(context, filters=None, sort_key=None,
+                         sort_dir='desc', limit=None, marker=None,
+                         columns_to_join=None, use_slave=False,
+                         expected_attrs=[]):
+            self.assertNotIn('all_tenants', filters)
+            return [fakes.stub_instance(100)]
+
+        self.stubs.Set(db, 'instance_get_all_by_filters',
+                       fake_get_all)
+
+        req = fakes.HTTPRequestV3.blank('/servers?all_tenants=0',
+                                      use_admin_context=True)
+        res = self.controller.index(req)
+
+        self.assertIn('servers', res)
+
+    def test_all_tenants_param_false(self):
+        def fake_get_all(context, filters=None, sort_key=None,
+                         sort_dir='desc', limit=None, marker=None,
+                         columns_to_join=None, use_slave=False,
+                         expected_attrs=[]):
+            self.assertNotIn('all_tenants', filters)
+            return [fakes.stub_instance(100)]
+
+        self.stubs.Set(db, 'instance_get_all_by_filters',
+                       fake_get_all)
+
+        req = fakes.HTTPRequestV3.blank('/servers?all_tenants=false',
+                                      use_admin_context=True)
+        res = self.controller.index(req)
+
+        self.assertIn('servers', res)
+
+    def test_all_tenants_param_invalid(self):
+        def fake_get_all(context, filters=None, sort_key=None,
+                         sort_dir='desc', limit=None, marker=None,
+                         columns_to_join=None,
+                         expected_attrs=[]):
+            self.assertNotIn('all_tenants', filters)
+            return [fakes.stub_instance(100)]
+
+        self.stubs.Set(db, 'instance_get_all_by_filters',
+                       fake_get_all)
+
+        req = fakes.HTTPRequestV3.blank('/servers?all_tenants=xxx',
+                                      use_admin_context=True)
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self.controller.index, req)
 
     def test_admin_restricted_tenant(self):
         def fake_get_all(context, filters=None, sort_key=None,
                          sort_dir='desc', limit=None, marker=None,
-                         columns_to_join=None):
-            self.assertNotEqual(filters, None)
+                         columns_to_join=None, use_slave=False,
+                         expected_attrs=[]):
+            self.assertIsNotNone(filters)
             self.assertEqual(filters['project_id'], 'fake')
             return [fakes.stub_instance(100)]
 
@@ -799,14 +844,15 @@ class ServersControllerTest(ControllerTest):
                                       use_admin_context=True)
         res = self.controller.index(req)
 
-        self.assertTrue('servers' in res)
+        self.assertIn('servers', res)
 
     def test_all_tenants_pass_policy(self):
         def fake_get_all(context, filters=None, sort_key=None,
                          sort_dir='desc', limit=None, marker=None,
-                         columns_to_join=None):
-            self.assertNotEqual(filters, None)
-            self.assertTrue('project_id' not in filters)
+                         columns_to_join=None, use_slave=False,
+                         expected_attrs=[]):
+            self.assertIsNotNone(filters)
+            self.assertNotIn('project_id', filters)
             return [fakes.stub_instance(100)]
 
         self.stubs.Set(db, 'instance_get_all_by_filters',
@@ -824,13 +870,13 @@ class ServersControllerTest(ControllerTest):
         req = fakes.HTTPRequestV3.blank('/servers?all_tenants=1')
         res = self.controller.index(req)
 
-        self.assertTrue('servers' in res)
+        self.assertIn('servers', res)
 
     def test_all_tenants_fail_policy(self):
         def fake_get_all(context, filters=None, sort_key=None,
                          sort_dir='desc', limit=None, marker=None,
                          columns_to_join=None):
-            self.assertNotEqual(filters, None)
+            self.assertIsNotNone(filters)
             return [fakes.stub_instance(100)]
 
         rules = {
@@ -853,9 +899,10 @@ class ServersControllerTest(ControllerTest):
 
         def fake_get_all(compute_self, context, search_opts=None,
                          sort_key=None, sort_dir='desc',
-                         limit=None, marker=None, want_objects=False):
-            self.assertNotEqual(search_opts, None)
-            self.assertTrue('flavor' in search_opts)
+                         limit=None, marker=None, want_objects=False,
+                         expected_attrs=[]):
+            self.assertIsNotNone(search_opts)
+            self.assertIn('flavor', search_opts)
             # flavor is an integer ID
             self.assertEqual(search_opts['flavor'], '12345')
             db_list = [fakes.stub_instance(100, uuid=server_uuid)]
@@ -876,15 +923,22 @@ class ServersControllerTest(ControllerTest):
 
         self.assertEqual(len(servers), 0)
 
+    def test_get_server_details_with_bad_flavor(self):
+        req = fakes.HTTPRequestV3.blank('/servers?flavor=abcde')
+        servers = self.controller.detail(req)['servers']
+
+        self.assertThat(servers, testtools.matchers.HasLength(0))
+
     def test_get_servers_allows_status(self):
         server_uuid = str(uuid.uuid4())
 
         def fake_get_all(compute_self, context, search_opts=None,
                          sort_key=None, sort_dir='desc',
-                         limit=None, marker=None, want_objects=False):
-            self.assertNotEqual(search_opts, None)
-            self.assertTrue('vm_state' in search_opts)
-            self.assertEqual(search_opts['vm_state'], vm_states.ACTIVE)
+                         limit=None, marker=None, want_objects=False,
+                         expected_attrs=[]):
+            self.assertIsNotNone(search_opts)
+            self.assertIn('vm_state', search_opts)
+            self.assertEqual(search_opts['vm_state'], [vm_states.ACTIVE])
             db_list = [fakes.stub_instance(100, uuid=server_uuid)]
             return instance_obj._make_instance_list(
                 context, instance_obj.InstanceList(), db_list, FIELDS)
@@ -894,6 +948,57 @@ class ServersControllerTest(ControllerTest):
         req = fakes.HTTPRequestV3.blank('/servers?status=active')
         servers = self.controller.index(req)['servers']
 
+        self.assertEqual(len(servers), 1)
+        self.assertEqual(servers[0]['id'], server_uuid)
+
+    def test_get_servers_allows_task_status(self):
+        server_uuid = str(uuid.uuid4())
+        task_state = task_states.REBOOTING
+
+        def fake_get_all(compute_self, context, search_opts=None,
+                         sort_key=None, sort_dir='desc',
+                         limit=None, marker=None, want_objects=False,
+                         expected_attrs=[]):
+            self.assertIsNotNone(search_opts)
+            self.assertIn('task_state', search_opts)
+            self.assertEqual([task_states.REBOOT_PENDING,
+                              task_states.REBOOT_STARTED,
+                              task_states.REBOOTING],
+                             search_opts['task_state'])
+            db_list = [fakes.stub_instance(100, uuid=server_uuid,
+                                                task_state=task_state)]
+            return instance_obj._make_instance_list(
+                context, instance_obj.InstanceList(), db_list, FIELDS)
+
+        self.stubs.Set(compute_api.API, 'get_all', fake_get_all)
+
+        req = fakes.HTTPRequestV3.blank('/servers?status=reboot')
+        servers = self.controller.index(req)['servers']
+
+        self.assertEqual(len(servers), 1)
+        self.assertEqual(servers[0]['id'], server_uuid)
+
+    def test_get_servers_resize_status(self):
+        # Test when resize status, it maps list of vm states.
+        server_uuid = str(uuid.uuid4())
+
+        def fake_get_all(compute_self, context, search_opts=None,
+                         sort_key=None, sort_dir='desc',
+                         limit=None, marker=None, want_objects=False,
+                         expected_attrs=[]):
+            self.assertIn('vm_state', search_opts)
+            self.assertEqual(search_opts['vm_state'],
+                             [vm_states.ACTIVE, vm_states.STOPPED])
+
+            db_list = [fakes.stub_instance(100, uuid=server_uuid)]
+            return instance_obj._make_instance_list(
+                context, instance_obj.InstanceList(), db_list, FIELDS)
+
+        self.stubs.Set(compute_api.API, 'get_all', fake_get_all)
+
+        req = fakes.HTTPRequestV3.blank('/servers?status=resize')
+
+        servers = self.controller.detail(req)['servers']
         self.assertEqual(len(servers), 1)
         self.assertEqual(servers[0]['id'], server_uuid)
 
@@ -915,9 +1020,10 @@ class ServersControllerTest(ControllerTest):
 
         def fake_get_all(compute_self, context, search_opts=None,
                          sort_key=None, sort_dir='desc',
-                         limit=None, marker=None, want_objects=False):
-            self.assertTrue('vm_state' in search_opts)
-            self.assertEqual(search_opts['vm_state'], 'deleted')
+                         limit=None, marker=None, want_objects=False,
+                         expected_attrs=[]):
+            self.assertIn('vm_state', search_opts)
+            self.assertEqual(search_opts['vm_state'], ['deleted'])
 
             db_list = [fakes.stub_instance(100, uuid=server_uuid)]
             return instance_obj._make_instance_list(
@@ -937,9 +1043,10 @@ class ServersControllerTest(ControllerTest):
 
         def fake_get_all(compute_self, context, search_opts=None,
                          sort_key=None, sort_dir='desc',
-                         limit=None, marker=None, want_objects=False):
-            self.assertNotEqual(search_opts, None)
-            self.assertTrue('name' in search_opts)
+                         limit=None, marker=None, want_objects=False,
+                         expected_attrs=[]):
+            self.assertIsNotNone(search_opts)
+            self.assertIn('name', search_opts)
             self.assertEqual(search_opts['name'], 'whee.*')
             db_list = [fakes.stub_instance(100, uuid=server_uuid)]
             return instance_obj._make_instance_list(
@@ -958,13 +1065,14 @@ class ServersControllerTest(ControllerTest):
 
         def fake_get_all(compute_self, context, search_opts=None,
                          sort_key=None, sort_dir='desc',
-                         limit=None, marker=None, want_objects=False):
-            self.assertNotEqual(search_opts, None)
-            self.assertTrue('changes_since' in search_opts)
+                         limit=None, marker=None, want_objects=False,
+                         expected_attrs=[]):
+            self.assertIsNotNone(search_opts)
+            self.assertIn('changes-since', search_opts)
             changes_since = datetime.datetime(2011, 1, 24, 17, 8, 1,
                                               tzinfo=iso8601.iso8601.UTC)
-            self.assertEqual(search_opts['changes_since'], changes_since)
-            self.assertTrue('deleted' not in search_opts)
+            self.assertEqual(search_opts['changes-since'], changes_since)
+            self.assertNotIn('deleted', search_opts)
             db_list = [fakes.stub_instance(100, uuid=server_uuid)]
             return instance_obj._make_instance_list(
                 context, instance_obj.InstanceList(), db_list, FIELDS)
@@ -992,15 +1100,16 @@ class ServersControllerTest(ControllerTest):
 
         def fake_get_all(compute_self, context, search_opts=None,
                          sort_key=None, sort_dir='desc',
-                         limit=None, marker=None, want_objects=False):
-            self.assertNotEqual(search_opts, None)
+                         limit=None, marker=None, want_objects=False,
+                         expected_attrs=[]):
+            self.assertIsNotNone(search_opts)
             # Allowed by user
-            self.assertTrue('name' in search_opts)
-            self.assertTrue('ip' in search_opts)
+            self.assertIn('name', search_opts)
+            self.assertIn('ip', search_opts)
             # OSAPI converts status to vm_state
-            self.assertTrue('vm_state' in search_opts)
+            self.assertIn('vm_state', search_opts)
             # Allowed only by admins with admin API on
-            self.assertFalse('unknown_option' in search_opts)
+            self.assertNotIn('unknown_option', search_opts)
             db_list = [fakes.stub_instance(100, uuid=server_uuid)]
             return instance_obj._make_instance_list(
                 context, instance_obj.InstanceList(), db_list, FIELDS)
@@ -1023,15 +1132,16 @@ class ServersControllerTest(ControllerTest):
 
         def fake_get_all(compute_self, context, search_opts=None,
                          sort_key=None, sort_dir='desc',
-                         limit=None, marker=None, want_objects=False):
-            self.assertNotEqual(search_opts, None)
+                         limit=None, marker=None, want_objects=False,
+                         expected_attrs=[]):
+            self.assertIsNotNone(search_opts)
             # Allowed by user
-            self.assertTrue('name' in search_opts)
+            self.assertIn('name', search_opts)
             # OSAPI converts status to vm_state
-            self.assertTrue('vm_state' in search_opts)
+            self.assertIn('vm_state', search_opts)
             # Allowed only by admins with admin API on
-            self.assertTrue('ip' in search_opts)
-            self.assertTrue('unknown_option' in search_opts)
+            self.assertIn('ip', search_opts)
+            self.assertIn('unknown_option', search_opts)
             db_list = [fakes.stub_instance(100, uuid=server_uuid)]
             return instance_obj._make_instance_list(
                 context, instance_obj.InstanceList(), db_list, FIELDS)
@@ -1053,9 +1163,10 @@ class ServersControllerTest(ControllerTest):
 
         def fake_get_all(compute_self, context, search_opts=None,
                          sort_key=None, sort_dir='desc',
-                         limit=None, marker=None, want_objects=False):
-            self.assertNotEqual(search_opts, None)
-            self.assertTrue('ip' in search_opts)
+                         limit=None, marker=None, want_objects=False,
+                         expected_attrs=[]):
+            self.assertIsNotNone(search_opts)
+            self.assertIn('ip', search_opts)
             self.assertEqual(search_opts['ip'], '10\..*')
             db_list = [fakes.stub_instance(100, uuid=server_uuid)]
             return instance_obj._make_instance_list(
@@ -1077,9 +1188,10 @@ class ServersControllerTest(ControllerTest):
 
         def fake_get_all(compute_self, context, search_opts=None,
                          sort_key=None, sort_dir='desc',
-                         limit=None, marker=None, want_objects=False):
-            self.assertNotEqual(search_opts, None)
-            self.assertTrue('ip6' in search_opts)
+                         limit=None, marker=None, want_objects=False,
+                         expected_attrs=[]):
+            self.assertIsNotNone(search_opts)
+            self.assertIn('ip6', search_opts)
             self.assertEqual(search_opts['ip6'], 'ffff.*')
             db_list = [fakes.stub_instance(100, uuid=server_uuid)]
             return instance_obj._make_instance_list(
@@ -1109,7 +1221,7 @@ class ServersControllerTest(ControllerTest):
             "links": [
                 {
                     "rel": "bookmark",
-                    "href": 'http://localhost/images/10',
+                    "href": 'http://localhost:9292/images/10',
                     },
                 ],
             }
@@ -1126,12 +1238,11 @@ class ServersControllerTest(ControllerTest):
             self.assertEqual(s['metadata']['seq'], str(i + 1))
 
     def test_get_all_server_details_with_host(self):
-        '''
-        We want to make sure that if two instances are on the same host, then
-        they return the same host_id. If two instances are on different hosts,
-        they should return different host_ids. In this test, there are 5
-        instances - 2 on one host and 3 on another.
-        '''
+        """We want to make sure that if two instances are on the same host,
+        then they return the same host_id. If two instances are on different
+        hosts, they should return different host_ids. In this test,
+        there are 5 instances - 2 on one host and 3 on another.
+        """
 
         def return_servers_with_host(context, *args, **kwargs):
             return [fakes.stub_instance(i + 1, 'fake', 'fake', host=i % 2,
@@ -1154,6 +1265,22 @@ class ServersControllerTest(ControllerTest):
             self.assertEqual(s['host_id'], host_ids[i % 2])
             self.assertEqual(s['name'], 'server%d' % (i + 1))
 
+    def test_get_servers_joins_pci_devices(self):
+        self.expected_attrs = None
+
+        def fake_get_all(compute_self, context, search_opts=None,
+                         sort_key=None, sort_dir='desc',
+                         limit=None, marker=None, want_objects=False,
+                         expected_attrs=[]):
+            self.expected_attrs = expected_attrs
+            return []
+
+        self.stubs.Set(compute_api.API, 'get_all', fake_get_all)
+
+        req = fakes.HTTPRequestV3.blank('/servers', use_admin_context=True)
+        servers = self.controller.index(req)['servers']
+        self.assertIn('pci_devices', self.expected_attrs)
+
 
 class ServersControllerDeleteTest(ControllerTest):
 
@@ -1163,6 +1290,8 @@ class ServersControllerDeleteTest(ControllerTest):
 
         def instance_destroy_mock(*args, **kwargs):
             self.server_delete_called = True
+            deleted_at = timeutils.utcnow()
+            return fake_instance.fake_db_instance(deleted_at=deleted_at)
 
         self.stubs.Set(db, 'instance_destroy', instance_destroy_mock)
 
@@ -1193,6 +1322,16 @@ class ServersControllerDeleteTest(ControllerTest):
 
         self.assertTrue(self.server_delete_called)
 
+    def test_delete_locked_server(self):
+        req = self._create_delete_request(FAKE_UUID)
+        self.stubs.Set(compute_api.API, 'soft_delete',
+                       fakes.fake_actions_to_locked_server)
+        self.stubs.Set(compute_api.API, 'delete',
+                       fakes.fake_actions_to_locked_server)
+
+        self.assertRaises(webob.exc.HTTPConflict, self.controller.delete,
+                          req, FAKE_UUID)
+
     def test_delete_server_instance_while_resize(self):
         req = self._create_delete_request(FAKE_UUID)
         self.stubs.Set(db, 'instance_get_by_uuid',
@@ -1203,6 +1342,27 @@ class ServersControllerDeleteTest(ControllerTest):
         # Delete shoud be allowed in any case, even during resizing,
         # because it may get stuck.
         self.assertTrue(self.server_delete_called)
+
+    def test_delete_server_instance_if_not_launched(self):
+        self.flags(reclaim_instance_interval=3600)
+        req = fakes.HTTPRequestV3.blank('/servers/%s' % FAKE_UUID)
+        req.method = 'DELETE'
+
+        self.server_delete_called = False
+
+        self.stubs.Set(db, 'instance_get_by_uuid',
+            fakes.fake_instance_get(launched_at=None))
+
+        def instance_destroy_mock(*args, **kwargs):
+            self.server_delete_called = True
+            deleted_at = timeutils.utcnow()
+            return fake_instance.fake_db_instance(deleted_at=deleted_at)
+        self.stubs.Set(db, 'instance_destroy', instance_destroy_mock)
+
+        self.controller.delete(req, FAKE_UUID)
+        # delete() should be called for instance which has never been active,
+        # even if reclaim_instance_interval has been set.
+        self.assertEqual(self.server_delete_called, True)
 
 
 class ServersControllerRebuildInstanceTest(ControllerTest):
@@ -1221,56 +1381,34 @@ class ServersControllerRebuildInstanceTest(ControllerTest):
                 'metadata': {
                     'open': 'stack',
                 },
-                'personality': [
-                    {
-                        "path": "/etc/banner.txt",
-                        "contents": "MQ==",
-                    },
-                ],
             },
         }
         self.req = fakes.HTTPRequest.blank('/fake/servers/a/action')
         self.req.method = 'POST'
         self.req.headers["content-type"] = "application/json"
 
-    def test_rebuild_instance_with_access_ipv4_bad_format(self):
-        # proper local hrefs must start with 'http://localhost/v2/'
-        self.body['rebuild']['access_ip_v4'] = 'bad_format'
-        self.body['rebuild']['access_ip_v6'] = 'fead::1234'
-        self.body['rebuild']['metadata']['hello'] = 'world'
-        self.req.body = jsonutils.dumps(self.body)
-        self.assertRaises(webob.exc.HTTPBadRequest,
-                          self.controller._action_rebuild,
-                          self.req, FAKE_UUID, self.body)
-
     def test_rebuild_instance_with_blank_metadata_key(self):
-        self.body['rebuild']['access_ip_v4'] = '0.0.0.0'
-        self.body['rebuild']['access_ip_v6'] = 'fead::1234'
         self.body['rebuild']['metadata'][''] = 'world'
         self.req.body = jsonutils.dumps(self.body)
         self.assertRaises(webob.exc.HTTPBadRequest,
                           self.controller._action_rebuild,
-                          self.req, FAKE_UUID, self.body)
+                          self.req, FAKE_UUID, body=self.body)
 
     def test_rebuild_instance_with_metadata_key_too_long(self):
-        self.body['rebuild']['access_ip_v4'] = '0.0.0.0'
-        self.body['rebuild']['access_ip_v6'] = 'fead::1234'
         self.body['rebuild']['metadata'][('a' * 260)] = 'world'
 
         self.req.body = jsonutils.dumps(self.body)
         self.assertRaises(webob.exc.HTTPRequestEntityTooLarge,
                           self.controller._action_rebuild,
-                          self.req, FAKE_UUID, self.body)
+                          self.req, FAKE_UUID, body=self.body)
 
     def test_rebuild_instance_with_metadata_value_too_long(self):
-        self.body['rebuild']['access_ip_v4'] = '0.0.0.0'
-        self.body['rebuild']['access_ip_v6'] = 'fead::1234'
         self.body['rebuild']['metadata']['key1'] = ('a' * 260)
 
         self.req.body = jsonutils.dumps(self.body)
         self.assertRaises(webob.exc.HTTPRequestEntityTooLarge,
                           self.controller._action_rebuild, self.req,
-                          FAKE_UUID, self.body)
+                          FAKE_UUID, body=self.body)
 
     def test_rebuild_instance_fails_when_min_ram_too_small(self):
         # make min_ram larger than our instance ram size
@@ -1285,7 +1423,7 @@ class ServersControllerRebuildInstanceTest(ControllerTest):
         self.req.body = jsonutils.dumps(self.body)
         self.assertRaises(webob.exc.HTTPBadRequest,
                           self.controller._action_rebuild,
-                          self.req, FAKE_UUID, self.body)
+                          self.req, FAKE_UUID, body=self.body)
 
     def test_rebuild_instance_fails_when_min_disk_too_small(self):
         # make min_disk larger than our instance disk size
@@ -1299,7 +1437,7 @@ class ServersControllerRebuildInstanceTest(ControllerTest):
         self.req.body = jsonutils.dumps(self.body)
         self.assertRaises(webob.exc.HTTPBadRequest,
                           self.controller._action_rebuild, self.req,
-                          FAKE_UUID, self.body)
+                          FAKE_UUID, body=self.body)
 
     def test_rebuild_instance_image_too_large(self):
         # make image size larger than our instance disk size
@@ -1314,7 +1452,19 @@ class ServersControllerRebuildInstanceTest(ControllerTest):
         self.req.body = jsonutils.dumps(self.body)
         self.assertRaises(webob.exc.HTTPBadRequest,
                           self.controller._action_rebuild,
-                          self.req, FAKE_UUID, self.body)
+                          self.req, FAKE_UUID, body=self.body)
+
+    def test_rebuild_instance_name_all_blank(self):
+        def fake_get_image(self, context, image_href):
+            return dict(id='76fa36fc-c930-4bf3-8c8a-ea2a2420deb6',
+                        name='public image', is_public=True, status='active')
+
+        self.stubs.Set(fake._FakeImageService, 'show', fake_get_image)
+        self.body['rebuild']['name'] = '     '
+        self.req.body = jsonutils.dumps(self.body)
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self.controller._action_rebuild,
+                          self.req, FAKE_UUID, body=self.body)
 
     def test_rebuild_instance_with_deleted_image(self):
         def fake_get_image(self, context, image_href):
@@ -1327,17 +1477,7 @@ class ServersControllerRebuildInstanceTest(ControllerTest):
         self.req.body = jsonutils.dumps(self.body)
         self.assertRaises(webob.exc.HTTPBadRequest,
                           self.controller._action_rebuild,
-                          self.req, FAKE_UUID, self.body)
-
-    def test_rebuild_instance_with_access_ipv6_bad_format(self):
-        self.body['rebuild']['access_ip_v4'] = '1.2.3.4'
-        self.body['rebuild']['access_ip_v6'] = 'bad_format'
-        self.body['rebuild']['metadata']['hello'] = 'world'
-        self.req.body = jsonutils.dumps(self.body)
-        self.req.headers["content-type"] = "application/json"
-        self.assertRaises(webob.exc.HTTPBadRequest,
-                          self.controller._action_rebuild,
-                          self.req, FAKE_UUID, self.body)
+                          self.req, FAKE_UUID, body=self.body)
 
     def test_start(self):
         self.mox.StubOutWithMock(compute_api.API, 'start')
@@ -1348,8 +1488,36 @@ class ServersControllerRebuildInstanceTest(ControllerTest):
         body = dict(start="")
         self.controller._start_server(req, FAKE_UUID, body)
 
+    def test_start_policy_failed(self):
+        rules = {
+            "compute:v3:servers:start":
+                common_policy.parse_rule("project_id:non_fake")
+        }
+        common_policy.set_rules(common_policy.Rules(rules))
+        req = fakes.HTTPRequestV3.blank('/servers/%s/action' % FAKE_UUID)
+        body = dict(start="")
+        exc = self.assertRaises(exception.PolicyNotAuthorized,
+                                self.controller._start_server,
+                                req, FAKE_UUID, body)
+        self.assertIn("compute:v3:servers:start", exc.format_message())
+
     def test_start_not_ready(self):
         self.stubs.Set(compute_api.API, 'start', fake_start_stop_not_ready)
+        req = fakes.HTTPRequestV3.blank('/servers/%s/action' % FAKE_UUID)
+        body = dict(start="")
+        self.assertRaises(webob.exc.HTTPConflict,
+            self.controller._start_server, req, FAKE_UUID, body)
+
+    def test_start_locked_server(self):
+        self.stubs.Set(compute_api.API, 'start',
+                       fakes.fake_actions_to_locked_server)
+        req = fakes.HTTPRequestV3.blank('/servers/%s/action' % FAKE_UUID)
+        body = dict(start="")
+        self.assertRaises(webob.exc.HTTPConflict,
+            self.controller._start_server, req, FAKE_UUID, body)
+
+    def test_start_invalid(self):
+        self.stubs.Set(compute_api.API, 'start', fake_start_stop_invalid_state)
         req = fakes.HTTPRequestV3.blank('/servers/%s/action' % FAKE_UUID)
         body = dict(start="")
         self.assertRaises(webob.exc.HTTPConflict,
@@ -1364,8 +1532,36 @@ class ServersControllerRebuildInstanceTest(ControllerTest):
         body = dict(stop="")
         self.controller._stop_server(req, FAKE_UUID, body)
 
+    def test_stop_policy_failed(self):
+        rules = {
+            "compute:v3:servers:stop":
+                common_policy.parse_rule("project_id:non_fake")
+        }
+        common_policy.set_rules(common_policy.Rules(rules))
+        req = fakes.HTTPRequestV3.blank('/servers/%s/action' % FAKE_UUID)
+        body = dict(stop='')
+        exc = self.assertRaises(exception.PolicyNotAuthorized,
+                                self.controller._stop_server,
+                                req, FAKE_UUID, body)
+        self.assertIn("compute:v3:servers:stop", exc.format_message())
+
     def test_stop_not_ready(self):
         self.stubs.Set(compute_api.API, 'stop', fake_start_stop_not_ready)
+        req = fakes.HTTPRequestV3.blank('/servers/%s/action' % FAKE_UUID)
+        body = dict(stop="")
+        self.assertRaises(webob.exc.HTTPConflict,
+            self.controller._stop_server, req, FAKE_UUID, body)
+
+    def test_stop_locked_server(self):
+        self.stubs.Set(compute_api.API, 'stop',
+                       fakes.fake_actions_to_locked_server)
+        req = fakes.HTTPRequestV3.blank('/servers/%s/action' % FAKE_UUID)
+        body = dict(stop="")
+        self.assertRaises(webob.exc.HTTPConflict,
+            self.controller._stop_server, req, FAKE_UUID, body)
+
+    def test_stop_invalid_state(self):
+        self.stubs.Set(compute_api.API, 'stop', fake_start_stop_invalid_state)
         req = fakes.HTTPRequestV3.blank('/servers/%s/action' % FAKE_UUID)
         body = dict(start="")
         self.assertRaises(webob.exc.HTTPConflict,
@@ -1383,7 +1579,7 @@ class ServersControllerRebuildInstanceTest(ControllerTest):
         self.stubs.Set(db, 'instance_get_by_uuid',
                        fake_instance_get_by_uuid_not_found)
         req = fakes.HTTPRequestV3.blank('/servers/test_inst/action')
-        body = dict(start="")
+        body = dict(stop="")
         self.assertRaises(webob.exc.HTTPNotFound,
             self.controller._stop_server, req, 'test_inst', body)
 
@@ -1403,53 +1599,17 @@ class ServersControllerUpdateTest(ControllerTest):
     def test_update_server_all_attributes(self):
         body = {'server': {
                   'name': 'server_test',
-                  'access_ip_v4': '0.0.0.0',
-                  'access_ip_v6': 'beef::0123',
                }}
-        req = self._get_request(body, {'name': 'server_test',
-                                       'access_ipv4': '0.0.0.0',
-                                       'access_ipv6': 'beef::0123'})
-        res_dict = self.controller.update(req, FAKE_UUID, body)
+        req = self._get_request(body, {'name': 'server_test'})
+        res_dict = self.controller.update(req, FAKE_UUID, body=body)
 
         self.assertEqual(res_dict['server']['id'], FAKE_UUID)
         self.assertEqual(res_dict['server']['name'], 'server_test')
-        self.assertEqual(res_dict['server']['access_ip_v4'], '0.0.0.0')
-        self.assertEqual(res_dict['server']['access_ip_v6'], 'beef::123')
-
-    def test_update_server_invalid_xml_raises_lookup(self):
-        req = webob.Request.blank('/v3/servers/%s' % FAKE_UUID)
-        req.method = 'PUT'
-        req.content_type = 'application/xml'
-        #xml request which raises LookupError
-        req.body = """<?xml version="1.0" encoding="TF-8"?>
-            <metadata
-            xmlns="http://docs.openstack.org/compute/api/v1.1"
-            key="Label"></metadata>"""
-        res = req.get_response(fakes.wsgi_app_v3())
-        self.assertEqual(res.status_int, 400)
-        res_dict = jsonutils.loads(res.body)
-        self.assertEqual(res_dict['badRequest']['message'],
-                         "Malformed request body")
-
-    def test_update_server_invalid_xml_raises_expat(self):
-        req = webob.Request.blank('/v3/servers/%s' % FAKE_UUID)
-        req.method = 'PUT'
-        req.content_type = 'application/xml'
-        #xml request which raises ExpatError
-        req.body = """<?xml version="1.0" encoding="UTF-8"?>
-            <metadata
-            xmlns="http://docs.openstack.org/compute/api/v1.1"
-            key="Label"></meta>"""
-        res = req.get_response(fakes.wsgi_app_v3())
-        self.assertEqual(res.status_int, 400)
-        res_dict = jsonutils.loads(res.body)
-        self.assertEqual(res_dict['badRequest']['message'],
-                         "Malformed request body")
 
     def test_update_server_name(self):
         body = {'server': {'name': 'server_test'}}
         req = self._get_request(body, {'name': 'server_test'})
-        res_dict = self.controller.update(req, FAKE_UUID, body)
+        res_dict = self.controller.update(req, FAKE_UUID, body=body)
 
         self.assertEqual(res_dict['server']['id'], FAKE_UUID)
         self.assertEqual(res_dict['server']['name'], 'server_test')
@@ -1458,77 +1618,18 @@ class ServersControllerUpdateTest(ControllerTest):
         body = {'server': {'name': 'x' * 256}}
         req = self._get_request(body, {'name': 'server_test'})
         self.assertRaises(webob.exc.HTTPBadRequest, self.controller.update,
-                            req, FAKE_UUID, body)
+                            req, FAKE_UUID, body=body)
 
-    def test_update_server_access_ipv4(self):
-        body = {'server': {'access_ip_v4': '0.0.0.0'}}
-        req = self._get_request(body, {'access_ipv4': '0.0.0.0'})
-        res_dict = self.controller.update(req, FAKE_UUID, body)
-
-        self.assertEqual(res_dict['server']['id'], FAKE_UUID)
-        self.assertEqual(res_dict['server']['access_ip_v4'], '0.0.0.0')
-
-    def test_update_server_access_ipv4_bad_format(self):
-        body = {'server': {'access_ip_v4': 'bad_format'}}
-        req = self._get_request(body, {'access_ipv4': '0.0.0.0'})
+    def test_update_server_name_all_blank_spaces(self):
+        self.stubs.Set(db, 'instance_get',
+                fakes.fake_instance_get(name='server_test'))
+        req = fakes.HTTPRequest.blank('/v3/servers/%s' % FAKE_UUID)
+        req.method = 'PUT'
+        req.content_type = 'application/json'
+        body = {'server': {'name': ' ' * 64}}
+        req.body = jsonutils.dumps(body)
         self.assertRaises(webob.exc.HTTPBadRequest, self.controller.update,
-                          req, FAKE_UUID, body)
-
-    def test_update_server_access_ipv4_none(self):
-        body = {'server': {'access_ip_v4': None}}
-        req = self._get_request(body, {'access_ipv4': '0.0.0.0'})
-        res_dict = self.controller.update(req, FAKE_UUID, body)
-
-        self.assertEqual(res_dict['server']['id'], FAKE_UUID)
-        self.assertEqual(res_dict['server']['access_ip_v4'], '')
-
-    def test_update_server_access_ipv4_blank(self):
-        body = {'server': {'access_ip_v4': ''}}
-        req = self._get_request(body, {'access_ipv4': '0.0.0.0'})
-        res_dict = self.controller.update(req, FAKE_UUID, body)
-
-        self.assertEqual(res_dict['server']['id'], FAKE_UUID)
-        self.assertEqual(res_dict['server']['access_ip_v4'], '')
-
-    def test_update_server_access_ipv6(self):
-        body = {'server': {'access_ip_v6': 'beef::0123'}}
-        req = self._get_request(body, {'access_ipv6': 'beef::0123'})
-        res_dict = self.controller.update(req, FAKE_UUID, body)
-
-        self.assertEqual(res_dict['server']['id'], FAKE_UUID)
-        self.assertEqual(res_dict['server']['access_ip_v6'], 'beef::123')
-
-    def test_update_server_access_ipv6_bad_format(self):
-        body = {'server': {'access_ip_v6': 'bad_format'}}
-        req = self._get_request(body, {'access_ipv6': 'beef::0123'})
-        self.assertRaises(webob.exc.HTTPBadRequest, self.controller.update,
-                          req, FAKE_UUID, body)
-
-    def test_update_server_access_ipv6_none(self):
-        body = {'server': {'access_ip_v6': None}}
-        req = self._get_request(body, {'access_ipv6': 'beef::0123'})
-        res_dict = self.controller.update(req, FAKE_UUID, body)
-
-        self.assertEqual(res_dict['server']['id'], FAKE_UUID)
-        self.assertEqual(res_dict['server']['access_ip_v6'], '')
-
-    def test_update_server_access_ipv6_blank(self):
-        body = {'server': {'access_ip_v6': ''}}
-        req = self._get_request(body, {'access_ipv6': 'beef::0123'})
-        res_dict = self.controller.update(req, FAKE_UUID, body)
-
-        self.assertEqual(res_dict['server']['id'], FAKE_UUID)
-        self.assertEqual(res_dict['server']['access_ip_v6'], '')
-
-    def test_update_server_personality(self):
-        body = {
-            'server': {
-                'personality': []
-            }
-        }
-        req = self._get_request(body)
-        self.assertRaises(webob.exc.HTTPBadRequest,
-            self.controller.update, req, FAKE_UUID, body)
+                          req, FAKE_UUID, body=body)
 
     def test_update_server_adminPass_ignored(self):
         inst_dict = dict(name='server_test', adminPass='bacon')
@@ -1551,7 +1652,7 @@ class ServersControllerUpdateTest(ControllerTest):
         req.method = 'PUT'
         req.content_type = "application/json"
         req.body = jsonutils.dumps(body)
-        res_dict = self.controller.update(req, FAKE_UUID, body)
+        res_dict = self.controller.update(req, FAKE_UUID, body=body)
 
         self.assertEqual(res_dict['server']['id'], FAKE_UUID)
         self.assertEqual(res_dict['server']['name'], 'server_test')
@@ -1564,7 +1665,7 @@ class ServersControllerUpdateTest(ControllerTest):
         body = {'server': {'name': 'server_test'}}
         req = self._get_request(body)
         self.assertRaises(webob.exc.HTTPNotFound, self.controller.update,
-                          req, FAKE_UUID, body)
+                          req, FAKE_UUID, body=body)
 
     def test_update_server_not_found_on_update(self):
         def fake_update(*args, **kwargs):
@@ -1574,7 +1675,15 @@ class ServersControllerUpdateTest(ControllerTest):
         body = {'server': {'name': 'server_test'}}
         req = self._get_request(body)
         self.assertRaises(webob.exc.HTTPNotFound, self.controller.update,
-                          req, FAKE_UUID, body)
+                          req, FAKE_UUID, body=body)
+
+    def test_update_server_policy_fail(self):
+        rule = {'compute:update': common_policy.parse_rule('role:admin')}
+        common_policy.set_rules(common_policy.Rules(rule))
+        body = {'server': {'name': 'server_test'}}
+        req = self._get_request(body, {'name': 'server_test'})
+        self.assertRaises(exception.PolicyNotAuthorized,
+                self.controller.update, req, FAKE_UUID, body=body)
 
 
 class ServerStatusTest(test.TestCase):
@@ -1695,6 +1804,8 @@ class ServersControllerCreateTest(test.TestCase):
         self.instance_cache_by_id = {}
         self.instance_cache_by_uuid = {}
 
+        fakes.stub_out_nw_api(self.stubs)
+
         ext_info = plugins.LoadedExtensionInfo()
         self.controller = servers.ServersController(extension_info=ext_info)
 
@@ -1708,8 +1819,6 @@ class ServersControllerCreateTest(test.TestCase):
                 'display_name': inst['display_name'] or 'test',
                 'uuid': FAKE_UUID,
                 'instance_type': dict(inst_type),
-                'access_ip_v4': '1.2.3.4',
-                'access_ip_v6': 'fead::1234',
                 'image_ref': inst.get('image_ref', def_image_ref),
                 'user_id': 'fake',
                 'project_id': 'fake',
@@ -1721,7 +1830,7 @@ class ServersControllerCreateTest(test.TestCase):
                 "fixed_ips": [],
                 "task_state": "",
                 "vm_state": "",
-                "security_groups": inst['security_groups'],
+                "root_device_name": inst.get('root_device_name', 'vda'),
             })
 
             self.instance_cache_by_id[instance['id']] = instance
@@ -1739,19 +1848,14 @@ class ServersControllerCreateTest(test.TestCase):
             instance.update(values)
             return instance
 
-        def rpc_call_wrapper(context, topic, msg, timeout=None):
-            """Stub out the scheduler creating the instance entry."""
-            if (topic == CONF.scheduler_topic and
-                    msg['method'] == 'run_instance'):
-                request_spec = msg['args']['request_spec']
-                num_instances = request_spec.get('num_instances', 1)
-                instances = []
-                for x in xrange(num_instances):
-                    instances.append(instance_create(context,
-                        request_spec['instance_properties']))
-                return instances
-
         def server_update(context, instance_uuid, params, update_cells=True):
+            inst = self.instance_cache_by_uuid[instance_uuid]
+            inst.update(params)
+            return inst
+
+        def server_update_and_get_original(
+                context, instance_uuid, params, update_cells=False,
+                columns_to_join=None):
             inst = self.instance_cache_by_uuid[instance_uuid]
             inst.update(params)
             return (inst, inst)
@@ -1768,10 +1872,7 @@ class ServersControllerCreateTest(test.TestCase):
         fakes.stub_out_rate_limiting(self.stubs)
         fakes.stub_out_key_pair_funcs(self.stubs)
         fake.stub_out_image_service(self.stubs)
-        fakes.stub_out_nw_api(self.stubs)
         self.stubs.Set(uuid, 'uuid4', fake_gen_uuid)
-        self.stubs.Set(db, 'instance_add_security_group',
-                       return_security_group)
         self.stubs.Set(db, 'project_get_networks',
                        project_get_networks)
         self.stubs.Set(db, 'instance_create', instance_create)
@@ -1779,16 +1880,12 @@ class ServersControllerCreateTest(test.TestCase):
                 fake_method)
         self.stubs.Set(db, 'instance_get', instance_get)
         self.stubs.Set(db, 'instance_update', instance_update)
-        self.stubs.Set(rpc, 'cast', fake_method)
-        self.stubs.Set(rpc, 'call', rpc_call_wrapper)
         self.stubs.Set(db, 'instance_update_and_get_original',
-                server_update)
-        self.stubs.Set(rpc, 'queue_get_for', queue_get_for)
+                server_update_and_get_original)
         self.stubs.Set(manager.VlanManager, 'allocate_fixed_ip',
                        fake_method)
         self.body = {
             'server': {
-                'min_count': 2,
                 'name': 'server_test',
                 'image_ref': self.image_uuid,
                 'flavor_ref': self.flavor_ref,
@@ -1796,12 +1893,6 @@ class ServersControllerCreateTest(test.TestCase):
                     'hello': 'world',
                     'open': 'stack',
                     },
-                'personality': [
-                    {
-                        "path": "/etc/banner.txt",
-                        "contents": "MQ==",
-                        },
-                    ],
                 },
             }
         self.bdm = [{'delete_on_termination': 1,
@@ -1813,23 +1904,41 @@ class ServersControllerCreateTest(test.TestCase):
         self.req.method = 'POST'
         self.req.headers["content-type"] = "application/json"
 
-    def _check_admin_pass_len(self, server_dict):
-        """utility function - check server_dict for admin_pass length."""
+    def _check_admin_password_len(self, server_dict):
+        """utility function - check server_dict for admin_password length."""
         self.assertEqual(CONF.password_length,
-                         len(server_dict["admin_pass"]))
+                         len(server_dict["admin_password"]))
 
-    def _check_admin_pass_missing(self, server_dict):
-        """utility function - check server_dict for absence of admin_pass."""
-        self.assertTrue("admin_pass" not in server_dict)
+    def _check_admin_password_missing(self, server_dict):
+        """utility function - check server_dict for admin_password absence."""
+        self.assertNotIn("admin_password", server_dict)
 
-    def _test_create_instance(self):
+    def _test_create_instance(self, flavor=2):
         image_uuid = 'c905cedb-7281-47e4-8a62-f26bc5fc4c77'
         self.body['server']['image_ref'] = image_uuid
-        self.body['server']['flavor_ref'] = 2
+        self.body['server']['flavor_ref'] = flavor
         self.req.body = jsonutils.dumps(self.body)
-        server = self.controller.create(self.req, self.body).obj['server']
-        self._check_admin_pass_len(server)
+        server = self.controller.create(self.req, body=self.body).obj['server']
+        self._check_admin_password_len(server)
         self.assertEqual(FAKE_UUID, server['id'])
+
+    def test_create_instance_private_flavor(self):
+        values = {
+            'name': 'fake_name',
+            'memory_mb': 512,
+            'vcpus': 1,
+            'root_gb': 10,
+            'ephemeral_gb': 10,
+            'flavorid': '1324',
+            'swap': 0,
+            'rxtx_factor': 0.5,
+            'vcpu_weight': 1,
+            'disabled': False,
+            'is_public': False,
+        }
+        db.flavor_create(context.get_admin_context(), values)
+        self.assertRaises(webob.exc.HTTPBadRequest, self._test_create_instance,
+                          flavor=1324)
 
     def test_create_server_bad_image_href(self):
         image_href = 1
@@ -1838,7 +1947,7 @@ class ServersControllerCreateTest(test.TestCase):
         self.req.body = jsonutils.dumps(self.body)
         self.assertRaises(webob.exc.HTTPBadRequest,
                           self.controller.create,
-                          self.req, self.body)
+                          self.req, body=self.body)
     # TODO(cyeoh): bp-v3-api-unittests
     # This needs to be ported to the os-networks extension tests
     # def test_create_server_with_invalid_networks_parameter(self):
@@ -1875,7 +1984,7 @@ class ServersControllerCreateTest(test.TestCase):
         with testtools.ExpectedException(
                 webob.exc.HTTPBadRequest,
                 'Image 76fa36fc-c930-4bf3-8c8a-ea2a2420deb6 is not active.'):
-            self.controller.create(self.req, self.body)
+            self.controller.create(self.req, body=self.body)
 
     def test_create_server_image_too_large(self):
         # Get the fake image service so we can set the status to deleted
@@ -1896,307 +2005,14 @@ class ServersControllerCreateTest(test.TestCase):
 
         with testtools.ExpectedException(
                 webob.exc.HTTPBadRequest,
-                "Instance type's disk is too small for requested image."):
-            self.controller.create(self.req, self.body)
-
-    # TODO(cyeoh): bp-v3-api-unittests
-    # This needs to be ported to the os-multiple-create extension tests
-    # def test_create_instance_invalid_negative_min(self):
-    #     self.ext_mgr.extensions = {'os-multiple-create': 'fake'}
-    #     image_href = '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6'
-    #     flavor_ref = 'http://localhost/123/flavors/3'
-
-    #     body = {
-    #         'server': {
-    #             'min_count': -1,
-    #             'name': 'server_test',
-    #             'imageRef': image_href,
-    #             'flavorRef': flavor_ref,
-    #         }
-    #     }
-    #     req = fakes.HTTPRequestV3.blank('/servers')
-    #     req.method = 'POST'
-    #     req.body = jsonutils.dumps(body)
-    #     req.headers["content-type"] = "application/json"
-    #     self.assertRaises(webob.exc.HTTPBadRequest,
-    #                       self.controller.create,
-    #                       req,
-    #                       body)
-
-    # TODO(cyeoh): bp-v3-api-unittests
-    # This needs to be ported to the os-multiple-create extension tests
-    # def test_create_instance_invalid_negative_max(self):
-    #     self.ext_mgr.extensions = {'os-multiple-create': 'fake'}
-    #     image_href = '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6'
-    #     flavor_ref = 'http://localhost/123/flavors/3'
-
-    #     body = {
-    #         'server': {
-    #             'max_count': -1,
-    #             'name': 'server_test',
-    #             'imageRef': image_href,
-    #             'flavorRef': flavor_ref,
-    #         }
-    #     }
-    #     req = fakes.HTTPRequestV3.blank('/servers')
-    #     req.method = 'POST'
-    #     req.body = jsonutils.dumps(body)
-    #     req.headers["content-type"] = "application/json"
-    #     self.assertRaises(webob.exc.HTTPBadRequest,
-    #                       self.controller.create,
-    #                       req,
-    #                       body)
-
-    # TODO(cyeoh): bp-v3-api-unittests
-    # This needs to be ported to the os-multiple-create extension tests
-    # def test_create_instance_invalid_alpha_min(self):
-    #     self.ext_mgr.extensions = {'os-multiple-create': 'fake'}
-    #     image_href = '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6'
-    #     flavor_ref = 'http://localhost/123/flavors/3'
-
-    #     body = {
-    #         'server': {
-    #             'min_count': 'abcd',
-    #             'name': 'server_test',
-    #             'imageRef': image_href,
-    #             'flavorRef': flavor_ref,
-    #         }
-    #     }
-    #     req = fakes.HTTPRequestV3.blank('/servers')
-    #     req.method = 'POST'
-    #     req.body = jsonutils.dumps(body)
-    #     req.headers["content-type"] = "application/json"
-    #     self.assertRaises(webob.exc.HTTPBadRequest,
-    #                       self.controller.create,
-    #                       req,
-    #                       body)
-
-    # TODO(cyeoh): bp-v3-api-unittests
-    # This needs to be ported to the os-multiple-create extension tests
-    # def test_create_instance_invalid_alpha_max(self):
-    #     self.ext_mgr.extensions = {'os-multiple-create': 'fake'}
-    #     image_href = '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6'
-    #     flavor_ref = 'http://localhost/123/flavors/3'
-
-    #     body = {
-    #         'server': {
-    #             'max_count': 'abcd',
-    #             'name': 'server_test',
-    #             'imageRef': image_href,
-    #             'flavorRef': flavor_ref,
-    #         }
-    #     }
-    #     req = fakes.HTTPRequestV3.blank('/servers')
-    #     req.method = 'POST'
-    #     req.body = jsonutils.dumps(body)
-    #     req.headers["content-type"] = "application/json"
-    #     self.assertRaises(webob.exc.HTTPBadRequest,
-    #                       self.controller.create,
-    #                       req,
-    #                       body)
-
-    # TODO(cyeoh): bp-v3-api-unittests
-    # This needs to be ported to the os-multiple-create extension tests
-    # def test_create_multiple_instances(self):
-    #     """Test creating multiple instances but not asking for
-    #     reservation_id
-    #     """
-    #     self.ext_mgr.extensions = {'os-multiple-create': 'fake'}
-    #     image_href = '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6'
-    #     flavor_ref = 'http://localhost/123/flavors/3'
-    #     body = {
-    #         'server': {
-    #             'min_count': 2,
-    #             'name': 'server_test',
-    #             'imageRef': image_href,
-    #             'flavorRef': flavor_ref,
-    #             'metadata': {'hello': 'world',
-    #                          'open': 'stack'},
-    #             'personality': []
-    #         }
-    #     }
-
-    #     req = fakes.HTTPRequestV3.blank('/servers')
-    #     req.method = 'POST'
-    #     req.body = jsonutils.dumps(body)
-    #     req.headers["content-type"] = "application/json"
-    #     res = self.controller.create(req, body).obj
-
-    #     self.assertEqual(FAKE_UUID, res["server"]["id"])
-    #     self._check_admin_pass_len(res["server"])
-
-    # TODO(cyeoh): bp-v3-api-unittests
-    # This needs to be ported to the os-multiple-create extension tests
-    # def test_create_multiple_instances_pass_disabled(self):
-    #     """Test creating multiple instances but not asking for
-    #     reservation_id
-    #     """
-    #     self.ext_mgr.extensions = {'os-multiple-create': 'fake'}
-    #     self.flags(enable_instance_password=False)
-    #     image_href = '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6'
-    #     flavor_ref = 'http://localhost/123/flavors/3'
-    #     body = {
-    #         'server': {
-    #             'min_count': 2,
-    #             'name': 'server_test',
-    #             'imageRef': image_href,
-    #             'flavorRef': flavor_ref,
-    #             'metadata': {'hello': 'world',
-    #                          'open': 'stack'},
-    #             'personality': []
-    #         }
-    #     }
-
-    #     req = fakes.HTTPRequestV3.blank('/servers')
-    #     req.method = 'POST'
-    #     req.body = jsonutils.dumps(body)
-    #     req.headers["content-type"] = "application/json"
-    #     res = self.controller.create(req, body).obj
-
-    #     self.assertEqual(FAKE_UUID, res["server"]["id"])
-    #     self._check_admin_pass_missing(res["server"])
-
-    # TODO(cyeoh): bp-v3-api-unittests
-    # This needs to be ported to the os-multiple-create extension tests
-    # def test_create_multiple_instances_resv_id_return(self):
-    #     """Test creating multiple instances with asking for
-    #     reservation_id
-    #     """
-    #     self.ext_mgr.extensions = {'os-multiple-create': 'fake'}
-    #     image_href = '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6'
-    #     flavor_ref = 'http://localhost/123/flavors/3'
-    #     body = {
-    #         'server': {
-    #             'min_count': 2,
-    #             'name': 'server_test',
-    #             'imageRef': image_href,
-    #             'flavorRef': flavor_ref,
-    #             'metadata': {'hello': 'world',
-    #                          'open': 'stack'},
-    #             'personality': [],
-    #             'return_reservation_id': True
-    #         }
-    #     }
-
-    #     req = fakes.HTTPRequestV3.blank('/servers')
-    #     req.method = 'POST'
-    #     req.body = jsonutils.dumps(body)
-    #     req.headers["content-type"] = "application/json"
-    #     res = self.controller.create(req, body)
-
-    #     reservation_id = res.obj.get('reservation_id')
-    #     self.assertNotEqual(reservation_id, "")
-    #     self.assertNotEqual(reservation_id, None)
-    #     self.assertTrue(len(reservation_id) > 1)
-
-    # TODO(cyeoh): bp-v3-api-unittests
-    # This needs to be ported to the os-multiple-create extension tests
-    # def test_create_multiple_instances_with_multiple_volume_bdm(self):
-    #     """
-    #     Test that a BadRequest is raised if multiple instances
-    #     are requested with a list of block device mappings for volumes.
-    #     """
-    #     self.ext_mgr.extensions = {'os-multiple-create': 'fake'}
-    #     min_count = 2
-    #     bdm = [{'device_name': 'foo1', 'volume_id': 'vol-xxxx'},
-    #            {'device_name': 'foo2', 'volume_id': 'vol-yyyy'}
-    #     ]
-    #     params = {
-    #               'block_device_mapping': bdm,
-    #               'min_count': min_count
-    #     }
-    #     old_create = compute_api.API.create
-
-    #     def create(*args, **kwargs):
-    #         self.assertEqual(kwargs['min_count'], 2)
-    #         self.assertEqual(len(kwargs['block_device_mapping']), 2)
-    #         return old_create(*args, **kwargs)
-
-    #     self.stubs.Set(compute_api.API, 'create', create)
-    #     self.assertRaises(webob.exc.HTTPBadRequest,
-    #                       self._test_create_extra, params, no_image=True)
-
-    # TODO(cyeoh): bp-v3-api-unittests
-    # This needs to be ported to the os-multiple-create extension tests
-    # def test_create_multiple_instances_with_single_volume_bdm(self):
-    #     """
-    #     Test that a BadRequest is raised if multiple instances
-    #     are requested to boot from a single volume.
-    #     """
-    #     self.ext_mgr.extensions = {'os-multiple-create': 'fake'}
-    #     min_count = 2
-    #     bdm = [{'device_name': 'foo1', 'volume_id': 'vol-xxxx'}]
-    #     params = {
-    #              'block_device_mapping': bdm,
-    #              'min_count': min_count
-    #     }
-    #     old_create = compute_api.API.create
-
-    #     def create(*args, **kwargs):
-    #         self.assertEqual(kwargs['min_count'], 2)
-    #         self.assertEqual(kwargs['block_device_mapping']['volume_id'],
-    #                         'vol-xxxx')
-    #         return old_create(*args, **kwargs)
-
-    #     self.stubs.Set(compute_api.API, 'create', create)
-    #     self.assertRaises(webob.exc.HTTPBadRequest,
-    #                       self._test_create_extra, params, no_image=True)
-
-    # TODO(cyeoh): bp-v3-api-unittests
-    # This needs to be ported to the os-multiple-create extension tests
-    # def test_create_multiple_instance_with_non_integer_max_count(self):
-    #     self.ext_mgr.extensions = {'os-multiple-create': 'fake'}
-    #     image_href = '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6'
-    #     flavor_ref = 'http://localhost/123/flavors/3'
-    #     body = {
-    #         'server': {
-    #             'max_count': 2.5,
-    #             'name': 'server_test',
-    #             'imageRef': image_href,
-    #             'flavorRef': flavor_ref,
-    #             'metadata': {'hello': 'world',
-    #                          'open': 'stack'},
-    #             'personality': []
-    #         }
-    #     }
-
-    #     req = fakes.HTTPRequestV3.blank('/servers')
-    #     req.method = 'POST'
-    #     req.body = jsonutils.dumps(body)
-    #     req.headers["content-type"] = "application/json"
-    #     self.assertRaises(webob.exc.HTTPBadRequest,
-    #                       self.controller.create, req, body)
-
-    # TODO(cyeoh): bp-v3-api-unittests
-    # This needs to be ported to the os-multiple-create extension tests
-    # def test_create_multiple_instance_with_non_integer_min_count(self):
-    #     self.ext_mgr.extensions = {'os-multiple-create': 'fake'}
-    #     image_href = '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6'
-    #     flavor_ref = 'http://localhost/123/flavors/3'
-    #     body = {
-    #         'server': {
-    #             'min_count': 2.5,
-    #             'name': 'server_test',
-    #             'imageRef': image_href,
-    #             'flavorRef': flavor_ref,
-    #             'metadata': {'hello': 'world',
-    #                          'open': 'stack'},
-    #             'personality': []
-    #         }
-    #     }
-
-    #     req = fakes.HTTPRequestV3.blank('/servers')
-    #     req.method = 'POST'
-    #     req.body = jsonutils.dumps(body)
-    #     req.headers["content-type"] = "application/json"
-    #     self.assertRaises(webob.exc.HTTPBadRequest,
-    #                       self.controller.create, req, body)
+                "Flavor's disk is too small for requested image."):
+            self.controller.create(self.req, body=self.body)
 
     def test_create_instance_image_ref_is_bookmark(self):
         image_href = 'http://localhost/images/%s' % self.image_uuid
         self.body['server']['image_ref'] = image_href
         self.req.body = jsonutils.dumps(self.body)
-        res = self.controller.create(self.req, self.body).obj
+        res = self.controller.create(self.req, body=self.body).obj
 
         server = res['server']
         self.assertEqual(FAKE_UUID, server['id'])
@@ -2209,7 +2025,7 @@ class ServersControllerCreateTest(test.TestCase):
         self.body['server']['flavor_ref'] = flavor_ref
         self.req.body = jsonutils.dumps(self.body)
         self.assertRaises(webob.exc.HTTPBadRequest, self.controller.create,
-                          self.req, self.body)
+                          self.req, body=self.body)
 
     def test_create_instance_no_key_pair(self):
         fakes.stub_out_key_pair_funcs(self.stubs, have_key_pair=False)
@@ -2222,246 +2038,8 @@ class ServersControllerCreateTest(test.TestCase):
         self.body['server'].update(params)
         self.req.body = jsonutils.dumps(self.body)
         self.req.headers["content-type"] = "application/json"
-        server = self.controller.create(self.req, self.body).obj['server']
+        self.controller.create(self.req, body=self.body).obj['server']
 
-    # TODO(cyeoh): bp-v3-api-unittests
-    # This needs to be ported to the os-security-groups extension tests
-    # def test_create_instance_with_security_group_enabled(self):
-    #     self.ext_mgr.extensions = {'os-security-groups': 'fake'}
-    #     group = 'foo'
-    #     old_create = compute_api.API.create
-
-    #     def sec_group_get(ctx, proj, name):
-    #         if name == group:
-    #             return True
-    #         else:
-    #             raise exception.SecurityGroupNotFoundForProject(
-    #                 project_id=proj, security_group_id=name)
-
-    #     def create(*args, **kwargs):
-    #         self.assertEqual(kwargs['security_group'], [group])
-    #         return old_create(*args, **kwargs)
-
-    #     self.stubs.Set(db, 'security_group_get_by_name', sec_group_get)
-    #     # negative test
-    #     self.assertRaises(webob.exc.HTTPBadRequest,
-    #                       self._test_create_extra,
-    #                       {'security_groups': [{'name': 'bogus'}]})
-    #     # positive test - extra assert in create path
-    #     self.stubs.Set(compute_api.API, 'create', create)
-    #     self._test_create_extra({'security_groups': [{'name': group}]})
-
-    def test_create_instance_with_security_group_disabled(self):
-        group = 'foo'
-        params = {'security_groups': [{'name': group}]}
-        old_create = compute_api.API.create
-
-        def create(*args, **kwargs):
-            # NOTE(vish): if the security groups extension is not
-            #             enabled, then security groups passed in
-            #             are ignored.
-            self.assertEqual(kwargs['security_group'], ['default'])
-            return old_create(*args, **kwargs)
-
-        self.stubs.Set(compute_api.API, 'create', create)
-        self._test_create_extra(params)
-
-    # TODO(cyeoh): bp-v3-api-unittests
-    # This needs to be ported to the OS-DCF extension tests
-    # def test_create_instance_with_disk_config_enabled(self):
-    #     self.ext_mgr.extensions = {'OS-DCF': 'fake'}
-    #     # NOTE(vish): the extension converts OS-DCF:disk_config into
-    #     #             auto_disk_config, so we are testing with
-    #     #             the_internal_value
-    #     params = {'auto_disk_config': 'AUTO'}
-    #     old_create = compute_api.API.create
-
-    #     def create(*args, **kwargs):
-    #         self.assertEqual(kwargs['auto_disk_config'], 'AUTO')
-    #         return old_create(*args, **kwargs)
-
-    #     self.stubs.Set(compute_api.API, 'create', create)
-    #     self._test_create_extra(params)
-
-    def test_create_instance_with_disk_config_disabled(self):
-        params = {'auto_disk_config': True}
-        old_create = compute_api.API.create
-
-        def create(*args, **kwargs):
-            self.assertEqual(kwargs['auto_disk_config'], False)
-            return old_create(*args, **kwargs)
-
-        self.stubs.Set(compute_api.API, 'create', create)
-        self._test_create_extra(params)
-
-    # TODO(cyeoh): bp-v3-api-unittests
-    # This needs to be ported to the os-volumes extension tests
-    # def test_create_instance_with_volumes_enabled(self):
-    #     self.ext_mgr.extensions = {'os-volumes': 'fake'}
-    #     bdm = [{'device_name': 'foo'}]
-    #     params = {'block_device_mapping': bdm}
-    #     old_create = compute_api.API.create
-
-    #     def create(*args, **kwargs):
-    #         self.assertEqual(kwargs['block_device_mapping'], bdm)
-    #         return old_create(*args, **kwargs)
-
-    #     self.stubs.Set(compute_api.API, 'create', create)
-    #     self._test_create_extra(params)
-
-    # TODO(cyeoh): bp-v3-api-unittests
-    # This needs to be ported to the os-volumes extension tests
-    # def test_create_instance_with_volumes_enabled_no_image(self):
-    #     """
-    #     Test that the create will fail if there is no image
-    #     and no bdms supplied in the request
-    #     """
-    #     self.ext_mgr.extensions = {'os-volumes': 'fake'}
-    #     old_create = compute_api.API.create
-
-    #     def create(*args, **kwargs):
-    #         self.assertNotIn('imageRef', kwargs)
-    #         return old_create(*args, **kwargs)
-
-    #     self.stubs.Set(compute_api.API, 'create', create)
-    #     self.assertRaises(webob.exc.HTTPBadRequest,
-    #                       self._test_create_extra, {}, no_image=True)
-
-    # TODO(cyeoh): bp-v3-api-unittests
-    # This needs to be ported to the os-volumes extension tests
-    # def test_create_instance_with_volumes_enabled_and_bdms_no_image(self):
-    #     """
-    #     Test that the create works if there is no image supplied but
-    #     os-volumes extension is enabled and bdms are supplied
-    #     """
-    #     self.ext_mgr.extensions = {'os-volumes': 'fake'}
-    #     bdm = [{'device_name': 'foo'}]
-    #     params = {'block_device_mapping': bdm}
-    #     old_create = compute_api.API.create
-
-    #     def create(*args, **kwargs):
-    #         self.assertEqual(kwargs['block_device_mapping'], bdm)
-    #         self.assertNotIn('imageRef', kwargs)
-    #         return old_create(*args, **kwargs)
-
-    #     self.stubs.Set(compute_api.API, 'create', create)
-    #     self._test_create_extra(params, no_image=True)
-
-    def test_create_instance_with_volumes_disabled(self):
-        bdm = [{'device_name': 'foo'}]
-        params = {'block_device_mapping': bdm}
-        old_create = compute_api.API.create
-
-        def create(*args, **kwargs):
-            self.assertEqual(kwargs['block_device_mapping'], None)
-            return old_create(*args, **kwargs)
-
-        self.stubs.Set(compute_api.API, 'create', create)
-        self._test_create_extra(params)
-
-    # TODO(cyeoh): bp-v3-api-unittests
-    # This needs to be ported to the os-volumes extension tests
-    # def test_create_instance_with_device_name_not_string(self):
-    #     self.ext_mgr.extensions = {'os-volumes': 'fake'}
-    #     bdm = [{'delete_on_termination': 1,
-    #             'device_name': 123,
-    #             'volume_size': 1,
-    #             'volume_id': '11111111-1111-1111-1111-111111111111'}]
-    #     params = {'block_device_mapping': bdm}
-    #     old_create = compute_api.API.create
-    #
-    #     def create(*args, **kwargs):
-    #         self.assertEqual(kwargs['block_device_mapping'], bdm)
-    #         return old_create(*args, **kwargs)
-    #
-    #     self.stubs.Set(compute_api.API, 'create', create)
-    #     self.assertRaises(webob.exc.HTTPBadRequest,
-    #                       self._test_create_extra, params)
-    #
-    # TODO(cyeoh): bp-v3-api-unittests
-    # This needs to be ported to the os-volumes extension tests
-    # def test_create_instance_with_device_name_empty(self):
-    #     self.ext_mgr.extensions = {'os-volumes': 'fake'}
-    #     bdm = [{'delete_on_termination': 1,
-    #             'device_name': '',
-    #             'volume_size': 1,
-    #             'volume_id': '11111111-1111-1111-1111-111111111111'}]
-    #     params = {'block_device_mapping': bdm}
-    #     old_create = compute_api.API.create
-    #
-    #     def create(*args, **kwargs):
-    #         self.assertEqual(kwargs['block_device_mapping'], bdm)
-    #         return old_create(*args, **kwargs)
-    #
-    #     self.stubs.Set(compute_api.API, 'create', create)
-    #     self.assertRaises(webob.exc.HTTPBadRequest,
-    #                       self._test_create_extra, params)
-    #
-    # TODO(cyeoh): bp-v3-api-unittests
-    # This needs to be ported to the os-volumes extension tests
-    # def test_create_instance_with_device_name_too_long(self):
-    #     self.ext_mgr.extensions = {'os-volumes': 'fake'}
-    #     bdm = [{'delete_on_termination': 1,
-    #             'device_name': 'a' * 256,
-    #             'volume_size': 1,
-    #             'volume_id': '11111111-1111-1111-1111-111111111111'}]
-    #     params = {'block_device_mapping': bdm}
-    #     old_create = compute_api.API.create
-    #
-    #     def create(*args, **kwargs):
-    #         self.assertEqual(kwargs['block_device_mapping'], bdm)
-    #         return old_create(*args, **kwargs)
-    #
-    #     self.stubs.Set(compute_api.API, 'create', create)
-    #     self.assertRaises(webob.exc.HTTPBadRequest,
-    #                       self._test_create_extra, params)
-    #
-    # TODO(cyeoh): bp-v3-api-unittests
-    # This needs to be ported to the os-volumes extension tests
-    # def test_create_instance_with_space_in_device_name(self):
-    #     self.ext_mgr.extensions = {'os-volumes': 'fake'}
-    #     bdm = [{'delete_on_termination': 1,
-    #             'device_name': 'vd a',
-    #             'volume_size': 1,
-    #             'volume_id': '11111111-1111-1111-1111-111111111111'}]
-    #     params = {'block_device_mapping': bdm}
-    #     old_create = compute_api.API.create
-    #
-    #     def create(*args, **kwargs):
-    #         self.assertEqual(kwargs['block_device_mapping'], bdm)
-    #         return old_create(*args, **kwargs)
-    #
-    #     self.stubs.Set(compute_api.API, 'create', create)
-    #     self.assertRaises(webob.exc.HTTPBadRequest,
-    #                       self._test_create_extra, params)
-    #
-    # TODO(cyeoh): bp-v3-api-unittests
-    # This needs to be ported to the os-volumes extension tests
-    # def test_create_instance_with_bdm_delete_on_termination(self):
-    #     self.ext_mgr.extensions = {'os-volumes': 'fake'}
-    #     bdm = [{'device_name': 'foo1', 'delete_on_termination': 1},
-    #            {'device_name': 'foo2', 'delete_on_termination': True},
-    #            {'device_name': 'foo3', 'delete_on_termination': 'invalid'},
-    #            {'device_name': 'foo4', 'delete_on_termination': 0},
-    #            {'device_name': 'foo5', 'delete_on_termination': False}]
-    #     expected_dbm = [
-    #         {'device_name': 'foo1', 'delete_on_termination': True},
-    #         {'device_name': 'foo2', 'delete_on_termination': True},
-    #         {'device_name': 'foo3', 'delete_on_termination': False},
-    #         {'device_name': 'foo4', 'delete_on_termination': False},
-    #         {'device_name': 'foo5', 'delete_on_termination': False}]
-    #     params = {'block_device_mapping': bdm}
-    #     old_create = compute_api.API.create
-    #
-    #     def create(*args, **kwargs):
-    #         self.assertEqual(kwargs['block_device_mapping'], expected_dbm)
-    #         return old_create(*args, **kwargs)
-    #
-    #     self.stubs.Set(compute_api.API, 'create', create)
-    #     self._test_create_extra(params)
-    #
-    #
-    #
     # TODO(cyeoh): bp-v3-api-unittests
     # This needs to be ported to the os-keypairs extension tests
     # def test_create_instance_with_keypairs_enabled(self):
@@ -2487,44 +2065,6 @@ class ServersControllerCreateTest(test.TestCase):
     #     self._test_create_extra(params)
     #
     # TODO(cyeoh): bp-v3-api-unittests
-    # This needs to be ported to the os-multi-create extension tests
-    # def test_create_instance_with_multiple_create_enabled(self):
-    #     self.ext_mgr.extensions = {'os-multiple-create': 'fake'}
-    #     min_count = 2
-    #     max_count = 3
-    #     params = {
-    #         'min_count': min_count,
-    #         'max_count': max_count,
-    #     }
-    #     old_create = compute_api.API.create
-
-    #     def create(*args, **kwargs):
-    #         self.assertEqual(kwargs['min_count'], 2)
-    #         self.assertEqual(kwargs['max_count'], 3)
-    #         return old_create(*args, **kwargs)
-
-    #     self.stubs.Set(compute_api.API, 'create', create)
-    #     self._test_create_extra(params)
-
-    def test_create_instance_with_multiple_create_disabled(self):
-        ret_res_id = True
-        min_count = 2
-        max_count = 3
-        params = {
-            'min_count': min_count,
-            'max_count': max_count,
-        }
-        old_create = compute_api.API.create
-
-        def create(*args, **kwargs):
-            self.assertEqual(kwargs['min_count'], 1)
-            self.assertEqual(kwargs['max_count'], 1)
-            return old_create(*args, **kwargs)
-
-        self.stubs.Set(compute_api.API, 'create', create)
-        self._test_create_extra(params)
-
-    # TODO(cyeoh): bp-v3-api-unittests
     # This needs to be ported to the os-networks extension tests
     # def test_create_instance_with_networks_enabled(self):
     #     self.ext_mgr.extensions = {'os-networks': 'fake'}
@@ -2541,7 +2081,45 @@ class ServersControllerCreateTest(test.TestCase):
     #     self.stubs.Set(compute_api.API, 'create', create)
     #     self._test_create_extra(params)
 
+    def test_create_instance_with_port_with_no_fixed_ips(self):
+        port_id = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
+        requested_networks = [{'port': port_id}]
+        params = {'networks': requested_networks}
+
+        def fake_create(*args, **kwargs):
+            raise exception.PortRequiresFixedIP(port_id=port_id)
+
+        self.stubs.Set(compute_api.API, 'create', fake_create)
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self._test_create_extra, params)
+
+    def test_create_instance_with_network_with_no_subnet(self):
+        network = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
+        requested_networks = [{'uuid': network}]
+        params = {'networks': requested_networks}
+
+        def fake_create(*args, **kwargs):
+            raise exception.NetworkRequiresSubnet(network_uuid=network)
+
+        self.stubs.Set(compute_api.API, 'create', fake_create)
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self._test_create_extra, params)
+
+    def test_create_instance_with_non_unique_secgroup_name(self):
+        network = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
+        requested_networks = [{'uuid': network}]
+        params = {'networks': requested_networks,
+                  'security_groups': [{'name': 'dup'}, {'name': 'dup'}]}
+
+        def fake_create(*args, **kwargs):
+            raise exception.NoUniqueMatch("No Unique match found for ...")
+
+        self.stubs.Set(compute_api.API, 'create', fake_create)
+        self.assertRaises(webob.exc.HTTPConflict,
+                          self._test_create_extra, params)
+
     def test_create_instance_with_networks_disabled_neutronv2(self):
+        nova_utils.reset_is_neutron()
         self.flags(network_api_class='nova.network.neutronv2.api.API')
         net_uuid = '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6'
         requested_networks = [{'uuid': net_uuid}]
@@ -2564,26 +2142,13 @@ class ServersControllerCreateTest(test.TestCase):
         old_create = compute_api.API.create
 
         def create(*args, **kwargs):
-            self.assertEqual(kwargs['requested_networks'], None)
+            self.assertIsNone(kwargs['requested_networks'])
             return old_create(*args, **kwargs)
 
         self.stubs.Set(compute_api.API, 'create', create)
         self._test_create_extra(params)
 
-    def test_create_instance_with_access_ip(self):
-        # proper local hrefs must start with 'http://localhost/v3/'
-        image_href = 'http://localhost/v2/fake/images/%s' % self.image_uuid
-        self.body['server']['image_ref'] = image_href
-        self.body['server']['access_ip_v4'] = '1.2.3.4'
-        self.body['server']['access_ip_v6'] = 'fead::1234'
-
-        self.req.body = jsonutils.dumps(self.body)
-        res = self.controller.create(self.req, self.body).obj
-        server = res['server']
-        self._check_admin_pass_len(server)
-        self.assertEqual(FAKE_UUID, server['id'])
-
-    def test_create_instance_with_access_ip_pass_disabled(self):
+    def test_create_instance_with_pass_disabled(self):
         # test with admin passwords disabled See lp bug 921814
         self.flags(enable_instance_password=False)
 
@@ -2591,34 +2156,12 @@ class ServersControllerCreateTest(test.TestCase):
         self.flags(enable_instance_password=False)
         image_href = 'http://localhost/v2/fake/images/%s' % self.image_uuid
         self.body['server']['image_ref'] = image_href
-        self.body['server']['access_ip_v4'] = '1.2.3.4'
-        self.body['server']['access_ip_v6'] = 'fead::1234'
         self.req.body = jsonutils.dumps(self.body)
-        res = self.controller.create(self.req, self.body).obj
+        res = self.controller.create(self.req, body=self.body).obj
 
         server = res['server']
-        self._check_admin_pass_missing(server)
+        self._check_admin_password_missing(server)
         self.assertEqual(FAKE_UUID, server['id'])
-
-    def test_create_instance_bad_format_access_ip_v4(self):
-        # proper local hrefs must start with 'http://localhost/v3/'
-        image_href = 'http://localhost/v2/fake/images/%s' % self.image_uuid
-        self.body['server']['image_ref'] = image_href
-        self.body['server']['access_ip_v4'] = 'bad_format'
-        self.body['server']['access_ip_v6'] = 'fead::1234'
-        self.req.body = jsonutils.dumps(self.body)
-        self.assertRaises(webob.exc.HTTPBadRequest, self.controller.create,
-                          self.req, self.body)
-
-    def test_create_instance_bad_format_access_ip_v6(self):
-        # proper local hrefs must start with 'http://localhost/v3/'
-        image_href = 'http://localhost/v2/fake/images/%s' % self.image_uuid
-        self.body['server']['image_ref'] = image_href
-        self.body['server']['access_ip_v4'] = '1.2.3.4'
-        self.body['server']['access_ip_v6'] = 'bad_format'
-        self.req.body = jsonutils.dumps(self.body)
-        self.assertRaises(webob.exc.HTTPBadRequest, self.controller.create,
-                          self.req, self.body)
 
     def test_create_instance_name_too_long(self):
         # proper local hrefs must start with 'http://localhost/v3/'
@@ -2627,17 +2170,41 @@ class ServersControllerCreateTest(test.TestCase):
         self.body['server']['image_ref'] = image_href
         self.req.body = jsonutils.dumps(self.body)
         self.assertRaises(webob.exc.HTTPBadRequest, self.controller.create,
-                          self.req, self.body)
+                          self.req, body=self.body)
+
+    def test_create_instance_name_all_blank_spaces(self):
+        # proper local hrefs must start with 'http://localhost/v2/'
+        image_uuid = '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6'
+        image_href = 'http://localhost/v3/images/%s' % image_uuid
+        flavor_ref = 'http://localhost/flavors/3'
+        body = {
+            'server': {
+                'name': ' ' * 64,
+                'imageRef': image_href,
+                'flavorRef': flavor_ref,
+                'metadata': {
+                    'hello': 'world',
+                    'open': 'stack',
+                },
+            },
+        }
+
+        req = fakes.HTTPRequest.blank('/v3/servers')
+        req.method = 'POST'
+        req.body = jsonutils.dumps(body)
+        req.headers["content-type"] = "application/json"
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self.controller.create, req, body=body)
 
     def test_create_instance(self):
         # proper local hrefs must start with 'http://localhost/v3/'
         image_href = 'http://localhost/v2/images/%s' % self.image_uuid
         self.body['server']['image_ref'] = image_href
         self.req.body = jsonutils.dumps(self.body)
-        res = self.controller.create(self.req, self.body).obj
+        res = self.controller.create(self.req, body=self.body).obj
 
         server = res['server']
-        self._check_admin_pass_len(server)
+        self._check_admin_password_len(server)
         self.assertEqual(FAKE_UUID, server['id'])
 
     def test_create_instance_extension_create_exception(self):
@@ -2660,13 +2227,6 @@ class ServersControllerCreateTest(test.TestCase):
                     'hello': 'world',
                     'open': 'stack',
                 },
-                'personality': [
-                    {
-                        "path": "/etc/banner.txt",
-                        "contents": "MQ==",
-                    },
-
-                ],
             },
         }
 
@@ -2674,7 +2234,7 @@ class ServersControllerCreateTest(test.TestCase):
         req.method = 'POST'
         req.body = jsonutils.dumps(body)
         req.headers["content-type"] = "application/json"
-        self.assertRaises(KeyError, self.controller.create, req, body)
+        self.assertRaises(KeyError, self.controller.create, req, body=body)
 
     def test_create_instance_pass_disabled(self):
         self.flags(enable_instance_password=False)
@@ -2682,10 +2242,10 @@ class ServersControllerCreateTest(test.TestCase):
         image_href = 'http://localhost/v2/images/%s' % self.image_uuid
         self.body['server']['image_ref'] = image_href
         self.req.body = jsonutils.dumps(self.body)
-        res = self.controller.create(self.req, self.body).obj
+        res = self.controller.create(self.req, body=self.body).obj
 
         server = res['server']
-        self._check_admin_pass_missing(server)
+        self._check_admin_password_missing(server)
         self.assertEqual(FAKE_UUID, server['id'])
 
     def test_create_instance_too_much_metadata(self):
@@ -2695,7 +2255,7 @@ class ServersControllerCreateTest(test.TestCase):
         self.body['server']['metadata']['vote'] = 'fiddletown'
         self.req.body = jsonutils.dumps(self.body)
         self.assertRaises(webob.exc.HTTPRequestEntityTooLarge,
-                          self.controller.create, self.req, self.body)
+                          self.controller.create, self.req, body=self.body)
 
     def test_create_instance_metadata_key_too_long(self):
         self.flags(quota_metadata_items=1)
@@ -2705,7 +2265,7 @@ class ServersControllerCreateTest(test.TestCase):
 
         self.req.body = jsonutils.dumps(self.body)
         self.assertRaises(webob.exc.HTTPRequestEntityTooLarge,
-                          self.controller.create, self.req, self.body)
+                          self.controller.create, self.req, body=self.body)
 
     def test_create_instance_metadata_value_too_long(self):
         self.flags(quota_metadata_items=1)
@@ -2714,7 +2274,7 @@ class ServersControllerCreateTest(test.TestCase):
         self.body['server']['metadata'] = {'key1': ('a' * 260)}
         self.req.body = jsonutils.dumps(self.body)
         self.assertRaises(webob.exc.HTTPRequestEntityTooLarge,
-                          self.controller.create, self.req, self.body)
+                          self.controller.create, self.req, body=self.body)
 
     def test_create_instance_metadata_key_blank(self):
         self.flags(quota_metadata_items=1)
@@ -2723,7 +2283,39 @@ class ServersControllerCreateTest(test.TestCase):
         self.body['server']['metadata'] = {'': 'abcd'}
         self.req.body = jsonutils.dumps(self.body)
         self.assertRaises(webob.exc.HTTPBadRequest,
-                          self.controller.create, self.req, self.body)
+                          self.controller.create, self.req, body=self.body)
+
+    def test_create_instance_metadata_not_dict(self):
+        self.flags(quota_metadata_items=1)
+        image_href = 'http://localhost/v2/images/%s' % self.image_uuid
+        self.body['server']['image_ref'] = image_href
+        self.body['server']['metadata'] = 'string'
+        self.req.body = jsonutils.dumps(self.body)
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self.controller.create, self.req, body=self.body)
+
+    def test_create_instance_metadata_key_not_string(self):
+        self.flags(quota_metadata_items=1)
+        image_href = 'http://localhost/v2/images/%s' % self.image_uuid
+        self.body['server']['image_ref'] = image_href
+        self.body['server']['metadata'] = {1: 'test'}
+        self.req.body = jsonutils.dumps(self.body)
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self.controller.create, self.req, body=self.body)
+
+    def test_create_instance_metadata_value_not_string(self):
+        self.flags(quota_metadata_items=1)
+        image_href = 'http://localhost/v2/images/%s' % self.image_uuid
+        self.body['server']['image_ref'] = image_href
+        self.body['server']['metadata'] = {'test': ['a', 'list']}
+        self.req.body = jsonutils.dumps(self.body)
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self.controller.create, self.req, body=self.body)
+
+    def test_create_user_data_malformed_bad_request(self):
+        params = {'os-user-data:user_data': 'u1234'}
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self._test_create_extra, params)
 
     def test_create_instance_invalid_key_name(self):
         image_href = 'http://localhost/v2/images/2'
@@ -2731,15 +2323,15 @@ class ServersControllerCreateTest(test.TestCase):
         self.body['server']['key_name'] = 'nonexistentkey'
         self.req.body = jsonutils.dumps(self.body)
         self.assertRaises(webob.exc.HTTPBadRequest,
-                          self.controller.create, self.req, self.body)
+                          self.controller.create, self.req, body=self.body)
 
     def test_create_instance_valid_key_name(self):
         self.body['server']['key_name'] = 'key'
         self.req.body = jsonutils.dumps(self.body)
-        res = self.controller.create(self.req, self.body).obj
+        res = self.controller.create(self.req, body=self.body).obj
 
         self.assertEqual(FAKE_UUID, res["server"]["id"])
-        self._check_admin_pass_len(res["server"])
+        self._check_admin_password_len(res["server"])
 
     def test_create_instance_invalid_flavor_href(self):
         image_href = 'http://localhost/v2/images/2'
@@ -2748,7 +2340,7 @@ class ServersControllerCreateTest(test.TestCase):
         self.body['server']['flavor_ref'] = flavor_ref
         self.req.body = jsonutils.dumps(self.body)
         self.assertRaises(webob.exc.HTTPBadRequest,
-                          self.controller.create, self.req, self.body)
+                          self.controller.create, self.req, body=self.body)
 
     def test_create_instance_invalid_flavor_id_int(self):
         image_href = 'http://localhost/v2/images/2'
@@ -2757,7 +2349,7 @@ class ServersControllerCreateTest(test.TestCase):
         self.body['server']['flavor_ref'] = flavor_ref
         self.req.body = jsonutils.dumps(self.body)
         self.assertRaises(webob.exc.HTTPBadRequest,
-                          self.controller.create, self.req, self.body)
+                          self.controller.create, self.req, body=self.body)
 
     def test_create_instance_bad_flavor_href(self):
         image_href = 'http://localhost/v2/images/2'
@@ -2766,7 +2358,7 @@ class ServersControllerCreateTest(test.TestCase):
         self.body['server']['flavor_ref'] = flavor_ref
         self.req.body = jsonutils.dumps(self.body)
         self.assertRaises(webob.exc.HTTPBadRequest,
-                          self.controller.create, self.req, self.body)
+                          self.controller.create, self.req, body=self.body)
 
     def test_create_instance_bad_href(self):
         image_href = 'asdf'
@@ -2774,70 +2366,47 @@ class ServersControllerCreateTest(test.TestCase):
         self.req.body = jsonutils.dumps(self.body)
 
         self.assertRaises(webob.exc.HTTPBadRequest,
-                          self.controller.create, self.req, self.body)
+                          self.controller.create, self.req, body=self.body)
 
     def test_create_instance_local_href(self):
         self.req.body = jsonutils.dumps(self.body)
-        res = self.controller.create(self.req, self.body).obj
+        res = self.controller.create(self.req, body=self.body).obj
 
         server = res['server']
         self.assertEqual(FAKE_UUID, server['id'])
 
-    def test_create_instance_admin_pass(self):
-        self.body['server']['flavor_ref'] = 3,
-        self.body['server']['admin_pass'] = 'testpass'
+    def test_create_instance_admin_password(self):
+        self.body['server']['flavor_ref'] = 3
+        self.body['server']['admin_password'] = 'testpass'
         self.req.body = jsonutils.dumps(self.body)
-        res = self.controller.create(self.req, self.body).obj
+        res = self.controller.create(self.req, body=self.body).obj
 
         server = res['server']
-        self.assertEqual(server['admin_pass'],
-                         self.body['server']['admin_pass'])
+        self.assertEqual(server['admin_password'],
+                         self.body['server']['admin_password'])
 
-    def test_create_instance_admin_pass_pass_disabled(self):
+    def test_create_instance_admin_password_pass_disabled(self):
         self.flags(enable_instance_password=False)
-        self.body['server']['flavor_ref'] = 3,
-        self.body['server']['admin_pass'] = 'testpass'
+        self.body['server']['flavor_ref'] = 3
+        self.body['server']['admin_password'] = 'testpass'
         self.req.body = jsonutils.dumps(self.body)
-        res = self.controller.create(self.req, self.body).obj
+        res = self.controller.create(self.req, body=self.body).obj
 
         server = res['server']
-        self.assertTrue('admin_pass' in self.body['server'])
+        self.assertIn('admin_password', self.body['server'])
 
-    def test_create_instance_admin_pass_empty(self):
-        self.body['server']['flavor_ref'] = 3,
-        self.body['server']['admin_pass'] = ''
+    def test_create_instance_admin_password_empty(self):
+        self.body['server']['flavor_ref'] = 3
+        self.body['server']['admin_password'] = ''
         self.req.body = jsonutils.dumps(self.body)
 
         # The fact that the action doesn't raise is enough validation
-        self.controller.create(self.req, self.body)
-
-    def test_create_instance_invalid_personality(self):
-
-        def fake_create(*args, **kwargs):
-            codec = 'utf8'
-            content = 'b25zLiINCg0KLVJpY2hhcmQgQ$$%QQmFjaA=='
-            start_position = 19
-            end_position = 20
-            msg = 'invalid start byte'
-            raise UnicodeDecodeError(codec, content, start_position,
-                                     end_position, msg)
-
-        self.stubs.Set(compute_api.API,
-                       'create',
-                       fake_create)
-
-        self.body['server']['personality'][0]["contents"] = \
-            "b25zLiINCg0KLVJpY2hhcmQgQ$$%QQmFjaA=="
-
-        self.req.body = jsonutils.dumps(self.body)
-        self.assertRaises(webob.exc.HTTPBadRequest,
-                          self.controller.create, self.req, self.body)
+        self.controller.create(self.req, body=self.body)
 
     def test_create_location(self):
         selfhref = 'http://localhost/v2/fake/servers/%s' % FAKE_UUID
-        bookhref = 'http://localhost/fake/servers/%s' % FAKE_UUID
         self.req.body = jsonutils.dumps(self.body)
-        robj = self.controller.create(self.req, self.body)
+        robj = self.controller.create(self.req, body=self.body)
 
         self.assertEqual(robj['Location'], selfhref)
 
@@ -2847,10 +2416,10 @@ class ServersControllerCreateTest(test.TestCase):
         self.body['server']['flavor_ref'] = 3
         self.req.body = jsonutils.dumps(self.body)
         try:
-            server = self.controller.create(self.req, self.body).obj['server']
+            self.controller.create(self.req, body=self.body).obj['server']
             self.fail('expected quota to be exceeded')
         except webob.exc.HTTPRequestEntityTooLarge as e:
-            self.assertEquals(e.explanation, expected_msg)
+            self.assertEqual(e.explanation, expected_msg)
 
     def test_create_instance_above_quota_instances(self):
         msg = _('Quota exceeded for instances: Requested 1, but'
@@ -2867,700 +2436,69 @@ class ServersControllerCreateTest(test.TestCase):
                 ' already used 9 of 10 cores')
         self._do_test_create_instance_above_quota('cores', 1, 10, msg)
 
+    def test_create_instance_with_neutronv2_port_in_use(self):
+        network = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+        port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
+        requested_networks = [{'uuid': network, 'port': port}]
+        params = {'networks': requested_networks}
 
-class TestServerCreateRequestXMLDeserializer(test.TestCase):
+        def fake_create(*args, **kwargs):
+            raise exception.PortInUse(port_id=port)
 
-    def setUp(self):
-        super(TestServerCreateRequestXMLDeserializer, self).setUp()
-        ext_info = plugins.LoadedExtensionInfo()
-        servers_controller = servers.ServersController(extension_info=ext_info)
-        self.deserializer = servers.CreateDeserializer(servers_controller)
+        self.stubs.Set(compute_api.API, 'create', fake_create)
+        self.assertRaises(webob.exc.HTTPConflict,
+                          self._test_create_extra, params)
 
-    def test_minimal_request(self):
-        serial_request = """
-<server xmlns="http://docs.openstack.org/compute/api/v2"
-        name="new-server-test"
-        image_ref="1"
-        flavor_ref="2"/>"""
-        request = self.deserializer.deserialize(serial_request)
-        expected = {
-            "server": {
-                "name": "new-server-test",
-                "image_ref": "1",
-                "flavor_ref": "2",
-            },
-        }
-        self.assertEquals(request['body'], expected)
+    def test_create_multiple_instance_with_neutronv2_port(self):
+        network = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+        port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
+        requested_networks = [{'uuid': network, 'port': port}]
+        params = {'networks': requested_networks}
+        self.body['server']['max_count'] = 2
 
-    def test_xml_create_exception(self):
-        def fake_availablity_extract_xml_deserialize(self,
-                                                     server_node,
-                                                     server_dict):
-            raise KeyError
+        def fake_create(*args, **kwargs):
+            msg = _("Unable to launch multiple instances with"
+                    " a single configured port ID. Please launch your"
+                    " instance one by one with different ports.")
+            raise exception.MultiplePortsNotApplicable(reason=msg)
 
-        self.stubs.Set(availability_zone.AvailabilityZone,
-                       'server_xml_extract_server_deserialize',
-                       fake_availablity_extract_xml_deserialize)
-        serial_request = """
-<server xmlns="http://docs.openstack.org/compute/api/v2"
-        name="new-server-test"
-        image_ref="1"
-        flavor_ref="2"/>"""
-        self.assertRaises(KeyError, self.deserializer.deserialize,
-                          serial_request)
+        self.stubs.Set(compute_api.API, 'create', fake_create)
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self._test_create_extra, params)
 
-    def test_request_with_alternate_namespace_prefix(self):
-        serial_request = """
-<ns2:server xmlns:ns2="http://docs.openstack.org/compute/api/v2"
-        name="new-server-test"
-        image_ref="1"
-        flavor_ref="2">
-        <ns2:metadata><ns2:meta key="hello">world</ns2:meta></ns2:metadata>
-        </ns2:server>
-        """
-        request = self.deserializer.deserialize(serial_request)
-        expected = {
-            "server": {
-                "name": "new-server-test",
-                "image_ref": "1",
-                "flavor_ref": "2",
-                'metadata': {"hello": "world"},
-                },
-            }
-        self.assertEquals(request['body'], expected)
+    def test_create_instance_with_neturonv2_not_found_network(self):
+        network = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+        requested_networks = [{'uuid': network}]
+        params = {'networks': requested_networks}
 
-    def test_access_ipv4(self):
-        serial_request = """
-<server xmlns="http://docs.openstack.org/compute/api/v2"
-        name="new-server-test"
-        image_ref="1"
-        flavor_ref="2"
-        access_ip_v4="1.2.3.4"/>"""
-        request = self.deserializer.deserialize(serial_request)
-        expected = {
-            "server": {
-                "name": "new-server-test",
-                "image_ref": "1",
-                "flavor_ref": "2",
-                "access_ip_v4": "1.2.3.4",
-            },
-        }
-        self.assertEquals(request['body'], expected)
+        def fake_create(*args, **kwargs):
+            raise exception.NetworkNotFound(network_id=network)
 
-    def test_access_ipv6(self):
-        serial_request = """
-<server xmlns="http://docs.openstack.org/compute/api/v2"
-        name="new-server-test"
-        image_ref="1"
-        flavor_ref="2"
-        access_ip_v6="fead::1234"/>"""
-        request = self.deserializer.deserialize(serial_request)
-        expected = {
-            "server": {
-                "name": "new-server-test",
-                "image_ref": "1",
-                "flavor_ref": "2",
-                "access_ip_v6": "fead::1234",
-            },
-        }
-        self.assertEquals(request['body'], expected)
+        self.stubs.Set(compute_api.API, 'create', fake_create)
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self._test_create_extra, params)
 
-    def test_access_ip(self):
-        serial_request = """
-<server xmlns="http://docs.openstack.org/compute/api/v2"
-        name="new-server-test"
-        image_ref="1"
-        flavor_ref="2"
-        access_ip_v4="1.2.3.4"
-        access_ip_v6="fead::1234"/>"""
-        request = self.deserializer.deserialize(serial_request)
-        expected = {
-            "server": {
-                "name": "new-server-test",
-                "image_ref": "1",
-                "flavor_ref": "2",
-                "access_ip_v4": "1.2.3.4",
-                "access_ip_v6": "fead::1234",
-            },
-        }
-        self.assertEquals(request['body'], expected)
+    def test_create_instance_with_neutronv2_port_not_found(self):
+        network = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+        port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
+        requested_networks = [{'uuid': network, 'port': port}]
+        params = {'networks': requested_networks}
 
-    def test_admin_pass(self):
-        serial_request = """
-<server xmlns="http://docs.openstack.org/compute/api/v2"
-        name="new-server-test"
-        image_ref="1"
-        flavor_ref="2"
-        admin_pass="1234"/>"""
-        request = self.deserializer.deserialize(serial_request)
-        expected = {
-            "server": {
-                "name": "new-server-test",
-                "image_ref": "1",
-                "flavor_ref": "2",
-                "admin_pass": "1234",
-            },
-        }
-        self.assertEquals(request['body'], expected)
+        def fake_create(*args, **kwargs):
+            raise exception.PortNotFound(port_id=port)
 
-    def test_image_link(self):
-        serial_request = """
-<server xmlns="http://docs.openstack.org/compute/api/v2"
-        name="new-server-test"
-        image_ref="http://localhost:8774/v3/images/2"
-        flavor_ref="3"/>"""
-        request = self.deserializer.deserialize(serial_request)
-        expected = {
-            "server": {
-                "name": "new-server-test",
-                "image_ref": "http://localhost:8774/v3/images/2",
-                "flavor_ref": "3",
-            },
-        }
-        self.assertEquals(request['body'], expected)
-
-    def test_flavor_link(self):
-        serial_request = """
-<server xmlns="http://docs.openstack.org/compute/api/v2"
-        name="new-server-test"
-        image_ref="1"
-        flavor_ref="http://localhost:8774/v3/flavors/3"/>"""
-        request = self.deserializer.deserialize(serial_request)
-        expected = {
-            "server": {
-                "name": "new-server-test",
-                "image_ref": "1",
-                "flavor_ref": "http://localhost:8774/v3/flavors/3",
-            },
-        }
-        self.assertEquals(request['body'], expected)
-
-    def test_empty_metadata_personality(self):
-        serial_request = """
-<server xmlns="http://docs.openstack.org/compute/api/v2"
-        name="new-server-test"
-        image_ref="1"
-        flavor_ref="2">
-    <metadata/>
-    <personality/>
-</server>"""
-        request = self.deserializer.deserialize(serial_request)
-        expected = {
-            "server": {
-                "name": "new-server-test",
-                "image_ref": "1",
-                "flavor_ref": "2",
-                "metadata": {},
-                "personality": [],
-            },
-        }
-        self.assertEquals(request['body'], expected)
-
-    def test_multiple_metadata_items(self):
-        serial_request = """
-<server xmlns="http://docs.openstack.org/compute/api/v2"
-        name="new-server-test"
-        image_ref="1"
-        flavor_ref="2">
-    <metadata>
-        <meta key="one">two</meta>
-        <meta key="open">snack</meta>
-    </metadata>
-</server>"""
-        request = self.deserializer.deserialize(serial_request)
-        expected = {
-            "server": {
-                "name": "new-server-test",
-                "image_ref": "1",
-                "flavor_ref": "2",
-                "metadata": {"one": "two", "open": "snack"},
-            },
-        }
-        self.assertEquals(request['body'], expected)
-
-    def test_multiple_personality_files(self):
-        serial_request = """
-<server xmlns="http://docs.openstack.org/compute/api/v2"
-        name="new-server-test"
-        image_ref="1"
-        flavor_ref="2">
-    <personality>
-        <file path="/etc/banner.txt">MQ==</file>
-        <file path="/etc/hosts">Mg==</file>
-    </personality>
-</server>"""
-        request = self.deserializer.deserialize(serial_request)
-        expected = {
-            "server": {
-                "name": "new-server-test",
-                "image_ref": "1",
-                "flavor_ref": "2",
-                "personality": [
-                    {"path": "/etc/banner.txt", "contents": "MQ=="},
-                    {"path": "/etc/hosts", "contents": "Mg=="},
-                ],
-            },
-        }
-        self.assertThat(request['body'], matchers.DictMatches(expected))
-
-    def test_spec_request(self):
-        image_bookmark_link = ("http://servers.api.openstack.org/1234/"
-                               "images/52415800-8b69-11e0-9b19-734f6f006e54")
-        serial_request = """
-<server xmlns="http://docs.openstack.org/compute/api/v2"
-        image_ref="%s"
-        flavor_ref="52415800-8b69-11e0-9b19-734f1195ff37"
-        name="new-server-test">
-  <metadata>
-    <meta key="My Server Name">Apache1</meta>
-  </metadata>
-  <personality>
-    <file path="/etc/banner.txt">Mg==</file>
-  </personality>
-</server>""" % (image_bookmark_link)
-        request = self.deserializer.deserialize(serial_request)
-        expected = {
-            "server": {
-                "name": "new-server-test",
-                "image_ref": ("http://servers.api.openstack.org/1234/"
-                             "images/52415800-8b69-11e0-9b19-734f6f006e54"),
-                "flavor_ref": "52415800-8b69-11e0-9b19-734f1195ff37",
-                "metadata": {"My Server Name": "Apache1"},
-                "personality": [
-                    {
-                        "path": "/etc/banner.txt",
-                        "contents": "Mg==",
-                    },
-                ],
-            },
-        }
-        self.assertEquals(request['body'], expected)
-
-    def test_request_with_empty_networks(self):
-        serial_request = """
-<server xmlns="http://docs.openstack.org/compute/api/v2"
- name="new-server-test" image_ref="1" flavor_ref="1">
-    <networks/>
-</server>"""
-        request = self.deserializer.deserialize(serial_request)
-        expected = {"server": {
-                "name": "new-server-test",
-                "image_ref": "1",
-                "flavor_ref": "1",
-                "networks": [],
-                }}
-        self.assertEquals(request['body'], expected)
-
-    def test_request_with_one_network(self):
-        serial_request = """
-<server xmlns="http://docs.openstack.org/compute/api/v2"
- name="new-server-test" image_ref="1" flavor_ref="1">
-    <networks>
-       <network uuid="1" fixed_ip="10.0.1.12"/>
-    </networks>
-</server>"""
-        request = self.deserializer.deserialize(serial_request)
-        expected = {"server": {
-                "name": "new-server-test",
-                "image_ref": "1",
-                "flavor_ref": "1",
-                "networks": [{"uuid": "1", "fixed_ip": "10.0.1.12"}],
-                }}
-        self.assertEquals(request['body'], expected)
-
-    def test_request_with_two_networks(self):
-        serial_request = """
-<server xmlns="http://docs.openstack.org/compute/api/v2"
- name="new-server-test" image_ref="1" flavor_ref="1">
-    <networks>
-       <network uuid="1" fixed_ip="10.0.1.12"/>
-       <network uuid="2" fixed_ip="10.0.2.12"/>
-    </networks>
-</server>"""
-        request = self.deserializer.deserialize(serial_request)
-        expected = {"server": {
-                "name": "new-server-test",
-                "image_ref": "1",
-                "flavor_ref": "1",
-                "networks": [{"uuid": "1", "fixed_ip": "10.0.1.12"},
-                             {"uuid": "2", "fixed_ip": "10.0.2.12"}],
-                }}
-        self.assertEquals(request['body'], expected)
-
-    def test_request_with_second_network_node_ignored(self):
-        serial_request = """
-<server xmlns="http://docs.openstack.org/compute/api/v2"
- name="new-server-test" image_ref="1" flavor_ref="1">
-    <networks>
-       <network uuid="1" fixed_ip="10.0.1.12"/>
-    </networks>
-    <networks>
-       <network uuid="2" fixed_ip="10.0.2.12"/>
-    </networks>
-</server>"""
-        request = self.deserializer.deserialize(serial_request)
-        expected = {"server": {
-                "name": "new-server-test",
-                "image_ref": "1",
-                "flavor_ref": "1",
-                "networks": [{"uuid": "1", "fixed_ip": "10.0.1.12"}],
-                }}
-        self.assertEquals(request['body'], expected)
-
-    def test_request_with_one_network_missing_id(self):
-        serial_request = """
-<server xmlns="http://docs.openstack.org/compute/api/v2"
- name="new-server-test" image_ref="1" flavor_ref="1">
-    <networks>
-       <network fixed_ip="10.0.1.12"/>
-    </networks>
-</server>"""
-        request = self.deserializer.deserialize(serial_request)
-        expected = {"server": {
-                "name": "new-server-test",
-                "image_ref": "1",
-                "flavor_ref": "1",
-                "networks": [{"fixed_ip": "10.0.1.12"}],
-                }}
-        self.assertEquals(request['body'], expected)
-
-    def test_request_with_one_network_missing_fixed_ip(self):
-        serial_request = """
-<server xmlns="http://docs.openstack.org/compute/api/v2"
- name="new-server-test" image_ref="1" flavor_ref="1">
-    <networks>
-       <network uuid="1"/>
-    </networks>
-</server>"""
-        request = self.deserializer.deserialize(serial_request)
-        expected = {"server": {
-                "name": "new-server-test",
-                "image_ref": "1",
-                "flavor_ref": "1",
-                "networks": [{"uuid": "1"}],
-                }}
-        self.assertEquals(request['body'], expected)
-
-    def test_request_with_one_network_empty_id(self):
-        serial_request = """
-    <server xmlns="http://docs.openstack.org/compute/api/v2"
-     name="new-server-test" image_ref="1" flavor_ref="1">
-        <networks>
-           <network uuid="" fixed_ip="10.0.1.12"/>
-        </networks>
-    </server>"""
-        request = self.deserializer.deserialize(serial_request)
-        expected = {"server": {
-                "name": "new-server-test",
-                "image_ref": "1",
-                "flavor_ref": "1",
-                "networks": [{"uuid": "", "fixed_ip": "10.0.1.12"}],
-                }}
-        self.assertEquals(request['body'], expected)
-
-    def test_request_with_one_network_empty_fixed_ip(self):
-        serial_request = """
-    <server xmlns="http://docs.openstack.org/compute/api/v2"
-     name="new-server-test" image_ref="1" flavor_ref="1">
-        <networks>
-           <network uuid="1" fixed_ip=""/>
-        </networks>
-    </server>"""
-        request = self.deserializer.deserialize(serial_request)
-        expected = {"server": {
-                "name": "new-server-test",
-                "image_ref": "1",
-                "flavor_ref": "1",
-                "networks": [{"uuid": "1", "fixed_ip": ""}],
-                }}
-        self.assertEquals(request['body'], expected)
-
-    def test_request_with_networks_duplicate_ids(self):
-        serial_request = """
-    <server xmlns="http://docs.openstack.org/compute/api/v2"
-     name="new-server-test" image_ref="1" flavor_ref="1">
-        <networks>
-           <network uuid="1" fixed_ip="10.0.1.12"/>
-           <network uuid="1" fixed_ip="10.0.2.12"/>
-        </networks>
-    </server>"""
-        request = self.deserializer.deserialize(serial_request)
-        expected = {"server": {
-                "name": "new-server-test",
-                "image_ref": "1",
-                "flavor_ref": "1",
-                "networks": [{"uuid": "1", "fixed_ip": "10.0.1.12"},
-                             {"uuid": "1", "fixed_ip": "10.0.2.12"}],
-                }}
-        self.assertEquals(request['body'], expected)
-
-    def test_request_with_multiple_create_args(self):
-        serial_request = """
-    <server xmlns="http://docs.openstack.org/compute/api/v2"
-     name="new-server-test" image_ref="1" flavor_ref="1"
-     min_count="1" max_count="3" return_reservation_id="True">
-    </server>"""
-        request = self.deserializer.deserialize(serial_request)
-        expected = {"server": {
-                "name": "new-server-test",
-                "image_ref": "1",
-                "flavor_ref": "1",
-                "min_count": "1",
-                "max_count": "3",
-                "return_reservation_id": True,
-                }}
-        self.assertEquals(request['body'], expected)
-
-    # TODO(cyeoh): bp-v3-api-unittests
-    # This needs to be ported to the OS-DCF extension tests
-    # def test_request_with_disk_config(self):
-    #     serial_request = """
-    # <server xmlns="http://docs.openstack.org/compute/api/v2"
-    # xmlns:OS-DCF="http://docs.openstack.org/compute/ext/disk_config/api/v1.1"
-    #  name="new-server-test" imageRef="1" flavorRef="1"
-    #  OS-DCF:diskConfig="AUTO">
-    # </server>"""
-    #     request = self.deserializer.deserialize(serial_request)
-    #     expected = {"server": {
-    #             "name": "new-server-test",
-    #             "imageRef": "1",
-    #             "flavorRef": "1",
-    #             "OS-DCF:diskConfig": "AUTO",
-    #             }}
-    #     self.assertEquals(request['body'], expected)
-
-    # TODO(cyeoh): bp-v3-api-unittests
-    # This needs to be ported to the scheduler hints extension tests
-    # def test_request_with_scheduler_hints(self):
-    #     serial_request = """
-    # <server xmlns="http://docs.openstack.org/compute/api/v2"
-    #  xmlns:OS-SCH-HNT=
-    #  "http://docs.openstack.org/compute/ext/scheduler-hints/api/v2"
-    #  name="new-server-test" imageRef="1" flavorRef="1">
-    #    <OS-SCH-HNT:scheduler_hints>
-    #      <different_host>
-    #        7329b667-50c7-46a6-b913-cb2a09dfeee0
-    #      </different_host>
-    #      <different_host>
-    #        f31efb24-34d2-43e1-8b44-316052956a39
-    #      </different_host>
-    #    </OS-SCH-HNT:scheduler_hints>
-    # </server>"""
-    #     request = self.deserializer.deserialize(serial_request)
-    #     expected = {"server": {
-    #             "name": "new-server-test",
-    #             "imageRef": "1",
-    #             "flavorRef": "1",
-    #             "OS-SCH-HNT:scheduler_hints": {
-    #                 "different_host": [
-    #                     "7329b667-50c7-46a6-b913-cb2a09dfeee0",
-    #                     "f31efb24-34d2-43e1-8b44-316052956a39",
-    #                 ]
-    #             }
-    #             }}
-    #     self.assertEquals(request['body'], expected)
-
-    def test_request_with_block_device_mapping(self):
-        serial_request = """
-    <server xmlns="http://docs.openstack.org/compute/api/v2"
-     name="new-server-test" image_ref="1" flavor_ref="1">
-       <block_device_mapping>
-         <mapping volume_id="7329b667-50c7-46a6-b913-cb2a09dfeee0"
-          device_name="/dev/vda" virtual_name="root"
-          delete_on_termination="False" />
-         <mapping snapshot_id="f31efb24-34d2-43e1-8b44-316052956a39"
-          device_name="/dev/vdb" virtual_name="ephemeral0"
-          delete_on_termination="False" />
-         <mapping device_name="/dev/vdc" no_device="True" />
-       </block_device_mapping>
-    </server>"""
-        request = self.deserializer.deserialize(serial_request)
-        expected = {"server": {
-                "name": "new-server-test",
-                "image_ref": "1",
-                "flavor_ref": "1",
-                "block_device_mapping": [
-                    {
-                        "volume_id": "7329b667-50c7-46a6-b913-cb2a09dfeee0",
-                        "device_name": "/dev/vda",
-                        "virtual_name": "root",
-                        "delete_on_termination": False,
-                    },
-                    {
-                        "snapshot_id": "f31efb24-34d2-43e1-8b44-316052956a39",
-                        "device_name": "/dev/vdb",
-                        "virtual_name": "ephemeral0",
-                        "delete_on_termination": False,
-                    },
-                    {
-                        "device_name": "/dev/vdc",
-                        "no_device": True,
-                    },
-                ]
-                }}
-        self.assertEquals(request['body'], expected)
-
-    def test_corrupt_xml(self):
-        """Should throw a 400 error on corrupt xml."""
-        self.assertRaises(
-                exception.MalformedRequestBody,
-                self.deserializer.deserialize,
-                utils.killer_xml_body())
-
-
-# TODO(cyeoh): bp-v3-api-unittests
-# This needs to be ported to the OS-DCF extension tests
-# class TestServerActionRequestXMLDeserializer(test.TestCase):
-
-#     def setUp(self):
-#         super(TestServerActionRequestXMLDeserializer, self).setUp()
-#         self.deserializer = servers.ActionDeserializer()
-
-#     def test_rebuild_request(self):
-#         serial_request = """
-# <rebuild xmlns="http://docs.openstack.org/compute/api/v1.1"
-#    xmlns:OS-DCF="http://docs.openstack.org/compute/ext/disk_config/api/v1.1"
-#    OS-DCF:diskConfig="MANUAL" imageRef="1"/>"""
-#         request = self.deserializer.deserialize(serial_request)
-#         expected = {
-#             "rebuild": {
-#                 "imageRef": "1",
-#                 "OS-DCF:diskConfig": "MANUAL",
-#                 },
-#             }
-#         self.assertEquals(request['body'], expected)
-
-#     def test_rebuild_request_auto_disk_config_compat(self):
-#         serial_request = """
-# <rebuild xmlns="http://docs.openstack.org/compute/api/v1.1"
-#    xmlns:OS-DCF="http://docs.openstack.org/compute/ext/disk_config/api/v1.1"
-#    auto_disk_config="MANUAL" imageRef="1"/>"""
-#         request = self.deserializer.deserialize(serial_request)
-#         expected = {
-#             "rebuild": {
-#                 "imageRef": "1",
-#                 "OS-DCF:diskConfig": "MANUAL",
-#                 },
-#             }
-#         self.assertEquals(request['body'], expected)
-
-#     def test_resize_request(self):
-#         serial_request = """
-# <resize xmlns="http://docs.openstack.org/compute/api/v1.1"
-#    xmlns:OS-DCF="http://docs.openstack.org/compute/ext/disk_config/api/v1.1"
-#    OS-DCF:diskConfig="MANUAL" flavorRef="1"/>"""
-#         request = self.deserializer.deserialize(serial_request)
-#         expected = {
-#             "resize": {
-#                 "flavorRef": "1",
-#                 "OS-DCF:diskConfig": "MANUAL",
-#                 },
-#             }
-#         self.assertEquals(request['body'], expected)
-
-#     def test_resize_request_auto_disk_config_compat(self):
-#         serial_request = """
-# <resize xmlns="http://docs.openstack.org/compute/api/v1.1"
-#    xmlns:OS-DCF="http://docs.openstack.org/compute/ext/disk_config/api/v1.1"
-#    auto_disk_config="MANUAL" flavorRef="1"/>"""
-#         request = self.deserializer.deserialize(serial_request)
-#         expected = {
-#             "resize": {
-#                 "flavorRef": "1",
-#                 "OS-DCF:diskConfig": "MANUAL",
-#                 },
-#             }
-#         self.assertEquals(request['body'], expected)
-
-
-class TestAddressesXMLSerialization(test.TestCase):
-
-    index_serializer = ips.AddressesTemplate()
-    show_serializer = ips.NetworkTemplate()
-
-    def test_xml_declaration(self):
-        fixture = {
-            'network_2': [
-                {'addr': '192.168.0.1', 'version': 4,
-                 'type': 'fixed', 'mac_addr': 'aa:aa:aa:aa:aa:aa'},
-                {'addr': 'fe80::beef', 'version': 6,
-                 'type': 'fixed', 'mac_addr': 'aa:aa:aa:aa:aa:aa'}
-            ],
-        }
-        output = self.show_serializer.serialize(fixture)
-        has_dec = output.startswith("<?xml version='1.0' encoding='UTF-8'?>")
-        self.assertTrue(has_dec)
-
-    def test_show(self):
-        fixture = {
-            'network_2': [
-                {'addr': '192.168.0.1', 'version': 4,
-                 'type': 'fixed', 'mac_addr': 'aa:aa:aa:aa:aa:aa'},
-                {'addr': 'fe80::beef', 'version': 6,
-                 'type': 'fixed', 'mac_addr': 'aa:aa:aa:aa:aa:aa'}
-            ],
-        }
-        output = self.show_serializer.serialize(fixture)
-        root = etree.XML(output)
-        network = fixture['network_2']
-        self.assertEqual(str(root.get('id')), 'network_2')
-        ip_elems = root.findall('{0}ip'.format(NS))
-        for z, ip_elem in enumerate(ip_elems):
-            ip = network[z]
-            self.assertEqual(str(ip_elem.get('version')),
-                             str(ip['version']))
-            self.assertEqual(str(ip_elem.get('addr')),
-                             str(ip['addr']))
-            self.assertEqual(str(ip_elem.get('type')),
-                                 str(ip['type']))
-            self.assertEqual(str(ip_elem.get('mac_addr')),
-                                 str(ip['mac_addr']))
-
-    def test_index(self):
-        fixture = {
-            'addresses': {
-                'network_1': [
-                    {'addr': '192.168.0.3', 'version': 4,
-                     'type': 'fixed', 'mac_addr': 'aa:aa:aa:aa:aa:aa'},
-                    {'addr': '192.168.0.5', 'version': 4,
-                     'type': 'fixed', 'mac_addr': 'aa:aa:aa:aa:aa:aa'}
-                ],
-                'network_2': [
-                    {'addr': '192.168.0.1', 'version': 4,
-                     'type': 'fixed', 'mac_addr': 'aa:aa:aa:aa:aa:aa'},
-                    {'addr': 'fe80::beef', 'version': 6,
-                     'type': 'fixed', 'mac_addr': 'aa:aa:aa:aa:aa:aa'}
-                ],
-            },
-        }
-        output = self.index_serializer.serialize(fixture)
-        root = etree.XML(output)
-        xmlutil.validate_schema(root, 'addresses', version='v3')
-        addresses_dict = fixture['addresses']
-        network_elems = root.findall('{0}network'.format(NS))
-        self.assertEqual(len(network_elems), 2)
-        for i, network_elem in enumerate(network_elems):
-            network = addresses_dict.items()[i]
-            self.assertEqual(str(network_elem.get('id')), str(network[0]))
-            ip_elems = network_elem.findall('{0}ip'.format(NS))
-            for z, ip_elem in enumerate(ip_elems):
-                ip = network[1][z]
-                self.assertEqual(str(ip_elem.get('version')),
-                                 str(ip['version']))
-                self.assertEqual(str(ip_elem.get('addr')),
-                                 str(ip['addr']))
-                self.assertEqual(str(ip_elem.get('type')),
-                                 str(ip['type']))
-                self.assertEqual(str(ip_elem.get('mac_addr')),
-                                 str(ip['mac_addr']))
+        self.stubs.Set(compute_api.API, 'create', fake_create)
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self._test_create_extra, params)
 
 
 class ServersViewBuilderTest(test.TestCase):
 
     def setUp(self):
         super(ServersViewBuilderTest, self).setUp()
+        CONF.set_override('glance_host', 'localhost')
         self.flags(use_ipv6=True)
-        self.instance = fakes.stub_instance(
+        db_inst = fakes.stub_instance(
             id=1,
             image_ref="5",
             uuid="deadbeef-feed-edee-beef-d0ea7beefedd",
@@ -3585,9 +2523,14 @@ class ServersViewBuilderTest(test.TestCase):
         fakes.stub_out_nw_api_get_floating_ips_by_fixed_address(self.stubs,
                                                                 floaters)
 
-        self.uuid = self.instance['uuid']
+        self.uuid = db_inst['uuid']
         self.view_builder = views.servers.ViewBuilderV3()
         self.request = fakes.HTTPRequestV3.blank("")
+        self.request.context = context.RequestContext('fake', 'fake')
+        self.instance = fake_instance.fake_instance_obj(
+                    self.request.context,
+                    expected_attrs=instance_obj.INSTANCE_DEFAULT_FIELDS,
+                    **db_inst)
 
     def test_get_flavor_valid_instance_type(self):
         flavor_bookmark = "http://localhost/flavors/1"
@@ -3643,7 +2586,7 @@ class ServersViewBuilderTest(test.TestCase):
         self.assertThat(output, matchers.DictMatches(expected_server))
 
     def test_build_server_detail(self):
-        image_bookmark = "http://localhost/images/5"
+        image_bookmark = "http://localhost:9292/images/5"
         flavor_bookmark = "http://localhost/flavors/1"
         self_link = "http://localhost/v3/servers/%s" % self.uuid
         bookmark_link = "http://localhost/servers/%s" % self.uuid
@@ -3657,8 +2600,6 @@ class ServersViewBuilderTest(test.TestCase):
                 "progress": 0,
                 "name": "test_server",
                 "status": "BUILD",
-                "access_ip_v4": "",
-                "access_ip_v6": "",
                 "host_id": '',
                 "image": {
                     "id": "5",
@@ -3706,19 +2647,14 @@ class ServersViewBuilderTest(test.TestCase):
     def test_build_server_no_image(self):
         self.instance["image_ref"] = ""
         output = self.view_builder.show(self.request, self.instance)
-        self.assertEqual(output['server']['image'], "")
+        self.assertEqual(output['server']['image'], {})
 
     def test_build_server_detail_with_fault(self):
         self.instance['vm_state'] = vm_states.ERROR
-        self.instance['fault'] = {
-            'code': 404,
-            'instance_uuid': self.uuid,
-            'message': "HTTPNotFound",
-            'details': "Stock details for test",
-            'created_at': datetime.datetime(2010, 10, 10, 12, 0, 0),
-        }
+        self.instance['fault'] = fake_instance.fake_fault_obj(
+                                     self.request.context, self.uuid)
 
-        image_bookmark = "http://localhost/images/5"
+        image_bookmark = "http://localhost:9292/images/5"
         flavor_bookmark = "http://localhost/flavors/1"
         self_link = "http://localhost/v3/servers/%s" % self.uuid
         bookmark_link = "http://localhost/servers/%s" % self.uuid
@@ -3731,8 +2667,6 @@ class ServersViewBuilderTest(test.TestCase):
                 "created": "2010-10-10T12:00:00Z",
                 "name": "test_server",
                 "status": "ERROR",
-                "access_ip_v4": "",
-                "access_ip_v6": "",
                 "host_id": '',
                 "image": {
                     "id": "5",
@@ -3784,15 +2718,32 @@ class ServersViewBuilderTest(test.TestCase):
         output = self.view_builder.show(self.request, self.instance)
         self.assertThat(output, matchers.DictMatches(expected_server))
 
+    def test_build_server_detail_with_fault_that_has_been_deleted(self):
+        self.instance['deleted'] = 1
+        self.instance['vm_state'] = vm_states.ERROR
+        fault = fake_instance.fake_fault_obj(self.request.context,
+                                             self.uuid, code=500,
+                                             message="No valid host was found")
+        self.instance['fault'] = fault
+
+        expected_fault = {"code": 500,
+                          "created": "2010-10-10T12:00:00Z",
+                          "message": "No valid host was found"}
+
+        self.request.context = context.RequestContext('fake', 'fake')
+        output = self.view_builder.show(self.request, self.instance)
+        # Regardless of vm_state deleted servers sholud be DELETED
+        self.assertEqual("DELETED", output['server']['status'])
+        self.assertThat(output['server']['fault'],
+                        matchers.DictMatches(expected_fault))
+
     def test_build_server_detail_with_fault_no_details_not_admin(self):
         self.instance['vm_state'] = vm_states.ERROR
-        self.instance['fault'] = {
-            'code': 500,
-            'instance_uuid': self.uuid,
-            'message': "Error",
-            'details': 'Stock details for test',
-            'created_at': datetime.datetime(2010, 10, 10, 12, 0, 0),
-        }
+        self.instance['fault'] = fake_instance.fake_fault_obj(
+                                                   self.request.context,
+                                                   self.uuid,
+                                                   code=500,
+                                                   message='Error')
 
         expected_fault = {"code": 500,
                           "created": "2010-10-10T12:00:00Z",
@@ -3805,13 +2756,11 @@ class ServersViewBuilderTest(test.TestCase):
 
     def test_build_server_detail_with_fault_admin(self):
         self.instance['vm_state'] = vm_states.ERROR
-        self.instance['fault'] = {
-            'code': 500,
-            'instance_uuid': self.uuid,
-            'message': "Error",
-            'details': 'Stock details for test',
-            'created_at': datetime.datetime(2010, 10, 10, 12, 0, 0),
-        }
+        self.instance['fault'] = fake_instance.fake_fault_obj(
+                                                   self.request.context,
+                                                   self.uuid,
+                                                   code=500,
+                                                   message='Error')
 
         expected_fault = {"code": 500,
                           "created": "2010-10-10T12:00:00Z",
@@ -3825,13 +2774,12 @@ class ServersViewBuilderTest(test.TestCase):
 
     def test_build_server_detail_with_fault_no_details_admin(self):
         self.instance['vm_state'] = vm_states.ERROR
-        self.instance['fault'] = {
-            'code': 500,
-            'instance_uuid': self.uuid,
-            'message': "Error",
-            'details': '',
-            'created_at': datetime.datetime(2010, 10, 10, 12, 0, 0),
-        }
+        self.instance['fault'] = fake_instance.fake_fault_obj(
+                                                   self.request.context,
+                                                   self.uuid,
+                                                   code=500,
+                                                   message='Error',
+                                                   details='')
 
         expected_fault = {"code": 500,
                           "created": "2010-10-10T12:00:00Z",
@@ -3845,27 +2793,17 @@ class ServersViewBuilderTest(test.TestCase):
     def test_build_server_detail_with_fault_but_active(self):
         self.instance['vm_state'] = vm_states.ACTIVE
         self.instance['progress'] = 100
-        self.instance['fault'] = {
-            'code': 404,
-            'instance_uuid': self.uuid,
-            'message': "HTTPNotFound",
-            'details': "Stock details for test",
-            'created_at': datetime.datetime(2010, 10, 10, 12, 0, 0),
-        }
-
-        image_bookmark = "http://localhost/images/5"
-        flavor_bookmark = "http://localhost/flavors/1"
-        self_link = "http://localhost/v3/servers/%s" % self.uuid
-        bookmark_link = "http://localhost/servers/%s" % self.uuid
+        self.instance['fault'] = fake_instance.fake_fault_obj(
+                                     self.request.context, self.uuid)
 
         output = self.view_builder.show(self.request, self.instance)
-        self.assertFalse('fault' in output['server'])
+        self.assertNotIn('fault', output['server'])
 
     def test_build_server_detail_active_status(self):
         #set the power state of the instance to running
         self.instance['vm_state'] = vm_states.ACTIVE
         self.instance['progress'] = 100
-        image_bookmark = "http://localhost/images/5"
+        image_bookmark = "http://localhost:9292/images/5"
         flavor_bookmark = "http://localhost/flavors/1"
         self_link = "http://localhost/v3/servers/%s" % self.uuid
         bookmark_link = "http://localhost/servers/%s" % self.uuid
@@ -3879,8 +2817,6 @@ class ServersViewBuilderTest(test.TestCase):
                 "progress": 100,
                 "name": "test_server",
                 "status": "ACTIVE",
-                "access_ip_v4": "",
-                "access_ip_v6": "",
                 "host_id": '',
                 "image": {
                     "id": "5",
@@ -3925,141 +2861,14 @@ class ServersViewBuilderTest(test.TestCase):
         output = self.view_builder.show(self.request, self.instance)
         self.assertThat(output, matchers.DictMatches(expected_server))
 
-    def test_build_server_detail_with_accessipv4(self):
-
-        self.instance['access_ip_v4'] = '1.2.3.4'
-
-        image_bookmark = "http://localhost/images/5"
-        flavor_bookmark = "http://localhost/flavors/1"
-        self_link = "http://localhost/v3/servers/%s" % self.uuid
-        bookmark_link = "http://localhost/servers/%s" % self.uuid
-        expected_server = {
-            "server": {
-                "id": self.uuid,
-                "user_id": "fake_user",
-                "tenant_id": "fake_project",
-                "updated": "2010-11-11T11:00:00Z",
-                "created": "2010-10-10T12:00:00Z",
-                "progress": 0,
-                "name": "test_server",
-                "status": "BUILD",
-                "host_id": '',
-                "image": {
-                    "id": "5",
-                    "links": [
-                        {
-                            "rel": "bookmark",
-                            "href": image_bookmark,
-                        },
-                    ],
-                },
-                "flavor": {
-                    "id": "1",
-                    "links": [
-                                              {
-                            "rel": "bookmark",
-                            "href": flavor_bookmark,
-                        },
-                    ],
-                },
-                "addresses": {
-                    'test1': [
-                        {'version': 4, 'addr': '192.168.1.100',
-                         'type': 'fixed', 'mac_addr': 'aa:aa:aa:aa:aa:aa'},
-                        {'version': 6, 'addr': '2001:db8:0:1::1',
-                         'type': 'fixed', 'mac_addr': 'aa:aa:aa:aa:aa:aa'},
-                    ]
-                },
-                "metadata": {},
-                "access_ip_v4": "1.2.3.4",
-                "access_ip_v6": "",
-                "links": [
-                    {
-                        "rel": "self",
-                        "href": self_link,
-                    },
-                    {
-                        "rel": "bookmark",
-                        "href": bookmark_link,
-                    },
-                ],
-            }
-        }
-
-        output = self.view_builder.show(self.request, self.instance)
-        self.assertThat(output, matchers.DictMatches(expected_server))
-
-    def test_build_server_detail_with_accessipv6(self):
-
-        self.instance['access_ip_v6'] = 'fead::1234'
-
-        image_bookmark = "http://localhost/images/5"
-        flavor_bookmark = "http://localhost/flavors/1"
-        self_link = "http://localhost/v3/servers/%s" % self.uuid
-        bookmark_link = "http://localhost/servers/%s" % self.uuid
-        expected_server = {
-            "server": {
-                "id": self.uuid,
-                "user_id": "fake_user",
-                "tenant_id": "fake_project",
-                "updated": "2010-11-11T11:00:00Z",
-                "created": "2010-10-10T12:00:00Z",
-                "progress": 0,
-                "name": "test_server",
-                "status": "BUILD",
-                "host_id": '',
-                "image": {
-                    "id": "5",
-                    "links": [
-                        {
-                            "rel": "bookmark",
-                            "href": image_bookmark,
-                        },
-                    ],
-                },
-                "flavor": {
-                    "id": "1",
-                    "links": [
-                                              {
-                            "rel": "bookmark",
-                            "href": flavor_bookmark,
-                        },
-                    ],
-                },
-                "addresses": {
-                    'test1': [
-                        {'version': 4, 'addr': '192.168.1.100',
-                         'type': 'fixed', 'mac_addr': 'aa:aa:aa:aa:aa:aa'},
-                        {'version': 6, 'addr': '2001:db8:0:1::1',
-                         'type': 'fixed', 'mac_addr': 'aa:aa:aa:aa:aa:aa'},
-                    ]
-                },
-                "metadata": {},
-                "access_ip_v4": "",
-                "access_ip_v6": "fead::1234",
-                "links": [
-                    {
-                        "rel": "self",
-                        "href": self_link,
-                    },
-                    {
-                        "rel": "bookmark",
-                        "href": bookmark_link,
-                    },
-                ],
-            }
-        }
-
-        output = self.view_builder.show(self.request, self.instance)
-        self.assertThat(output, matchers.DictMatches(expected_server))
-
     def test_build_server_detail_with_metadata(self):
 
         metadata = []
         metadata.append(models.InstanceMetadata(key="Open", value="Stack"))
+        metadata = nova_utils.metadata_to_dict(metadata)
         self.instance['metadata'] = metadata
 
-        image_bookmark = "http://localhost/images/5"
+        image_bookmark = "http://localhost:9292/images/5"
         flavor_bookmark = "http://localhost/flavors/1"
         self_link = "http://localhost/v3/servers/%s" % self.uuid
         bookmark_link = "http://localhost/servers/%s" % self.uuid
@@ -4073,8 +2882,6 @@ class ServersViewBuilderTest(test.TestCase):
                 "progress": 0,
                 "name": "test_server",
                 "status": "BUILD",
-                "access_ip_v4": "",
-                "access_ip_v6": "",
                 "host_id": '',
                 "image": {
                     "id": "5",
@@ -4120,1024 +2927,22 @@ class ServersViewBuilderTest(test.TestCase):
         self.assertThat(output, matchers.DictMatches(expected_server))
 
 
-class ServerXMLSerializationTest(test.TestCase):
-
-    TIMESTAMP = "2010-10-11T10:30:22Z"
-    SERVER_HREF = 'http://localhost/v3/servers/%s' % FAKE_UUID
-    SERVER_NEXT = 'http://localhost/v3/servers?limit=%s&marker=%s'
-    SERVER_BOOKMARK = 'http://localhost/servers/%s' % FAKE_UUID
-    IMAGE_BOOKMARK = 'http://localhost/images/5'
-    FLAVOR_BOOKMARK = 'http://localhost/flavors/1'
-
-    def test_xml_declaration(self):
-        serializer = servers.ServerTemplate()
-
-        fixture = {
-            "server": {
-                'id': FAKE_UUID,
-                'user_id': 'fake_user_id',
-                'tenant_id': 'fake_tenant_id',
-                'created': self.TIMESTAMP,
-                'updated': self.TIMESTAMP,
-                "progress": 0,
-                "name": "test_server",
-                "status": "BUILD",
-                "host_id": 'e4d909c290d0fb1ca068ffaddf22cbd0',
-                "access_ip_v4": "1.2.3.4",
-                "access_ip_v6": "fead::1234",
-                "image": {
-                    "id": "5",
-                    "links": [
-                        {
-                            "rel": "bookmark",
-                            "href": self.IMAGE_BOOKMARK,
-                        },
-                    ],
-                },
-                "flavor": {
-                    "id": "1",
-                    "links": [
-                        {
-                            "rel": "bookmark",
-                            "href": self.FLAVOR_BOOKMARK,
-                        },
-                    ],
-                },
-                "addresses": {
-                    "network_one": [
-                        {
-                            "version": 4,
-                            "addr": "67.23.10.138",
-                            "type": "fixed",
-                            "mac_addr": "aa:aa:aa:aa:aa:aa"
-                        },
-                        {
-                            "version": 6,
-                            "addr": "::babe:67.23.10.138",
-                            "type": "fixed",
-                            "mac_addr": "aa:aa:aa:aa:aa:aa"
-                        },
-                    ],
-                    "network_two": [
-                        {
-                            "version": 4,
-                            "addr": "67.23.10.139",
-                            "type": "fixed",
-                            "mac_addr": "aa:aa:aa:aa:aa:aa"
-                        },
-                        {
-                            "version": 6,
-                            "addr": "::babe:67.23.10.139",
-                            "type": "fixed",
-                            "mac_addr": "aa:aa:aa:aa:aa:aa"
-                        },
-                    ],
-                },
-                "metadata": {
-                    "Open": "Stack",
-                    "Number": "1",
-                },
-                'links': [
-                    {
-                        'href': self.SERVER_HREF,
-                        'rel': 'self',
-                    },
-                    {
-                        'href': self.SERVER_BOOKMARK,
-                        'rel': 'bookmark',
-                    },
-                ],
-            }
-        }
-
-        output = serializer.serialize(fixture)
-        has_dec = output.startswith("<?xml version='1.0' encoding='UTF-8'?>")
-        self.assertTrue(has_dec)
-
-    def test_show(self):
-        serializer = servers.ServerTemplate()
-
-        fixture = {
-            "server": {
-                "id": FAKE_UUID,
-                "user_id": "fake",
-                "tenant_id": "fake",
-                'created': self.TIMESTAMP,
-                'updated': self.TIMESTAMP,
-                "progress": 0,
-                "name": "test_server",
-                "status": "BUILD",
-                "host_id": 'e4d909c290d0fb1ca068ffaddf22cbd0',
-                "access_ip_v4": "1.2.3.4",
-                "access_ip_v6": "fead::1234",
-                "image": {
-                    "id": "5",
-                    "links": [
-                        {
-                            "rel": "bookmark",
-                            "href": self.IMAGE_BOOKMARK,
-                        },
-                    ],
-                },
-                "flavor": {
-                    "id": "1",
-                    "links": [
-                        {
-                            "rel": "bookmark",
-                            "href": self.FLAVOR_BOOKMARK,
-                        },
-                    ],
-                },
-                "addresses": {
-                    "network_one": [
-                        {
-                            "version": 4,
-                            "addr": "67.23.10.138",
-                            "type": "fixed",
-                            "mac_addr": "aa:aa:aa:aa:aa:aa"
-                        },
-                        {
-                            "version": 6,
-                            "addr": "::babe:67.23.10.138",
-                            "type": "fixed",
-                            "mac_addr": "aa:aa:aa:aa:aa:aa"
-                        },
-                    ],
-                    "network_two": [
-                        {
-                            "version": 4,
-                            "addr": "67.23.10.139",
-                            "type": "fixed",
-                            "mac_addr": "aa:aa:aa:aa:aa:aa"
-                        },
-                        {
-                            "version": 6,
-                            "addr": "::babe:67.23.10.139",
-                            "type": "fixed",
-                            "mac_addr": "aa:aa:aa:aa:aa:aa"
-                        },
-                    ],
-                },
-                "metadata": {
-                    "Open": "Stack",
-                    "Number": "1",
-                },
-                'links': [
-                    {
-                        'href': self.SERVER_HREF,
-                        'rel': 'self',
-                    },
-                    {
-                        'href': self.SERVER_BOOKMARK,
-                        'rel': 'bookmark',
-                    },
-                ],
-            }
-        }
-
-        output = serializer.serialize(fixture)
-        root = etree.XML(output)
-        xmlutil.validate_schema(root, 'server', version='v3')
-
-        server_dict = fixture['server']
-
-        for key in ['name', 'id', 'created', 'access_ip_v4',
-                    'updated', 'progress', 'status', 'host_id',
-                    'access_ip_v6']:
-            self.assertEqual(root.get(key), str(server_dict[key]))
-
-        link_nodes = root.findall('{0}link'.format(ATOMNS))
-        self.assertEqual(len(link_nodes), 2)
-        for i, link in enumerate(server_dict['links']):
-            for key, value in link.items():
-                self.assertEqual(link_nodes[i].get(key), value)
-
-        metadata_root = root.find('{0}metadata'.format(NS))
-        metadata_elems = metadata_root.findall('{0}meta'.format(NS))
-        self.assertEqual(len(metadata_elems), 2)
-        for i, metadata_elem in enumerate(metadata_elems):
-            (meta_key, meta_value) = server_dict['metadata'].items()[i]
-            self.assertEqual(str(metadata_elem.get('key')), str(meta_key))
-            self.assertEqual(str(metadata_elem.text).strip(), str(meta_value))
-
-        image_root = root.find('{0}image'.format(NS))
-        self.assertEqual(image_root.get('id'), server_dict['image']['id'])
-        link_nodes = image_root.findall('{0}link'.format(ATOMNS))
-        self.assertEqual(len(link_nodes), 1)
-        for i, link in enumerate(server_dict['image']['links']):
-            for key, value in link.items():
-                self.assertEqual(link_nodes[i].get(key), value)
-
-        flavor_root = root.find('{0}flavor'.format(NS))
-        self.assertEqual(flavor_root.get('id'), server_dict['flavor']['id'])
-        link_nodes = flavor_root.findall('{0}link'.format(ATOMNS))
-        self.assertEqual(len(link_nodes), 1)
-        for i, link in enumerate(server_dict['flavor']['links']):
-            for key, value in link.items():
-                self.assertEqual(link_nodes[i].get(key), value)
-
-        addresses_root = root.find('{0}addresses'.format(NS))
-        addresses_dict = server_dict['addresses']
-        network_elems = addresses_root.findall('{0}network'.format(NS))
-        self.assertEqual(len(network_elems), 2)
-        for i, network_elem in enumerate(network_elems):
-            network = addresses_dict.items()[i]
-            self.assertEqual(str(network_elem.get('id')), str(network[0]))
-            ip_elems = network_elem.findall('{0}ip'.format(NS))
-            for z, ip_elem in enumerate(ip_elems):
-                ip = network[1][z]
-                self.assertEqual(str(ip_elem.get('version')),
-                                 str(ip['version']))
-                self.assertEqual(str(ip_elem.get('addr')),
-                                 str(ip['addr']))
-                self.assertEqual(str(ip_elem.get('type')),
-                                 str(ip['type']))
-                self.assertEqual(str(ip_elem.get('mac_addr')),
-                                 str(ip['mac_addr']))
-
-    def test_create(self):
-        serializer = servers.FullServerTemplate()
-
-        fixture = {
-            "server": {
-                "id": FAKE_UUID,
-                "user_id": "fake",
-                "tenant_id": "fake",
-                'created': self.TIMESTAMP,
-                'updated': self.TIMESTAMP,
-                "progress": 0,
-                "name": "test_server",
-                "status": "BUILD",
-                "access_ip_v4": "1.2.3.4",
-                "access_ip_v6": "fead::1234",
-                "host_id": "e4d909c290d0fb1ca068ffaddf22cbd0",
-                "admin_pass": "test_password",
-                "image": {
-                    "id": "5",
-                    "links": [
-                        {
-                            "rel": "bookmark",
-                            "href": self.IMAGE_BOOKMARK,
-                        },
-                    ],
-                },
-                "flavor": {
-                    "id": "1",
-                    "links": [
-                        {
-                            "rel": "bookmark",
-                            "href": self.FLAVOR_BOOKMARK,
-                        },
-                    ],
-                },
-                "addresses": {
-                    "network_one": [
-                        {
-                            "version": 4,
-                            "addr": "67.23.10.138",
-                            "type": "fixed",
-                            "mac_addr": "aa:aa:aa:aa:aa:aa"
-                        },
-                        {
-                            "version": 6,
-                            "addr": "::babe:67.23.10.138",
-                            "type": "fixed",
-                            "mac_addr": "aa:aa:aa:aa:aa:aa"
-                        },
-                    ],
-                    "network_two": [
-                        {
-                            "version": 4,
-                            "addr": "67.23.10.139",
-                            "type": "fixed",
-                            "mac_addr": "aa:aa:aa:aa:aa:aa"
-                        },
-                        {
-                            "version": 6,
-                            "addr": "::babe:67.23.10.139",
-                            "type": "fixed",
-                            "mac_addr": "aa:aa:aa:aa:aa:aa"
-                        },
-                    ],
-                },
-                "metadata": {
-                    "Open": "Stack",
-                    "Number": "1",
-                },
-                'links': [
-                    {
-                        'href': self.SERVER_HREF,
-                        'rel': 'self',
-                    },
-                    {
-                        'href': self.SERVER_BOOKMARK,
-                        'rel': 'bookmark',
-                    },
-                ],
-            }
-        }
-
-        output = serializer.serialize(fixture)
-        root = etree.XML(output)
-        xmlutil.validate_schema(root, 'server', version='v3')
-
-        server_dict = fixture['server']
-
-        for key in ['name', 'id', 'created', 'access_ip_v4',
-                    'updated', 'progress', 'status', 'host_id',
-                    'access_ip_v6', 'admin_pass']:
-            self.assertEqual(root.get(key), str(server_dict[key]))
-
-        link_nodes = root.findall('{0}link'.format(ATOMNS))
-        self.assertEqual(len(link_nodes), 2)
-        for i, link in enumerate(server_dict['links']):
-            for key, value in link.items():
-                self.assertEqual(link_nodes[i].get(key), value)
-
-        metadata_root = root.find('{0}metadata'.format(NS))
-        metadata_elems = metadata_root.findall('{0}meta'.format(NS))
-        self.assertEqual(len(metadata_elems), 2)
-        for i, metadata_elem in enumerate(metadata_elems):
-            (meta_key, meta_value) = server_dict['metadata'].items()[i]
-            self.assertEqual(str(metadata_elem.get('key')), str(meta_key))
-            self.assertEqual(str(metadata_elem.text).strip(), str(meta_value))
-
-        image_root = root.find('{0}image'.format(NS))
-        self.assertEqual(image_root.get('id'), server_dict['image']['id'])
-        link_nodes = image_root.findall('{0}link'.format(ATOMNS))
-        self.assertEqual(len(link_nodes), 1)
-        for i, link in enumerate(server_dict['image']['links']):
-            for key, value in link.items():
-                self.assertEqual(link_nodes[i].get(key), value)
-
-        flavor_root = root.find('{0}flavor'.format(NS))
-        self.assertEqual(flavor_root.get('id'), server_dict['flavor']['id'])
-        link_nodes = flavor_root.findall('{0}link'.format(ATOMNS))
-        self.assertEqual(len(link_nodes), 1)
-        for i, link in enumerate(server_dict['flavor']['links']):
-            for key, value in link.items():
-                self.assertEqual(link_nodes[i].get(key), value)
-
-        addresses_root = root.find('{0}addresses'.format(NS))
-        addresses_dict = server_dict['addresses']
-        network_elems = addresses_root.findall('{0}network'.format(NS))
-        self.assertEqual(len(network_elems), 2)
-        for i, network_elem in enumerate(network_elems):
-            network = addresses_dict.items()[i]
-            self.assertEqual(str(network_elem.get('id')), str(network[0]))
-            ip_elems = network_elem.findall('{0}ip'.format(NS))
-            for z, ip_elem in enumerate(ip_elems):
-                ip = network[1][z]
-                self.assertEqual(str(ip_elem.get('version')),
-                                 str(ip['version']))
-                self.assertEqual(str(ip_elem.get('addr')),
-                                 str(ip['addr']))
-                self.assertEqual(str(ip_elem.get('type')),
-                                 str(ip['type']))
-                self.assertEqual(str(ip_elem.get('mac_addr')),
-                                 str(ip['mac_addr']))
-
-    def test_index(self):
-        serializer = servers.MinimalServersTemplate()
-
-        uuid1 = fakes.get_fake_uuid(1)
-        uuid2 = fakes.get_fake_uuid(2)
-        expected_server_href = 'http://localhost/v3/servers/%s' % uuid1
-        expected_server_bookmark = 'http://localhost/servers/%s' % uuid1
-        expected_server_href_2 = 'http://localhost/v3/servers/%s' % uuid2
-        expected_server_bookmark_2 = 'http://localhost/servers/%s' % uuid2
-        fixture = {"servers": [
-            {
-                "id": fakes.get_fake_uuid(1),
-                "name": "test_server",
-                'links': [
-                    {
-                        'href': expected_server_href,
-                        'rel': 'self',
-                    },
-                    {
-                        'href': expected_server_bookmark,
-                        'rel': 'bookmark',
-                    },
-                ],
-            },
-            {
-                "id": fakes.get_fake_uuid(2),
-                "name": "test_server_2",
-                'links': [
-                    {
-                        'href': expected_server_href_2,
-                        'rel': 'self',
-                    },
-                    {
-                        'href': expected_server_bookmark_2,
-                        'rel': 'bookmark',
-                    },
-                ],
-            },
-        ]}
-
-        output = serializer.serialize(fixture)
-        root = etree.XML(output)
-        xmlutil.validate_schema(root, 'servers_index', version='v3')
-        server_elems = root.findall('{0}server'.format(NS))
-        self.assertEqual(len(server_elems), 2)
-        for i, server_elem in enumerate(server_elems):
-            server_dict = fixture['servers'][i]
-            for key in ['name', 'id']:
-                self.assertEqual(server_elem.get(key), str(server_dict[key]))
-
-            link_nodes = server_elem.findall('{0}link'.format(ATOMNS))
-            self.assertEqual(len(link_nodes), 2)
-            for i, link in enumerate(server_dict['links']):
-                for key, value in link.items():
-                    self.assertEqual(link_nodes[i].get(key), value)
-
-    def test_index_with_servers_links(self):
-        serializer = servers.MinimalServersTemplate()
-
-        uuid1 = fakes.get_fake_uuid(1)
-        uuid2 = fakes.get_fake_uuid(2)
-        expected_server_href = 'http://localhost/v3/servers/%s' % uuid1
-        expected_server_next = self.SERVER_NEXT % (2, 2)
-        expected_server_bookmark = 'http://localhost/servers/%s' % uuid1
-        expected_server_href_2 = 'http://localhost/v3/servers/%s' % uuid2
-        expected_server_bookmark_2 = 'http://localhost/servers/%s' % uuid2
-        fixture = {"servers": [
-            {
-                "id": fakes.get_fake_uuid(1),
-                "name": "test_server",
-                'links': [
-                    {
-                        'href': expected_server_href,
-                        'rel': 'self',
-                    },
-                    {
-                        'href': expected_server_bookmark,
-                        'rel': 'bookmark',
-                    },
-                ],
-            },
-            {
-                "id": fakes.get_fake_uuid(2),
-                "name": "test_server_2",
-                'links': [
-                    {
-                        'href': expected_server_href_2,
-                        'rel': 'self',
-                    },
-                    {
-                        'href': expected_server_bookmark_2,
-                        'rel': 'bookmark',
-                    },
-                ],
-            },
-        ],
-        "servers_links": [
-            {
-                'rel': 'next',
-                'href': expected_server_next,
-            },
-        ]}
-
-        output = serializer.serialize(fixture)
-        root = etree.XML(output)
-        xmlutil.validate_schema(root, 'servers_index', version='v3')
-        server_elems = root.findall('{0}server'.format(NS))
-        self.assertEqual(len(server_elems), 2)
-        for i, server_elem in enumerate(server_elems):
-            server_dict = fixture['servers'][i]
-            for key in ['name', 'id']:
-                self.assertEqual(server_elem.get(key), str(server_dict[key]))
-
-            link_nodes = server_elem.findall('{0}link'.format(ATOMNS))
-            self.assertEqual(len(link_nodes), 2)
-            for i, link in enumerate(server_dict['links']):
-                for key, value in link.items():
-                    self.assertEqual(link_nodes[i].get(key), value)
-
-        # Check servers_links
-        servers_links = root.findall('{0}link'.format(ATOMNS))
-        for i, link in enumerate(fixture['servers_links']):
-            for key, value in link.items():
-                self.assertEqual(servers_links[i].get(key), value)
-
-    def test_detail(self):
-        serializer = servers.ServersTemplate()
-
-        uuid1 = fakes.get_fake_uuid(1)
-        expected_server_href = 'http://localhost/v3/servers/%s' % uuid1
-        expected_server_bookmark = 'http://localhost/servers/%s' % uuid1
-        expected_image_bookmark = self.IMAGE_BOOKMARK
-        expected_flavor_bookmark = self.FLAVOR_BOOKMARK
-
-        uuid2 = fakes.get_fake_uuid(2)
-        expected_server_href_2 = 'http://localhost/v3/servers/%s' % uuid2
-        expected_server_bookmark_2 = 'http://localhost/servers/%s' % uuid2
-        fixture = {"servers": [
-            {
-                "id": fakes.get_fake_uuid(1),
-                "user_id": "fake",
-                "tenant_id": "fake",
-                'created': self.TIMESTAMP,
-                'updated': self.TIMESTAMP,
-                "progress": 0,
-                "name": "test_server",
-                "status": "BUILD",
-                "access_ip_v4": "1.2.3.4",
-                "access_ip_v6": "fead::1234",
-                "host_id": 'e4d909c290d0fb1ca068ffaddf22cbd0',
-                "image": {
-                    "id": "5",
-                    "links": [
-                        {
-                            "rel": "bookmark",
-                            "href": expected_image_bookmark,
-                        },
-                    ],
-                },
-                "flavor": {
-                    "id": "1",
-                    "links": [
-                        {
-                            "rel": "bookmark",
-                            "href": expected_flavor_bookmark,
-                        },
-                    ],
-                },
-                "addresses": {
-                    "network_one": [
-                        {
-                            "version": 4,
-                            "addr": "67.23.10.138",
-                            "type": "fixed",
-                            "mac_addr": "aa:aa:aa:aa:aa:aa"
-
-                        },
-                        {
-                            "version": 6,
-                            "addr": "::babe:67.23.10.138",
-                            "type": "fixed",
-                            "mac_addr": "aa:aa:aa:aa:aa:aa"
-
-                        },
-                    ],
-                },
-                "metadata": {
-                    "Number": "1",
-                },
-                "links": [
-                    {
-                        "href": expected_server_href,
-                        "rel": "self",
-                    },
-                    {
-                        "href": expected_server_bookmark,
-                        "rel": "bookmark",
-                    },
-                ],
-            },
-            {
-                "id": fakes.get_fake_uuid(2),
-                "user_id": 'fake',
-                "tenant_id": 'fake',
-                'created': self.TIMESTAMP,
-                'updated': self.TIMESTAMP,
-                "progress": 100,
-                "name": "test_server_2",
-                "status": "ACTIVE",
-                "access_ip_v4": "1.2.3.4",
-                "access_ip_v6": "fead::1234",
-                "host_id": 'e4d909c290d0fb1ca068ffaddf22cbd0',
-                "image": {
-                    "id": "5",
-                    "links": [
-                        {
-                            "rel": "bookmark",
-                            "href": expected_image_bookmark,
-                        },
-                    ],
-                },
-                "flavor": {
-                    "id": "1",
-                    "links": [
-                        {
-                            "rel": "bookmark",
-                            "href": expected_flavor_bookmark,
-                        },
-                    ],
-                },
-                "addresses": {
-                    "network_one": [
-                        {
-                            "version": 4,
-                            "addr": "67.23.10.138",
-                            "type": "fixed",
-                            "mac_addr": "aa:aa:aa:aa:aa:aa"
-
-                        },
-                        {
-                            "version": 6,
-                            "addr": "::babe:67.23.10.138",
-                            "type": "fixed",
-                            "mac_addr": "aa:aa:aa:aa:aa:aa"
-
-                        },
-                    ],
-                },
-                "metadata": {
-                    "Number": "2",
-                },
-                "links": [
-                    {
-                        "href": expected_server_href_2,
-                        "rel": "self",
-                    },
-                    {
-                        "href": expected_server_bookmark_2,
-                        "rel": "bookmark",
-                    },
-                ],
-            },
-        ]}
-
-        output = serializer.serialize(fixture)
-        root = etree.XML(output)
-        xmlutil.validate_schema(root, 'servers', version='v3')
-        server_elems = root.findall('{0}server'.format(NS))
-        self.assertEqual(len(server_elems), 2)
-        for i, server_elem in enumerate(server_elems):
-            server_dict = fixture['servers'][i]
-
-            for key in ['name', 'id', 'created', 'access_ip_v4',
-                        'updated', 'progress', 'status', 'host_id',
-                        'access_ip_v6']:
-                self.assertEqual(server_elem.get(key), str(server_dict[key]))
-
-            link_nodes = server_elem.findall('{0}link'.format(ATOMNS))
-            self.assertEqual(len(link_nodes), 2)
-            for i, link in enumerate(server_dict['links']):
-                for key, value in link.items():
-                    self.assertEqual(link_nodes[i].get(key), value)
-
-            metadata_root = server_elem.find('{0}metadata'.format(NS))
-            metadata_elems = metadata_root.findall('{0}meta'.format(NS))
-            for i, metadata_elem in enumerate(metadata_elems):
-                (meta_key, meta_value) = server_dict['metadata'].items()[i]
-                self.assertEqual(str(metadata_elem.get('key')), str(meta_key))
-                self.assertEqual(str(metadata_elem.text).strip(),
-                                 str(meta_value))
-
-            image_root = server_elem.find('{0}image'.format(NS))
-            self.assertEqual(image_root.get('id'), server_dict['image']['id'])
-            link_nodes = image_root.findall('{0}link'.format(ATOMNS))
-            self.assertEqual(len(link_nodes), 1)
-            for i, link in enumerate(server_dict['image']['links']):
-                for key, value in link.items():
-                    self.assertEqual(link_nodes[i].get(key), value)
-
-            flavor_root = server_elem.find('{0}flavor'.format(NS))
-            self.assertEqual(flavor_root.get('id'),
-                             server_dict['flavor']['id'])
-            link_nodes = flavor_root.findall('{0}link'.format(ATOMNS))
-            self.assertEqual(len(link_nodes), 1)
-            for i, link in enumerate(server_dict['flavor']['links']):
-                for key, value in link.items():
-                    self.assertEqual(link_nodes[i].get(key), value)
-
-            addresses_root = server_elem.find('{0}addresses'.format(NS))
-            addresses_dict = server_dict['addresses']
-            network_elems = addresses_root.findall('{0}network'.format(NS))
-            for i, network_elem in enumerate(network_elems):
-                network = addresses_dict.items()[i]
-                self.assertEqual(str(network_elem.get('id')), str(network[0]))
-                ip_elems = network_elem.findall('{0}ip'.format(NS))
-                for z, ip_elem in enumerate(ip_elems):
-                    ip = network[1][z]
-                    self.assertEqual(str(ip_elem.get('version')),
-                                     str(ip['version']))
-                    self.assertEqual(str(ip_elem.get('addr')),
-                                     str(ip['addr']))
-                    self.assertEqual(str(ip_elem.get('type')),
-                                 str(ip['type']))
-                self.assertEqual(str(ip_elem.get('mac_addr')),
-                                 str(ip['mac_addr']))
-
-    def test_update(self):
-        serializer = servers.ServerTemplate()
-
-        fixture = {
-            "server": {
-                "id": FAKE_UUID,
-                "user_id": "fake",
-                "tenant_id": "fake",
-                'created': self.TIMESTAMP,
-                'updated': self.TIMESTAMP,
-                "progress": 0,
-                "name": "test_server",
-                "status": "BUILD",
-                "host_id": 'e4d909c290d0fb1ca068ffaddf22cbd0',
-                "access_ip_v4": "1.2.3.4",
-                "access_ip_v6": "fead::1234",
-                "image": {
-                    "id": "5",
-                    "links": [
-                        {
-                            "rel": "bookmark",
-                            "href": self.IMAGE_BOOKMARK,
-                        },
-                    ],
-                },
-                "flavor": {
-                    "id": "1",
-                    "links": [
-                        {
-                            "rel": "bookmark",
-                            "href": self.FLAVOR_BOOKMARK,
-                        },
-                    ],
-                },
-                "addresses": {
-                    "network_one": [
-                        {
-                            "version": 4,
-                            "addr": "67.23.10.138",
-                            "type": "fixed",
-                            "mac_addr": "aa:aa:aa:aa:aa:aa"
-                        },
-                        {
-                            "version": 6,
-                            "addr": "::babe:67.23.10.138",
-                            "type": "fixed",
-                            "mac_addr": "aa:aa:aa:aa:aa:aa"
-                        },
-                    ],
-                    "network_two": [
-                        {
-                            "version": 4,
-                            "addr": "67.23.10.139",
-                            "type": "fixed",
-                            "mac_addr": "aa:aa:aa:aa:aa:aa"
-                        },
-                        {
-                            "version": 6,
-                            "addr": "::babe:67.23.10.139",
-                            "type": "fixed",
-                            "mac_addr": "aa:aa:aa:aa:aa:aa"
-                        },
-                    ],
-                },
-                "metadata": {
-                    "Open": "Stack",
-                    "Number": "1",
-                },
-                'links': [
-                    {
-                        'href': self.SERVER_HREF,
-                        'rel': 'self',
-                    },
-                    {
-                        'href': self.SERVER_BOOKMARK,
-                        'rel': 'bookmark',
-                    },
-                ],
-                "fault": {
-                    "code": 500,
-                    "created": self.TIMESTAMP,
-                    "message": "Error Message",
-                    "details": "Fault details",
-                }
-            }
-        }
-
-        output = serializer.serialize(fixture)
-        root = etree.XML(output)
-        xmlutil.validate_schema(root, 'server', version='v3')
-
-        server_dict = fixture['server']
-
-        for key in ['name', 'id', 'created', 'access_ip_v4',
-                    'updated', 'progress', 'status', 'host_id',
-                    'access_ip_v6']:
-            self.assertEqual(root.get(key), str(server_dict[key]))
-
-        link_nodes = root.findall('{0}link'.format(ATOMNS))
-        self.assertEqual(len(link_nodes), 2)
-        for i, link in enumerate(server_dict['links']):
-            for key, value in link.items():
-                self.assertEqual(link_nodes[i].get(key), value)
-
-        metadata_root = root.find('{0}metadata'.format(NS))
-        metadata_elems = metadata_root.findall('{0}meta'.format(NS))
-        self.assertEqual(len(metadata_elems), 2)
-        for i, metadata_elem in enumerate(metadata_elems):
-            (meta_key, meta_value) = server_dict['metadata'].items()[i]
-            self.assertEqual(str(metadata_elem.get('key')), str(meta_key))
-            self.assertEqual(str(metadata_elem.text).strip(), str(meta_value))
-
-        image_root = root.find('{0}image'.format(NS))
-        self.assertEqual(image_root.get('id'), server_dict['image']['id'])
-        link_nodes = image_root.findall('{0}link'.format(ATOMNS))
-        self.assertEqual(len(link_nodes), 1)
-        for i, link in enumerate(server_dict['image']['links']):
-            for key, value in link.items():
-                self.assertEqual(link_nodes[i].get(key), value)
-
-        flavor_root = root.find('{0}flavor'.format(NS))
-        self.assertEqual(flavor_root.get('id'), server_dict['flavor']['id'])
-        link_nodes = flavor_root.findall('{0}link'.format(ATOMNS))
-        self.assertEqual(len(link_nodes), 1)
-        for i, link in enumerate(server_dict['flavor']['links']):
-            for key, value in link.items():
-                self.assertEqual(link_nodes[i].get(key), value)
-
-        addresses_root = root.find('{0}addresses'.format(NS))
-        addresses_dict = server_dict['addresses']
-        network_elems = addresses_root.findall('{0}network'.format(NS))
-        self.assertEqual(len(network_elems), 2)
-        for i, network_elem in enumerate(network_elems):
-            network = addresses_dict.items()[i]
-            self.assertEqual(str(network_elem.get('id')), str(network[0]))
-            ip_elems = network_elem.findall('{0}ip'.format(NS))
-            for z, ip_elem in enumerate(ip_elems):
-                ip = network[1][z]
-                self.assertEqual(str(ip_elem.get('version')),
-                                 str(ip['version']))
-                self.assertEqual(str(ip_elem.get('addr')),
-                                 str(ip['addr']))
-                self.assertEqual(str(ip_elem.get('type')),
-                                 str(ip['type']))
-                self.assertEqual(str(ip_elem.get('mac_addr')),
-                                 str(ip['mac_addr']))
-
-        fault_root = root.find('{0}fault'.format(NS))
-        fault_dict = server_dict['fault']
-        self.assertEqual(fault_root.get("code"), str(fault_dict["code"]))
-        self.assertEqual(fault_root.get("created"), fault_dict["created"])
-        msg_elem = fault_root.find('{0}message'.format(NS))
-        self.assertEqual(msg_elem.text, fault_dict["message"])
-        det_elem = fault_root.find('{0}details'.format(NS))
-        self.assertEqual(det_elem.text, fault_dict["details"])
-
-    def test_action(self):
-        serializer = servers.FullServerTemplate()
-
-        fixture = {
-            "server": {
-                "id": FAKE_UUID,
-                "user_id": "fake",
-                "tenant_id": "fake",
-                'created': self.TIMESTAMP,
-                'updated': self.TIMESTAMP,
-                "progress": 0,
-                "name": "test_server",
-                "status": "BUILD",
-                "access_ip_v4": "1.2.3.4",
-                "access_ip_v6": "fead::1234",
-                "host_id": "e4d909c290d0fb1ca068ffaddf22cbd0",
-                "admin_pass": "test_password",
-                "image": {
-                    "id": "5",
-                    "links": [
-                        {
-                            "rel": "bookmark",
-                            "href": self.IMAGE_BOOKMARK,
-                        },
-                    ],
-                },
-                "flavor": {
-                    "id": "1",
-                    "links": [
-                        {
-                            "rel": "bookmark",
-                            "href": self.FLAVOR_BOOKMARK,
-                        },
-                    ],
-                },
-                "addresses": {
-                    "network_one": [
-                        {
-                            "version": 4,
-                            "addr": "67.23.10.138",
-                            "type": "fixed",
-                            "mac_addr": "aa:aa:aa:aa:aa:aa"
-                        },
-                        {
-                            "version": 6,
-                            "addr": "::babe:67.23.10.138",
-                            "type": "fixed",
-                            "mac_addr": "aa:aa:aa:aa:aa:aa"
-                        },
-                    ],
-                    "network_two": [
-                        {
-                            "version": 4,
-                            "addr": "67.23.10.139",
-                            "type": "fixed",
-                            "mac_addr": "aa:aa:aa:aa:aa:aa"
-                        },
-                        {
-                            "version": 6,
-                            "addr": "::babe:67.23.10.139",
-                            "type": "fixed",
-                            "mac_addr": "aa:aa:aa:aa:aa:aa"
-                        },
-                    ],
-                },
-                "metadata": {
-                    "Open": "Stack",
-                    "Number": "1",
-                },
-                'links': [
-                    {
-                        'href': self.SERVER_HREF,
-                        'rel': 'self',
-                    },
-                    {
-                        'href': self.SERVER_BOOKMARK,
-                        'rel': 'bookmark',
-                    },
-                ],
-            }
-        }
-
-        output = serializer.serialize(fixture)
-        root = etree.XML(output)
-        xmlutil.validate_schema(root, 'server', version='v3')
-
-        server_dict = fixture['server']
-
-        for key in ['name', 'id', 'created', 'access_ip_v4',
-                    'updated', 'progress', 'status', 'host_id',
-                    'access_ip_v6', 'admin_pass']:
-            self.assertEqual(root.get(key), str(server_dict[key]))
-
-        link_nodes = root.findall('{0}link'.format(ATOMNS))
-        self.assertEqual(len(link_nodes), 2)
-        for i, link in enumerate(server_dict['links']):
-            for key, value in link.items():
-                self.assertEqual(link_nodes[i].get(key), value)
-
-        metadata_root = root.find('{0}metadata'.format(NS))
-        metadata_elems = metadata_root.findall('{0}meta'.format(NS))
-        self.assertEqual(len(metadata_elems), 2)
-        for i, metadata_elem in enumerate(metadata_elems):
-            (meta_key, meta_value) = server_dict['metadata'].items()[i]
-            self.assertEqual(str(metadata_elem.get('key')), str(meta_key))
-            self.assertEqual(str(metadata_elem.text).strip(), str(meta_value))
-
-        image_root = root.find('{0}image'.format(NS))
-        self.assertEqual(image_root.get('id'), server_dict['image']['id'])
-        link_nodes = image_root.findall('{0}link'.format(ATOMNS))
-        self.assertEqual(len(link_nodes), 1)
-        for i, link in enumerate(server_dict['image']['links']):
-            for key, value in link.items():
-                self.assertEqual(link_nodes[i].get(key), value)
-
-        flavor_root = root.find('{0}flavor'.format(NS))
-        self.assertEqual(flavor_root.get('id'), server_dict['flavor']['id'])
-        link_nodes = flavor_root.findall('{0}link'.format(ATOMNS))
-        self.assertEqual(len(link_nodes), 1)
-        for i, link in enumerate(server_dict['flavor']['links']):
-            for key, value in link.items():
-                self.assertEqual(link_nodes[i].get(key), value)
-
-        addresses_root = root.find('{0}addresses'.format(NS))
-        addresses_dict = server_dict['addresses']
-        network_elems = addresses_root.findall('{0}network'.format(NS))
-        self.assertEqual(len(network_elems), 2)
-        for i, network_elem in enumerate(network_elems):
-            network = addresses_dict.items()[i]
-            self.assertEqual(str(network_elem.get('id')), str(network[0]))
-            ip_elems = network_elem.findall('{0}ip'.format(NS))
-            for z, ip_elem in enumerate(ip_elems):
-                ip = network[1][z]
-                self.assertEqual(str(ip_elem.get('version')),
-                                 str(ip['version']))
-                self.assertEqual(str(ip_elem.get('addr')),
-                                 str(ip['addr']))
-                self.assertEqual(str(ip_elem.get('type')),
-                                 str(ip['type']))
-                self.assertEqual(str(ip_elem.get('mac_addr')),
-                                 str(ip['mac_addr']))
-
-
 class ServersAllExtensionsTestCase(test.TestCase):
-    """
-    Servers tests using default API router with all extensions enabled.
+    """Servers tests using default API router with all extensions enabled.
 
     The intent here is to catch cases where extensions end up throwing
     an exception because of a malformed request before the core API
     gets a chance to validate the request and return a 422 response.
 
-    For example, ServerDiskConfigController extends servers.Controller:
+    For example, AccessIPsController extends servers.Controller:
 
-      @wsgi.extends
-      def create(self, req, body):
-          if 'server' in body:
-                self._set_disk_config(body['server'])
-          resp_obj = (yield)
-          self._show(req, resp_obj)
+        @wsgi.extends
+        def create(self, req, resp_obj, body):
+            context = req.environ['nova.context']
+            if authorize(context) and 'server' in resp_obj.obj:
+                resp_obj.attach(xml=AccessIPTemplate())
+                server = resp_obj.obj['server']
+                self._extend_server(req, server)
 
     we want to ensure that the extension isn't barfing on an invalid
     body.
@@ -5162,7 +2967,7 @@ class ServersAllExtensionsTestCase(test.TestCase):
 
         req.body = jsonutils.dumps(body)
         res = req.get_response(self.app)
-        self.assertEqual(422, res.status_int)
+        self.assertEqual(400, res.status_int)
 
     def test_update_missing_server(self):
         # Test create with malformed body.
@@ -5179,51 +2984,92 @@ class ServersAllExtensionsTestCase(test.TestCase):
 
         req.body = jsonutils.dumps(body)
         res = req.get_response(self.app)
-        self.assertEqual(422, res.status_int)
+        self.assertEqual(400, res.status_int)
 
 
-class ServersUnprocessableEntityTestCase(test.TestCase):
-    """
-    Tests of places we throw 422 Unprocessable Entity from
-    """
+class ServersInvalidRequestTestCase(test.TestCase):
+    """Tests of places we throw 400 Bad Request from."""
 
     def setUp(self):
-        super(ServersUnprocessableEntityTestCase, self).setUp()
+        super(ServersInvalidRequestTestCase, self).setUp()
         ext_info = plugins.LoadedExtensionInfo()
         self.controller = servers.ServersController(extension_info=ext_info)
 
-    def _unprocessable_server_create(self, body):
+    def _invalid_server_create(self, body):
         req = fakes.HTTPRequestV3.blank('/servers')
         req.method = 'POST'
 
-        self.assertRaises(webob.exc.HTTPUnprocessableEntity,
-                          self.controller.create, req, body)
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self.controller.create, req, body=body)
 
     def test_create_server_no_body(self):
-        self._unprocessable_server_create(body=None)
+        self._invalid_server_create(body=None)
 
     def test_create_server_missing_server(self):
         body = {'foo': {'a': 'b'}}
-        self._unprocessable_server_create(body=body)
+        self._invalid_server_create(body=body)
 
     def test_create_server_malformed_entity(self):
         body = {'server': 'string'}
-        self._unprocessable_server_create(body=body)
+        self._invalid_server_create(body=body)
 
     def _unprocessable_server_update(self, body):
         req = fakes.HTTPRequestV3.blank('/servers/%s' % FAKE_UUID)
         req.method = 'PUT'
 
-        self.assertRaises(webob.exc.HTTPUnprocessableEntity,
-                          self.controller.update, req, FAKE_UUID, body)
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self.controller.update, req, FAKE_UUID, body=body)
 
     def test_update_server_no_body(self):
-        self._unprocessable_server_update(body=None)
+        self._invalid_server_create(body=None)
 
     def test_update_server_missing_server(self):
         body = {'foo': {'a': 'b'}}
-        self._unprocessable_server_update(body=body)
+        self._invalid_server_create(body=body)
 
     def test_create_update_malformed_entity(self):
         body = {'server': 'string'}
-        self._unprocessable_server_update(body=body)
+        self._invalid_server_create(body=body)
+
+
+class FakeExt(extensions.V3APIExtensionBase):
+    name = "AccessIPs"
+    alias = 'os-access-ips'
+    version = 1
+
+    def fake_extension_point(self, *args, **kwargs):
+        pass
+
+    def get_controller_extensions(self):
+        return []
+
+    def get_resources(self):
+        return []
+
+
+class TestServersExtensionPoint(test.NoDBTestCase):
+    def setUp(self):
+        super(TestServersExtensionPoint, self).setUp()
+        CONF.set_override('extensions_whitelist', ['os-access-ips'],
+                          'osapi_v3')
+        self.stubs.Set(access_ips, 'AccessIPs', FakeExt)
+
+    def _test_load_extension_point(self, name):
+        setattr(FakeExt, 'server_%s' % name,
+                FakeExt.fake_extension_point)
+        ext_info = plugins.LoadedExtensionInfo()
+        controller = servers.ServersController(extension_info=ext_info)
+        self.assertEqual(
+            'os-access-ips',
+            list(getattr(controller,
+                         '%s_extension_manager' % name))[0].obj.alias)
+        delattr(FakeExt, 'server_%s' % name)
+
+    def test_load_update_extension_point(self):
+        self._test_load_extension_point('update')
+
+    def test_load_rebuild_extension_point(self):
+        self._test_load_extension_point('rebuild')
+
+    def test_load_create_extension_point(self):
+        self._test_load_extension_point('create')

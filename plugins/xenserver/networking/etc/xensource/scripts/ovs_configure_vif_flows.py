@@ -1,6 +1,4 @@
 #!/usr/bin/env python
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -21,12 +19,13 @@ This script is used to configure openvswitch flows on XenServer hosts.
 """
 
 import os
-import simplejson as json
 import sys
 
 # This is written to Python 2.4, since that is what is available on XenServer
 import netaddr
-import novalib
+import simplejson as json
+
+import novalib  # noqa
 
 
 OVS_OFCTL = '/usr/bin/ovs-ofctl'

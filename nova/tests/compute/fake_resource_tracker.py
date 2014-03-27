@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -23,6 +21,7 @@ class FakeResourceTracker(resource_tracker.ResourceTracker):
 
     def _create(self, context, values):
         self.compute_node = values
+        self.compute_node['id'] = 1
 
     def _update(self, context, values, prune_stats=False):
         self.compute_node.update(values)

@@ -12,9 +12,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from lxml import etree
 import webob
 
+from nova.api.openstack.compute.plugins.v3 import flavor_rxtx
 from nova.compute import flavors
 from nova.openstack.common import jsonutils
 from nova import test
@@ -27,6 +27,10 @@ FAKE_FLAVORS = {
         "memory_mb": '256',
         "root_gb": '10',
         "rxtx_factor": '1.0',
+        "swap": 0,
+        "ephemeral_gb": 0,
+        "vcpus": 1,
+        "disabled": False,
     },
     'flavor 2': {
         "flavorid": '2',
@@ -34,6 +38,10 @@ FAKE_FLAVORS = {
         "memory_mb": '512',
         "root_gb": '10',
         "rxtx_factor": None,
+        "swap": 0,
+        "vcpus": 1,
+        "ephemeral_gb": 0,
+        "disabled": False,
     },
 }
 
@@ -42,19 +50,24 @@ def fake_flavor_get_by_flavor_id(flavorid, ctxt=None):
     return FAKE_FLAVORS['flavor %s' % flavorid]
 
 
-def fake_flavor_get_all(*args, **kwargs):
-    return FAKE_FLAVORS
+def fake_get_all_flavors_sorted_list(context=None, inactive=False,
+                                     filters=None, sort_key='flavorid',
+                                     sort_dir='asc', limit=None, marker=None):
+    return [
+        fake_flavor_get_by_flavor_id(1),
+        fake_flavor_get_by_flavor_id(2)
+    ]
 
 
-class FlavorRxtxTest(test.TestCase):
+class FlavorRxtxTest(test.NoDBTestCase):
     content_type = 'application/json'
-    prefix = ''
+    prefix = '%s:' % flavor_rxtx.ALIAS
 
     def setUp(self):
         super(FlavorRxtxTest, self).setUp()
         fakes.stub_out_nw_api(self.stubs)
-        self.stubs.Set(flavors, "get_all_flavors",
-                       fake_flavor_get_all)
+        self.stubs.Set(flavors, "get_all_flavors_sorted_list",
+                       fake_get_all_flavors_sorted_list)
         self.stubs.Set(flavors,
                        "get_flavor_by_flavor_id",
                        fake_flavor_get_by_flavor_id)
@@ -74,7 +87,8 @@ class FlavorRxtxTest(test.TestCase):
         return jsonutils.loads(body).get('flavors')
 
     def assertFlavorRxtx(self, flavor, rxtx):
-        self.assertEqual(str(flavor.get('rxtx_factor')), rxtx)
+        self.assertEqual(
+            flavor.get('%srxtx_factor' % self.prefix), rxtx)
 
     def test_show(self):
         url = '/v3/flavors/1'
@@ -91,13 +105,3 @@ class FlavorRxtxTest(test.TestCase):
         flavors = self._get_flavors(res.body)
         self.assertFlavorRxtx(flavors[0], '1.0')
         self.assertFlavorRxtx(flavors[1], '')
-
-
-class FlavorRxtxXmlTest(FlavorRxtxTest):
-    content_type = 'application/xml'
-
-    def _get_flavor(self, body):
-        return etree.XML(body)
-
-    def _get_flavors(self, body):
-        return etree.XML(body).getchildren()

@@ -23,7 +23,7 @@ CONF = cfg.CONF
 MAX_REQUEST_BODY_SIZE = CONF.osapi_max_request_body_size
 
 
-class TestLimitingReader(test.TestCase):
+class TestLimitingReader(test.NoDBTestCase):
 
     def test_limiting_reader(self):
         BYTES = 1024
@@ -32,7 +32,7 @@ class TestLimitingReader(test.TestCase):
         for chunk in nova.api.sizelimit.LimitingReader(data, BYTES):
             bytes_read += len(chunk)
 
-        self.assertEquals(bytes_read, BYTES)
+        self.assertEqual(bytes_read, BYTES)
 
         bytes_read = 0
         data = StringIO.StringIO("*" * BYTES)
@@ -42,7 +42,7 @@ class TestLimitingReader(test.TestCase):
             bytes_read += 1
             byte = reader.read(1)
 
-        self.assertEquals(bytes_read, BYTES)
+        self.assertEqual(bytes_read, BYTES)
 
     def test_limiting_reader_fails(self):
         BYTES = 1024
@@ -69,7 +69,7 @@ class TestLimitingReader(test.TestCase):
                           _consume_all_read)
 
 
-class TestRequestBodySizeLimiter(test.TestCase):
+class TestRequestBodySizeLimiter(test.NoDBTestCase):
 
     def setUp(self):
         super(TestRequestBodySizeLimiter, self).setUp()

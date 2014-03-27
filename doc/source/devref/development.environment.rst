@@ -35,7 +35,7 @@ Virtual environments
 --------------------
 
 Nova development uses a set of shell scripts in DevStack. Virtual
-enviroments with venv are also available with the source code.
+environments with venv are also available with the source code.
 
 The easiest way to build a fully functional development environment is
 with DevStack. Create a machine (such as a VM or Vagrant box) running a
@@ -60,7 +60,7 @@ Install the prerequisite packages.
 
 On Ubuntu::
 
-  sudo apt-get install python-dev libssl-dev python-pip git-core libxml2-dev libxslt-dev
+  sudo apt-get install python-dev libssl-dev python-pip git-core libxml2-dev libxslt-dev pkg-config libffi-dev libpq-dev libmysqlclient-dev
 
 On Ubuntu Precise (12.04) you may also need to add the following packages::
 
@@ -68,7 +68,8 @@ On Ubuntu Precise (12.04) you may also need to add the following packages::
 
 On Fedora-based distributions (e.g., Fedora/RHEL/CentOS/Scientific Linux)::
 
-  sudo yum install python-devel openssl-devel python-pip git gcc libxslt-devel mysql-devel
+  sudo yum install python-devel openssl-devel python-pip git gcc libxslt-devel mysql-devel python-pip postgresql-devel libffi-devel
+  sudo pip-python install tox
 
 
 Mac OS X Systems
@@ -140,6 +141,40 @@ Or, if you prefer, you can run commands in the virtualenv on a case by case
 basis by running::
 
      $ tools/with_venv.sh <your command>
+
+Using a remote debugger
+-----------------------
+
+Some modern IDE such as pycharm (commercial) or Eclipse (open source) support remote debugging.  In order to run nova with remote debugging, start the nova process
+with the following parameters
+--remote_debug-host <host IP where the debugger is running>
+--remote_debug-port <port it is listening on>
+
+Before you start your nova process, start the remote debugger using the instructions for that debugger.
+For pycharm - http://blog.jetbrains.com/pycharm/2010/12/python-remote-debug-with-pycharm/
+For Eclipse - http://pydev.org/manual_adv_remote_debugger.html
+
+More detailed instructions are located here - http://novaremotedebug.blogspot.com
+
+Using fake computes for tests
+-----------------------------
+
+The number of instances supported by fake computes is not limited by physical
+constraints. It allows to perform stress tests on a deployment with few
+resources (typically a laptop). But you must avoid using scheduler filters
+limiting the number of instances per compute (like RamFilter, DiskFilter,
+AggregateCoreFilter), otherwise they will limit the number of instances per
+compute.
+
+
+Fake computes can also be used in multi hypervisor-type deployments in order to
+take advantage of fake and "real" computes during tests:
+
+* create many fake instances for stress tests
+* create some "real" instances for functional tests
+
+Fake computes can be used for testing Nova itself but also applications on top
+of it.
 
 Contributing Your Work
 ----------------------

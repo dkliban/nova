@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -28,7 +26,6 @@ from cinderclient import service_catalog
 from cinderclient.v1 import client as cinder_client
 from oslo.config import cfg
 
-from nova.db import base
 from nova import exception
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
@@ -37,16 +34,16 @@ cinder_opts = [
     cfg.StrOpt('cinder_catalog_info',
             default='volume:cinder:publicURL',
             help='Info to match when looking for cinder in the service '
-                 'catalog. Format is : separated values of the form: '
+                 'catalog. Format is: separated values of the form: '
                  '<service_type>:<service_name>:<endpoint_type>'),
     cfg.StrOpt('cinder_endpoint_template',
                help='Override service catalog lookup with template for cinder '
                     'endpoint e.g. http://localhost:8776/v1/%(project_id)s'),
     cfg.StrOpt('os_region_name',
-                help='region name of this node'),
+                help='Region name of this node'),
     cfg.StrOpt('cinder_ca_certificates_file',
-                help='Location of ca certicates file to use for cinder client '
-                     'requests.'),
+                help='Location of ca certificates file to use for cinder '
+                     'client requests.'),
     cfg.IntOpt('cinder_http_retries',
                default=3,
                help='Number of cinderclient retries on failed http calls'),
@@ -201,7 +198,7 @@ def translate_snapshot_exception(method):
     return wrapper
 
 
-class API(base.Base):
+class API(object):
     """API for interacting with the volume manager."""
 
     @translate_volume_exception
@@ -278,6 +275,11 @@ class API(base.Base):
         return cinderclient(context).volumes.terminate_connection(volume_id,
                                                                   connector)
 
+    def migrate_volume_completion(self, context, old_volume_id, new_volume_id,
+                                  error=False):
+        return cinderclient(context).volumes.migrate_volume_completion(
+            old_volume_id, new_volume_id, error)
+
     def create(self, context, size, name, description, snapshot=None,
                image_id=None, volume_type=None, metadata=None,
                availability_zone=None):
@@ -301,7 +303,7 @@ class API(base.Base):
             item = cinderclient(context).volumes.create(size, **kwargs)
             return _untranslate_volume_summary_view(context, item)
         except cinder_exception.BadRequest as e:
-            raise exception.InvalidInput(reason=e.message)
+            raise exception.InvalidInput(reason=unicode(e))
 
     @translate_volume_exception
     def delete(self, context, volume_id):
@@ -346,6 +348,9 @@ class API(base.Base):
     def delete_snapshot(self, context, snapshot_id):
         cinderclient(context).volume_snapshots.delete(snapshot_id)
 
+    def get_volume_encryption_metadata(self, context, volume_id):
+        return cinderclient(context).volumes.get_encryption_metadata(volume_id)
+
     @translate_volume_exception
     def get_volume_metadata(self, context, volume_id):
         raise NotImplementedError()
@@ -362,3 +367,19 @@ class API(base.Base):
     @translate_volume_exception
     def get_volume_metadata_value(self, volume_id, key):
         raise NotImplementedError()
+
+    @translate_snapshot_exception
+    def update_snapshot_status(self, context, snapshot_id, status):
+        vs = cinderclient(context).volume_snapshots
+
+        # '90%' here is used to tell Cinder that Nova is done
+        # with its portion of the 'creating' state. This can
+        # be removed when we are able to split the Cinder states
+        # into 'creating' and a separate state of
+        # 'creating_in_nova'. (Same for 'deleting' state.)
+
+        vs.update_snapshot_status(
+            snapshot_id,
+            {'status': status,
+             'progress': '90%'}
+        )

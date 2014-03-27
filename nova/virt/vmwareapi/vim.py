@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 VMware, Inc.
 # Copyright (c) 2011 Citrix Systems, Inc.
 # Copyright 2011 OpenStack Foundation
@@ -21,13 +19,10 @@ Classes for making VMware VI SOAP calls.
 """
 
 import httplib
-
-try:
-    import suds
-except ImportError:
-    suds = None
+import urllib2
 
 from oslo.config import cfg
+import suds
 
 from nova.openstack.common.gettextutils import _
 from nova import utils
@@ -38,8 +33,6 @@ CONN_ABORT_ERROR = 'Software caused connection abort'
 ADDRESS_IN_USE_ERROR = 'Address already in use'
 
 vmwareapi_wsdl_loc_opt = cfg.StrOpt('wsdl_location',
-        deprecated_name='vmwareapi_wsdl_loc',
-        deprecated_group='DEFAULT',
         help='Optional VIM Service WSDL Location '
              'e.g http://<server>/vimService.wsdl. '
              'Optional over-ride to default location for bug work-arounds')
@@ -48,26 +41,56 @@ CONF = cfg.CONF
 CONF.register_opt(vmwareapi_wsdl_loc_opt, 'vmware')
 
 
-if suds:
+def get_moref(value, type):
+    """Get managed object reference."""
+    moref = suds.sudsobject.Property(value)
+    moref._type = type
+    return moref
 
-    class VIMMessagePlugin(suds.plugin.MessagePlugin):
 
-        def addAttributeForValue(self, node):
-            # suds does not handle AnyType properly.
-            # VI SDK requires type attribute to be set when AnyType is used
-            if node.name == 'value':
-                node.set('xsi:type', 'xsd:string')
+def object_to_dict(obj, list_depth=1):
+    """Convert Suds object into serializable format.
 
-        def marshalled(self, context):
-            """suds will send the specified soap envelope.
-            Provides the plugin with the opportunity to prune empty
-            nodes and fixup nodes before sending it to the server.
-            """
-            # suds builds the entire request object based on the wsdl schema.
-            # VI SDK throws server errors if optional SOAP nodes are sent
-            # without values, e.g. <test/> as opposed to <test>test</test>
-            context.envelope.prune()
-            context.envelope.walk(self.addAttributeForValue)
+    The calling function can limit the amount of list entries that
+    are converted.
+    """
+    d = {}
+    for k, v in suds.sudsobject.asdict(obj).iteritems():
+        if hasattr(v, '__keylist__'):
+            d[k] = object_to_dict(v, list_depth=list_depth)
+        elif isinstance(v, list):
+            d[k] = []
+            used = 0
+            for item in v:
+                used = used + 1
+                if used > list_depth:
+                    break
+                if hasattr(item, '__keylist__'):
+                    d[k].append(object_to_dict(item, list_depth=list_depth))
+                else:
+                    d[k].append(item)
+        else:
+            d[k] = v
+    return d
+
+
+class VIMMessagePlugin(suds.plugin.MessagePlugin):
+    def addAttributeForValue(self, node):
+        # suds does not handle AnyType properly.
+        # VI SDK requires type attribute to be set when AnyType is used
+        if node.name == 'value':
+            node.set('xsi:type', 'xsd:string')
+
+    def marshalled(self, context):
+        """suds will send the specified soap envelope.
+        Provides the plugin with the opportunity to prune empty
+        nodes and fixup nodes before sending it to the server.
+        """
+        # suds builds the entire request object based on the wsdl schema.
+        # VI SDK throws server errors if optional SOAP nodes are sent
+        # without values, e.g. <test/> as opposed to <test>test</test>
+        context.envelope.prune()
+        context.envelope.walk(self.addAttributeForValue)
 
 
 class Vim:
@@ -76,8 +99,7 @@ class Vim:
     def __init__(self,
                  protocol="https",
                  host="localhost"):
-        """
-        Creates the necessary Communication interfaces and gets the
+        """Creates the necessary Communication interfaces and gets the
         ServiceContent for initiating SOAP transactions.
 
         protocol: http or https
@@ -92,13 +114,14 @@ class Vim:
         self.url = Vim.get_soap_url(protocol, host)
         self.client = suds.client.Client(self.wsdl_url, location=self.url,
                                          plugins=[VIMMessagePlugin()])
-        self._service_content = self.RetrieveServiceContent(
-                                        "ServiceInstance")
+        self._service_content = self.retrieve_service_content()
+
+    def retrieve_service_content(self):
+        return self.RetrieveServiceContent("ServiceInstance")
 
     @staticmethod
     def get_wsdl_url(protocol, host_name):
-        """
-        allows override of the wsdl location, making this static
+        """Allows override of the wsdl location, making this static
         means we can test the logic outside of the constructor
         without forcing the test environment to have multiple valid
         wsdl locations to test against.
@@ -116,8 +139,7 @@ class Vim:
 
     @staticmethod
     def get_soap_url(protocol, host_name):
-        """
-        Calculates the location of the SOAP services
+        """Calculates the location of the SOAP services
         for a particular server. Created as a static
         method for testing.
 
@@ -136,8 +158,7 @@ class Vim:
     def __getattr__(self, attr_name):
         """Makes the API calls and gets the result."""
         def vim_request_handler(managed_object, **kwargs):
-            """
-            Builds the SOAP message and parses the response for fault
+            """Builds the SOAP message and parses the response for fault
             checking and other errors.
 
             managed_object    : Managed Object Reference or Managed
@@ -161,14 +182,17 @@ class Vim:
                 return response
             # Catch the VimFaultException that is raised by the fault
             # check of the SOAP response
-            except error_util.VimFaultException as excep:
+            except error_util.VimFaultException:
+                raise
+            except suds.MethodNotFound:
                 raise
             except suds.WebFault as excep:
                 doc = excep.document
                 detail = doc.childAtPath("/Envelope/Body/Fault/detail")
                 fault_list = []
-                for child in detail.getChildren():
-                    fault_list.append(child.get("type"))
+                if detail:
+                    for child in detail.getChildren():
+                        fault_list.append(child.get("type"))
                 raise error_util.VimFaultException(fault_list, excep)
             except AttributeError as excep:
                 raise error_util.VimAttributeError(_("No such SOAP method "
@@ -178,6 +202,10 @@ class Vim:
                     httplib.CannotSendHeader) as excep:
                 raise error_util.SessionOverLoadException(_("httplib "
                                 "error in %s: ") % (attr_name), excep)
+            except (urllib2.URLError,
+                    urllib2.HTTPError) as excep:
+                raise error_util.SessionConnectionException(_("urllib2 "
+                            "error in  %s: ") % (attr_name), excep)
             except Exception as excep:
                 # Socket errors which need special handling for they
                 # might be caused by ESX API call overload

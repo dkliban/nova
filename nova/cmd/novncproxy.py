@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -29,6 +27,8 @@ from oslo.config import cfg
 
 from nova import config
 from nova.console import websocketproxy
+from nova.openstack.common.report import guru_meditation_report as gmr
+from nova import version
 
 
 opts = [
@@ -65,6 +65,8 @@ def main():
         print("Can not find novnc html/js/css files at %s." % CONF.web)
         return(-1)
 
+    gmr.TextGuruMeditation.setup_autorun(version)
+
     # Create and start the NovaWebSockets proxy
     server = websocketproxy.NovaWebSocketProxy(
                                    listen_host=CONF.novncproxy_host,
@@ -77,6 +79,8 @@ def main():
                                    daemon=CONF.daemon,
                                    record=CONF.record,
                                    web=CONF.web,
+                                   file_only=True,
+                                   no_parent=True,
                                    target_host='ignore',
                                    target_port='ignore',
                                    wrap_mode='exit',

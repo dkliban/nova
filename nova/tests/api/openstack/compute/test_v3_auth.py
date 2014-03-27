@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 IBM Corp.
 # Copyright 2010 OpenStack Foundation
 # All Rights Reserved.
@@ -24,7 +22,7 @@ from nova import test
 from nova.tests.api.openstack import fakes
 
 
-class TestNoAuthMiddlewareV3(test.TestCase):
+class TestNoAuthMiddlewareV3(test.NoDBTestCase):
 
     def setUp(self):
         super(TestNoAuthMiddlewareV3, self).setUp()
@@ -60,5 +58,5 @@ class TestNoAuthMiddlewareV3(test.TestCase):
         req.headers['X-Auth-Project-Id'] = 'user1_project'
         result = req.get_response(fakes.wsgi_app_v3(use_no_auth=True))
         self.assertEqual(result.status, '204 No Content')
-        self.assertFalse('X-CDN-Management-Url' in result.headers)
-        self.assertFalse('X-Storage-Url' in result.headers)
+        self.assertNotIn('X-CDN-Management-Url', result.headers)
+        self.assertNotIn('X-Storage-Url', result.headers)

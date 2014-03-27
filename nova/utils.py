@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # Copyright 2011 Justin Santa Barbara
@@ -24,6 +22,7 @@ import datetime
 import functools
 import hashlib
 import inspect
+import multiprocessing
 import os
 import pyclbr
 import random
@@ -33,25 +32,25 @@ import socket
 import struct
 import sys
 import tempfile
-import time
 from xml.sax import saxutils
 
 import eventlet
 import netaddr
-
 from oslo.config import cfg
+from oslo import messaging
+import six
 
 from nova import exception
 from nova.openstack.common import excutils
+from nova.openstack.common import gettextutils
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import importutils
 from nova.openstack.common import lockutils
 from nova.openstack.common import log as logging
 from nova.openstack.common import processutils
-from nova.openstack.common.rpc import common as rpc_common
 from nova.openstack.common import timeutils
 
-notify_decorator = 'nova.openstack.common.notifier.api.notify_decorator'
+notify_decorator = 'nova.notifications.notify_decorator'
 
 monkey_patch_opts = [
     cfg.BoolOpt('monkey_patch',
@@ -70,7 +69,7 @@ utils_opts = [
                help='Length of generated instance admin passwords'),
     cfg.StrOpt('instance_usage_audit_period',
                default='month',
-               help='time period to generate instance usages for.  '
+               help='Time period to generate instance usages for.  '
                     'Time period must be hour, day, month or year'),
     cfg.StrOpt('rootwrap_config',
                default="/etc/nova/rootwrap.conf",
@@ -82,18 +81,9 @@ utils_opts = [
 CONF = cfg.CONF
 CONF.register_opts(monkey_patch_opts)
 CONF.register_opts(utils_opts)
+CONF.import_opt('network_api_class', 'nova.network')
 
 LOG = logging.getLogger(__name__)
-
-# Used for looking up extensions of text
-# to their 'multiplied' byte amount
-BYTE_MULTIPLIERS = {
-    '': 1,
-    't': 1024 ** 4,
-    'g': 1024 ** 3,
-    'm': 1024 ** 2,
-    'k': 1024,
-}
 
 # used in limits
 TIME_UNITS = {
@@ -103,7 +93,15 @@ TIME_UNITS = {
     'DAY': 84400
 }
 
+
+_IS_NEUTRON = None
+
 synchronized = lockutils.synchronized_with_prefix('nova-')
+
+SM_IMAGE_PROP_PREFIX = "image_"
+SM_INHERITABLE_KEYS = (
+    'min_ram', 'min_disk', 'disk_format', 'container_format',
+)
 
 
 def vpn_ping(address, port, timeout=0.05, session_id=None):
@@ -155,28 +153,27 @@ def vpn_ping(address, port, timeout=0.05, session_id=None):
         return server_sess
 
 
+def _get_root_helper():
+    return 'sudo nova-rootwrap %s' % CONF.rootwrap_config
+
+
 def execute(*cmd, **kwargs):
     """Convenience wrapper around oslo's execute() method."""
     if 'run_as_root' in kwargs and not 'root_helper' in kwargs:
-        kwargs['root_helper'] = 'sudo nova-rootwrap %s' % CONF.rootwrap_config
+        kwargs['root_helper'] = _get_root_helper()
     return processutils.execute(*cmd, **kwargs)
 
 
 def trycmd(*args, **kwargs):
     """Convenience wrapper around oslo's trycmd() method."""
     if 'run_as_root' in kwargs and not 'root_helper' in kwargs:
-        kwargs['root_helper'] = 'sudo nova-rootwrap %s' % CONF.rootwrap_config
+        kwargs['root_helper'] = _get_root_helper()
     return processutils.trycmd(*args, **kwargs)
 
 
 def novadir():
     import nova
     return os.path.abspath(nova.__file__).split('nova/__init__.py')[0]
-
-
-def debug(arg):
-    LOG.debug(_('debug in callback: %s'), arg)
-    return arg
 
 
 def generate_uid(topic, size=8):
@@ -325,17 +322,12 @@ def generate_password(length=None, symbolgroups=DEFAULT_PASSWORD_SYMBOLS):
     return ''.join(password)
 
 
-def last_octet(address):
-    return int(address.split('.')[-1])
-
-
 def get_my_ipv4_address():
     """Run ip route/addr commands to figure out the best ipv4
     """
     LOCALHOST = '127.0.0.1'
     try:
-        out = execute('ip', '-f', 'inet', '-o', 'route', 'show',
-                      run_as_root=True)
+        out = execute('ip', '-f', 'inet', '-o', 'route', 'show')
 
         # Find the default route
         regex_default = ('default\s*via\s*'
@@ -367,8 +359,7 @@ def _get_ipv4_address_for_interface(iface):
     """Run ip addr show for an interface and grab its ipv4 addresses
     """
     try:
-        out = execute('ip', '-f', 'inet', '-o', 'addr', 'show', iface,
-                      run_as_root=True)
+        out = execute('ip', '-f', 'inet', '-o', 'addr', 'show', iface)
         regexp_address = re.compile('inet\s*'
                                     '(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})')
         address = [m.group(1) for m in regexp_address.finditer(out[0])
@@ -400,24 +391,6 @@ def get_my_linklocal(interface):
         msg = _("Couldn't get Link Local IP of %(interface)s"
                 " :%(ex)s") % {'interface': interface, 'ex': ex}
         raise exception.NovaException(msg)
-
-
-def parse_mailmap(mailmap='.mailmap'):
-    mapping = {}
-    if os.path.exists(mailmap):
-        fp = open(mailmap, 'r')
-        for l in fp:
-            l = l.strip()
-            if not l.startswith('#') and ' ' in l:
-                canonical_email, alias = l.split(' ')
-                mapping[alias.lower()] = canonical_email.lower()
-    return mapping
-
-
-def str_dict_replace(s, mapping):
-    for s1, s2 in mapping.iteritems():
-        s = s.replace(s1, s2)
-    return s
 
 
 class LazyPluggable(object):
@@ -471,115 +444,10 @@ def utf8(value):
     """
     if isinstance(value, unicode):
         return value.encode('utf-8')
+    elif isinstance(value, gettextutils.Message):
+        return unicode(value).encode('utf-8')
     assert isinstance(value, str)
     return value
-
-
-def get_from_path(items, path):
-    """Returns a list of items matching the specified path.
-
-    Takes an XPath-like expression e.g. prop1/prop2/prop3, and for each item
-    in items, looks up items[prop1][prop2][prop3].  Like XPath, if any of the
-    intermediate results are lists it will treat each list item individually.
-    A 'None' in items or any child expressions will be ignored, this function
-    will not throw because of None (anywhere) in items.  The returned list
-    will contain no None values.
-
-    """
-    if path is None:
-        raise exception.NovaException('Invalid mini_xpath')
-
-    (first_token, sep, remainder) = path.partition('/')
-
-    if first_token == '':
-        raise exception.NovaException('Invalid mini_xpath')
-
-    results = []
-
-    if items is None:
-        return results
-
-    if not isinstance(items, list):
-        # Wrap single objects in a list
-        items = [items]
-
-    for item in items:
-        if item is None:
-            continue
-        get_method = getattr(item, 'get', None)
-        if get_method is None:
-            continue
-        child = get_method(first_token)
-        if child is None:
-            continue
-        if isinstance(child, list):
-            # Flatten intermediate lists
-            for x in child:
-                results.append(x)
-        else:
-            results.append(child)
-
-    if not sep:
-        # No more tokens
-        return results
-    else:
-        return get_from_path(results, remainder)
-
-
-def flatten_dict(dict_, flattened=None):
-    """Recursively flatten a nested dictionary."""
-    flattened = flattened or {}
-    for key, value in dict_.iteritems():
-        if hasattr(value, 'iteritems'):
-            flatten_dict(value, flattened)
-        else:
-            flattened[key] = value
-    return flattened
-
-
-def partition_dict(dict_, keys):
-    """Return two dicts, one with `keys` the other with everything else."""
-    intersection = {}
-    difference = {}
-    for key, value in dict_.iteritems():
-        if key in keys:
-            intersection[key] = value
-        else:
-            difference[key] = value
-    return intersection, difference
-
-
-def map_dict_keys(dict_, key_map):
-    """Return a dict in which the dictionaries keys are mapped to new keys."""
-    mapped = {}
-    for key, value in dict_.iteritems():
-        mapped_key = key_map[key] if key in key_map else key
-        mapped[mapped_key] = value
-    return mapped
-
-
-def subset_dict(dict_, keys):
-    """Return a dict that only contains a subset of keys."""
-    subset = partition_dict(dict_, keys)[0]
-    return subset
-
-
-def diff_dict(orig, new):
-    """
-    Return a dict describing how to change orig to new.  The keys
-    correspond to values that have changed; the value will be a list
-    of one or two elements.  The first element of the list will be
-    either '+' or '-', indicating whether the key was updated or
-    deleted; if the key was updated, the list will contain a second
-    element, giving the updated value.
-    """
-    # Figure out what keys went away
-    result = dict((k, ['-']) for k in set(orig.keys()) - set(new.keys()))
-    # Compute the updates
-    for key, value in new.items():
-        if key not in orig or value != orig[key]:
-            result[key] = ['+', value]
-    return result
 
 
 def check_isinstance(obj, cls):
@@ -590,8 +458,7 @@ def check_isinstance(obj, cls):
 
 
 def parse_server_string(server_str):
-    """
-    Parses the given server_string and returns a list of host and port.
+    """Parses the given server_string and returns a list of host and port.
     If it's not a combination of host part and port, the port element
     is a null string. If the input is invalid expression, return a null
     list.
@@ -640,6 +507,10 @@ def is_valid_ipv6(address):
         return netaddr.valid_ipv6(address)
     except Exception:
         return False
+
+
+def is_valid_ip_address(address):
+    return is_valid_ipv4(address) or is_valid_ipv6(address)
 
 
 def is_valid_ipv6_cidr(address):
@@ -699,17 +570,17 @@ def get_ip_version(network):
 
 
 def monkey_patch():
-    """If the Flags.monkey_patch set as True,
+    """If the CONF.monkey_patch set as True,
     this function patches a decorator
     for all functions in specified modules.
     You can set decorators for each modules
     using CONF.monkey_patch_modules.
     The format is "Module path:Decorator function".
     Example:
-      'nova.api.ec2.cloud:nova.openstack.common.notifier.api.notify_decorator'
+      'nova.api.ec2.cloud:nova.notifications.notify_decorator'
 
     Parameters of the decorator is as follows.
-    (See nova.openstack.common.notifier.api.notify_decorator)
+    (See nova.notifications.notify_decorator)
 
     name - name of the function
     function - object of the function
@@ -748,20 +619,6 @@ def convert_to_list_dict(lst, label):
     return [{label: x} for x in lst]
 
 
-def timefunc(func):
-    """Decorator that logs how long a particular function took to execute."""
-    @functools.wraps(func)
-    def inner(*args, **kwargs):
-        start_time = time.time()
-        try:
-            return func(*args, **kwargs)
-        finally:
-            total_time = time.time() - start_time
-            LOG.debug(_("timefunc: '%(name)s' took %(total_time).2f secs") %
-                      dict(name=func.__name__, total_time=total_time))
-    return inner
-
-
 def make_dev_path(dev, partition=None, base='/dev'):
     """Return a path to a particular device.
 
@@ -775,15 +632,6 @@ def make_dev_path(dev, partition=None, base='/dev'):
     if partition:
         path += str(partition)
     return path
-
-
-def total_seconds(td):
-    """Local total_seconds implementation for compatibility with python 2.6."""
-    if hasattr(td, 'total_seconds'):
-        return td.total_seconds()
-    else:
-        return ((td.days * 86400 + td.seconds) * 10 ** 6 +
-                td.microseconds) / 10.0 ** 6
 
 
 def sanitize_hostname(hostname):
@@ -818,14 +666,6 @@ def read_cached_file(filename, cache_info, reload_func=None):
         if reload_func:
             reload_func(cache_info['data'])
     return cache_info['data']
-
-
-def hash_file(file_like_object):
-    """Generate a hash for the contents of a file."""
-    checksum = hashlib.sha1()
-    for chunk in iter(lambda: file_like_object.read(32768), b''):
-        checksum.update(chunk)
-    return checksum.hexdigest()
 
 
 @contextlib.contextmanager
@@ -905,7 +745,7 @@ def read_file_as_root(file_path):
 def temporary_chown(path, owner_uid=None):
     """Temporarily chown a path.
 
-    :params owner_uid: UID of temporary owner (defaults to current user)
+    :param owner_uid: UID of temporary owner (defaults to current user)
     """
     if owner_uid is None:
         owner_uid = os.getuid()
@@ -976,7 +816,7 @@ class UndoManager(object):
             self._rollback()
 
 
-def mkfs(fs, path, label=None):
+def mkfs(fs, path, label=None, run_as_root=False):
     """Format a file or block device
 
     :param fs: Filesystem type (examples include 'swap', 'ext3', 'ext4'
@@ -989,7 +829,7 @@ def mkfs(fs, path, label=None):
     else:
         args = ['mkfs', '-t', fs]
     #add -F to force no interactive execute on non-block device.
-    if fs in ('ext3', 'ext4'):
+    if fs in ('ext3', 'ext4', 'ntfs'):
         args.extend(['-F'])
     if label:
         if fs in ('msdos', 'vfat'):
@@ -998,7 +838,7 @@ def mkfs(fs, path, label=None):
             label_opt = '-L'
         args.extend([label_opt, label])
     args.append(path)
-    execute(*args)
+    execute(*args, run_as_root=run_as_root)
 
 
 def last_bytes(file_like_object, num):
@@ -1045,6 +885,8 @@ def instance_meta(instance):
 
 
 def instance_sys_meta(instance):
+    if not instance.get('system_metadata'):
+        return {}
     if isinstance(instance['system_metadata'], dict):
         return instance['system_metadata']
     else:
@@ -1072,6 +914,27 @@ def get_wrapped_function(function):
     return _get_wrapped_function(function)
 
 
+def expects_func_args(*args):
+    def _decorator_checker(dec):
+        @functools.wraps(dec)
+        def _decorator(f):
+            base_f = get_wrapped_function(f)
+            arg_names, a, kw, _default = inspect.getargspec(base_f)
+            if a or kw or set(args) <= set(arg_names):
+                # NOTE (ndipanov): We can't really tell if correct stuff will
+                # be passed if it's a function with *args or **kwargs so
+                # we still carry on and hope for the best
+                return dec(f)
+            else:
+                raise TypeError("Decorated function %(f_name)s does not "
+                                "have the arguments expected by the "
+                                "decorator %(d_name)s" %
+                                {'f_name': base_f.__name__,
+                                 'd_name': dec.__name__})
+        return _decorator
+    return _decorator_checker
+
+
 class ExceptionHelper(object):
     """Class to wrap another and translate the ClientExceptions raised by its
     function calls to the actual ones.
@@ -1087,8 +950,8 @@ class ExceptionHelper(object):
         def wrapper(*args, **kwargs):
             try:
                 return func(*args, **kwargs)
-            except rpc_common.ClientException as e:
-                raise (e._exc_info[1], None, e._exc_info[2])
+            except messaging.ExpectedException as e:
+                raise (e.exc_info[1], None, e.exc_info[2])
         return wrapper
 
 
@@ -1099,13 +962,13 @@ def check_string_length(value, name, min_length=0, max_length=None):
     :param min_length: the min_length of the string
     :param max_length: the max_length of the string
     """
-    if not isinstance(value, basestring):
+    if not isinstance(value, six.string_types):
         msg = _("%s is not a string or unicode") % name
         raise exception.InvalidInput(message=msg)
 
     if len(value) < min_length:
-        msg = _("%(name)s has less than %(min_length)s "
-                "characters.") % {'name': name, 'min_length': min_length}
+        msg = _("%(name)s has a minimum character requirement of "
+                "%(min_length)s.") % {'name': name, 'min_length': min_length}
         raise exception.InvalidInput(message=msg)
 
     if max_length and len(value) > max_length:
@@ -1118,7 +981,7 @@ def validate_integer(value, name, min_value=None, max_value=None):
     """Make sure that value is a valid integer, potentially within range."""
     try:
         value = int(str(value))
-    except ValueError:
+    except (ValueError, UnicodeEncodeError):
         msg = _('%(value_name)s must be an integer')
         raise exception.InvalidInput(reason=(
             msg % {'value_name': name}))
@@ -1150,14 +1013,146 @@ def spawn_n(func, *args, **kwargs):
 
 
 def is_none_string(val):
+    """Check if a string represents a None value.
     """
-    Check if a string represents a None value.
-    """
-    if not isinstance(val, basestring):
+    if not isinstance(val, six.string_types):
         return False
 
     return val.lower() == 'none'
 
 
 def convert_version_to_int(version):
-    return version[0] * 1000000 + version[1] * 1000 + version[2]
+    try:
+        if isinstance(version, six.string_types):
+            version = convert_version_to_tuple(version)
+        if isinstance(version, tuple):
+            return reduce(lambda x, y: (x * 1000) + y, version)
+    except Exception:
+        raise exception.NovaException(message="Hypervisor version invalid.")
+
+
+def convert_version_to_str(version_int):
+    version_numbers = []
+    factor = 1000
+    while version_int != 0:
+        version_number = version_int - (version_int // factor * factor)
+        version_numbers.insert(0, str(version_number))
+        version_int = version_int / factor
+
+    return reduce(lambda x, y: "%s.%s" % (x, y), version_numbers)
+
+
+def convert_version_to_tuple(version_str):
+    return tuple(int(part) for part in version_str.split('.'))
+
+
+def is_neutron():
+    global _IS_NEUTRON
+
+    if _IS_NEUTRON is not None:
+        return _IS_NEUTRON
+
+    try:
+        # compatibility with Folsom/Grizzly configs
+        cls_name = CONF.network_api_class
+        if cls_name == 'nova.network.quantumv2.api.API':
+            cls_name = 'nova.network.neutronv2.api.API'
+
+        from nova.network.neutronv2 import api as neutron_api
+        _IS_NEUTRON = issubclass(importutils.import_class(cls_name),
+                                 neutron_api.API)
+    except ImportError:
+        _IS_NEUTRON = False
+
+    return _IS_NEUTRON
+
+
+def reset_is_neutron():
+    global _IS_NEUTRON
+    _IS_NEUTRON = None
+
+
+def is_auto_disk_config_disabled(auto_disk_config_raw):
+    auto_disk_config_disabled = False
+    if auto_disk_config_raw is not None:
+        adc_lowered = auto_disk_config_raw.strip().lower()
+        if adc_lowered == "disabled":
+            auto_disk_config_disabled = True
+    return auto_disk_config_disabled
+
+
+def get_auto_disk_config_from_instance(instance=None, sys_meta=None):
+    if sys_meta is None:
+        sys_meta = instance_sys_meta(instance)
+    return sys_meta.get("image_auto_disk_config")
+
+
+def get_auto_disk_config_from_image_props(image_properties):
+    return image_properties.get("auto_disk_config")
+
+
+def get_system_metadata_from_image(image_meta, flavor=None):
+    system_meta = {}
+    prefix_format = SM_IMAGE_PROP_PREFIX + '%s'
+
+    for key, value in image_meta.get('properties', {}).iteritems():
+        new_value = unicode(value)[:255]
+        system_meta[prefix_format % key] = new_value
+
+    for key in SM_INHERITABLE_KEYS:
+        value = image_meta.get(key)
+
+        if key == 'min_disk' and flavor:
+            if image_meta.get('disk_format') == 'vhd':
+                value = flavor['root_gb']
+            else:
+                value = max(value, flavor['root_gb'])
+
+        if value is None:
+            continue
+
+        system_meta[prefix_format % key] = value
+
+    return system_meta
+
+
+def get_image_from_system_metadata(system_meta):
+    image_meta = {}
+    properties = {}
+
+    if not isinstance(system_meta, dict):
+        system_meta = metadata_to_dict(system_meta)
+
+    for key, value in system_meta.iteritems():
+        if value is None:
+            continue
+
+        # NOTE(xqueralt): Not sure this has to inherit all the properties or
+        # just the ones we need. Leaving it for now to keep the old behaviour.
+        if key.startswith(SM_IMAGE_PROP_PREFIX):
+            key = key[len(SM_IMAGE_PROP_PREFIX):]
+
+        if key in SM_INHERITABLE_KEYS:
+            image_meta[key] = value
+        else:
+            # Skip properties that are non-inheritable
+            if key in CONF.non_inheritable_image_properties:
+                continue
+            properties[key] = value
+
+    if properties:
+        image_meta['properties'] = properties
+
+    return image_meta
+
+
+def get_hash_str(base_str):
+    """returns string that represents hash of base_str (in hex format)."""
+    return hashlib.md5(base_str).hexdigest()
+
+
+def cpu_count():
+    try:
+        return multiprocessing.cpu_count()
+    except NotImplementedError:
+        return 1

@@ -1,4 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
 # Copyright (c) 2013 Hewlett-Packard Development Company, L.P.
 # Copyright (c) 2012 VMware, Inc.
 #
@@ -21,6 +20,8 @@ Management class for host-related functions (start, reboot, etc).
 from nova import exception
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
+from nova.openstack.common import units
+from nova import utils
 from nova.virt.vmwareapi import vim_util
 from nova.virt.vmwareapi import vm_util
 
@@ -28,9 +29,7 @@ LOG = logging.getLogger(__name__)
 
 
 class Host(object):
-    """
-    Implements host related operations.
-    """
+    """Implements host related operations."""
     def __init__(self, session):
         self._session = session
 
@@ -53,7 +52,7 @@ class Host(object):
                                     self._session._get_vim(),
                                     "PowerUpHostFromStandBy_Task", host_mor,
                                     timeoutSec=60)
-        self._session._wait_for_task(host, host_task)
+        self._session._wait_for_task(host_task)
 
     def host_maintenance_mode(self, host, mode):
         """Start/Stop host maintenance window. On start, it triggers
@@ -73,7 +72,7 @@ class Host(object):
                                     self._session._get_vim(),
                                     "ExitMaintenanceMode_Task",
                                     host_mor, timeout=0)
-        self._session._wait_for_task(host, host_task)
+        self._session._wait_for_task(host_task)
 
     def set_host_enabled(self, _host, enabled):
         """Sets the specified host's ability to accept new instances."""
@@ -126,14 +125,15 @@ class HostState(object):
                               "sockets": summary.hardware.numCpuPkgs,
                               "threads": summary.hardware.numCpuThreads}
                 }
-        data["disk_total"] = ds[2] / (1024 * 1024 * 1024)
-        data["disk_available"] = ds[3] / (1024 * 1024 * 1024)
+        data["disk_total"] = ds[2] / units.Gi
+        data["disk_available"] = ds[3] / units.Gi
         data["disk_used"] = data["disk_total"] - data["disk_available"]
-        data["host_memory_total"] = summary.hardware.memorySize / (1024 * 1024)
+        data["host_memory_total"] = summary.hardware.memorySize / units.Mi
         data["host_memory_free"] = data["host_memory_total"] - \
                                    summary.quickStats.overallMemoryUsage
         data["hypervisor_type"] = summary.config.product.name
-        data["hypervisor_version"] = summary.config.product.version
+        data["hypervisor_version"] = utils.convert_version_to_int(
+                str(summary.config.product.version))
         data["hypervisor_hostname"] = self._host_name
         data["supported_instances"] = [('i686', 'vmware', 'hvm'),
                                        ('x86_64', 'vmware', 'hvm')]
@@ -163,44 +163,31 @@ class VCState(object):
         return self._stats
 
     def update_status(self):
-        """Update the current state of the host.
-        """
-        host_mor = vm_util.get_host_ref(self._session, self._cluster)
-        if host_mor is None:
-            return
-
-        summary = self._session._call_method(vim_util,
-                                             "get_dynamic_property",
-                                             host_mor,
-                                             "HostSystem",
-                                             "summary")
-
-        if summary is None:
-            return
-
+        """Update the current state of the cluster."""
+        # Get the datastore in the cluster
         try:
             ds = vm_util.get_datastore_ref_and_name(self._session,
                                                     self._cluster)
         except exception.DatastoreNotFound:
             ds = (None, None, 0, 0)
 
+        # Get cpu, memory stats from the cluster
+        stats = vm_util.get_stats_from_cluster(self._session, self._cluster)
+        about_info = self._session._call_method(vim_util, "get_about_info")
         data = {}
-        data["vcpus"] = summary.hardware.numCpuThreads
-        data["cpu_info"] =\
-        {"vendor": summary.hardware.vendor,
-         "model": summary.hardware.cpuModel,
-         "topology": {"cores": summary.hardware.numCpuCores,
-                      "sockets": summary.hardware.numCpuPkgs,
-                      "threads": summary.hardware.numCpuThreads}
-        }
-        data["disk_total"] = ds[2] / (1024 * 1024 * 1024)
-        data["disk_available"] = ds[3] / (1024 * 1024 * 1024)
+        data["vcpus"] = stats['cpu']['vcpus']
+        data["cpu_info"] = {"vendor": stats['cpu']['vendor'],
+                            "model": stats['cpu']['model'],
+                            "topology": {"cores": stats['cpu']['cores'],
+                                         "threads": stats['cpu']['vcpus']}}
+        data["disk_total"] = ds[2] / units.Gi
+        data["disk_available"] = ds[3] / units.Gi
         data["disk_used"] = data["disk_total"] - data["disk_available"]
-        data["host_memory_total"] = summary.hardware.memorySize / (1024 * 1024)
-        data["host_memory_free"] = data["host_memory_total"] -\
-                                   summary.quickStats.overallMemoryUsage
-        data["hypervisor_type"] = summary.config.product.name
-        data["hypervisor_version"] = summary.config.product.version
+        data["host_memory_total"] = stats['mem']['total']
+        data["host_memory_free"] = stats['mem']['free']
+        data["hypervisor_type"] = about_info.name
+        data["hypervisor_version"] = utils.convert_version_to_int(
+                str(about_info.version))
         data["hypervisor_hostname"] = self._host_name
         data["supported_instances"] = [('i686', 'vmware', 'hvm'),
                                        ('x86_64', 'vmware', 'hvm')]

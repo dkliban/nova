@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2010 Citrix Systems, Inc.
 # Copyright 2010-2012 OpenStack Foundation
 #
@@ -17,14 +15,17 @@
 
 import base64
 import binascii
+from distutils import version
 import os
+import sys
 import time
 import uuid
 
 from oslo.config import cfg
 
 from nova.api.metadata import password
-from nova.compute import api as compute_api
+from nova.compute import utils as compute_utils
+from nova import conductor
 from nova import context
 from nova import crypto
 from nova import exception
@@ -36,61 +37,82 @@ from nova import utils
 
 
 USE_AGENT_KEY = "xenapi_use_agent"
-USE_AGENT_SM_KEY = compute_api.SM_IMAGE_PROP_PREFIX + USE_AGENT_KEY
+USE_AGENT_SM_KEY = utils.SM_IMAGE_PROP_PREFIX + USE_AGENT_KEY
+SKIP_SSH_KEY = "xenapi_skip_agent_inject_ssh"
+SKIP_SSH_SM_KEY = utils.SM_IMAGE_PROP_PREFIX + SKIP_SSH_KEY
+SKIP_FILES_AT_BOOT_KEY = "xenapi_skip_agent_inject_files_at_boot"
+SKIP_FILES_AT_BOOT_SM_KEY = utils.SM_IMAGE_PROP_PREFIX \
+                                        + SKIP_FILES_AT_BOOT_KEY
 
 LOG = logging.getLogger(__name__)
 
 xenapi_agent_opts = [
     cfg.IntOpt('agent_timeout',
                default=30,
-               help='number of seconds to wait for agent reply'),
+               deprecated_name='agent_timeout',
+               deprecated_group='DEFAULT',
+               help='Number of seconds to wait for agent reply'),
     cfg.IntOpt('agent_version_timeout',
                default=300,
-               help='number of seconds to wait for agent '
+               deprecated_name='agent_version_timeout',
+               deprecated_group='DEFAULT',
+               help='Number of seconds to wait for agent '
                     'to be fully operational'),
     cfg.IntOpt('agent_resetnetwork_timeout',
+               deprecated_name='agent_resetnetwork_timeout',
+               deprecated_group='DEFAULT',
                default=60,
-               help='number of seconds to wait for agent reply '
+               help='Number of seconds to wait for agent reply '
                     'to resetnetwork request'),
-    cfg.StrOpt('xenapi_agent_path',
+    cfg.StrOpt('agent_path',
                default='usr/sbin/xe-update-networking',
-               help='Specifies the path in which the xenapi guest agent '
+               deprecated_name='xenapi_agent_path',
+               deprecated_group='DEFAULT',
+               help='Specifies the path in which the XenAPI guest agent '
                     'should be located. If the agent is present, network '
                     'configuration is not injected into the image. '
                     'Used if compute_driver=xenapi.XenAPIDriver and '
-                    ' flat_injected=True'),
-    cfg.BoolOpt('xenapi_disable_agent',
-               default=False,
-               help='Disables the use of the XenAPI agent in any image '
-                    'regardless of what image properties are present. '),
-    cfg.BoolOpt('xenapi_use_agent_default',
-               default=False,
-               help='Determines if the xenapi agent should be used when '
-                    'the image used does not contain a hint to declare if '
-                    'the agent is present or not. '
-                    'The hint is a glance property "' + USE_AGENT_KEY + '" '
-                    'that has the value "true" or "false". '
-                    'Note that waiting for the agent when it is not present '
-                    'will significantly increase server boot times.'),
+                    'flat_injected=True'),
+    cfg.BoolOpt('disable_agent',
+                default=False,
+                deprecated_name='xenapi_disable_agent',
+                deprecated_group='DEFAULT',
+                help='Disables the use of the XenAPI agent in any image '
+                     'regardless of what image properties are present.'),
+    cfg.BoolOpt('use_agent_default',
+                default=False,
+                deprecated_name='xenapi_use_agent_default',
+                deprecated_group='DEFAULT',
+                help='Determines if the XenAPI agent should be used when '
+                     'the image used does not contain a hint to declare if '
+                     'the agent is present or not. '
+                     'The hint is a glance property "' + USE_AGENT_KEY + '" '
+                     'that has the value "True" or "False". '
+                     'Note that waiting for the agent when it is not present '
+                     'will significantly increase server boot times.'),
 ]
 
 CONF = cfg.CONF
-CONF.register_opts(xenapi_agent_opts)
+# xenapi_agent options in the DEFAULT group were deprecated in Icehouse
+CONF.register_opts(xenapi_agent_opts, 'xenserver')
 
 
 def _call_agent(session, instance, vm_ref, method, addl_args=None,
-                timeout=None, success_code='0'):
+                timeout=None, success_codes=None):
     """Abstracts out the interaction with the agent xenapi plugin."""
     if addl_args is None:
         addl_args = {}
     if timeout is None:
-        timeout = CONF.agent_timeout
+        timeout = CONF.xenserver.agent_timeout
+    if success_codes is None:
+        success_codes = ['0']
 
-    vm_rec = session.call_xenapi("VM.get_record", vm_ref)
+    # always fetch domid because VM may have rebooted
+    dom_id = session.VM.get_domid(vm_ref)
 
     args = {
         'id': str(uuid.uuid4()),
-        'dom_id': vm_rec['domid'],
+        'dom_id': str(dom_id),
         'timeout': str(timeout),
     }
     args.update(addl_args)
@@ -126,16 +148,29 @@ def _call_agent(session, instance, vm_ref, method, addl_args=None,
                       instance=instance)
             raise exception.AgentError(method=method)
 
-    if ret['returncode'] != success_code:
+    if ret['returncode'] not in success_codes:
         LOG.error(_('The agent call to %(method)s returned an '
                     'an error: %(ret)r. args=%(args)r'),
                   {'method': method, 'ret': ret, 'args': args},
                   instance=instance)
         raise exception.AgentError(method=method)
 
+    LOG.debug(_('The agent call to %(method)s was successful: '
+                '%(ret)r. args=%(args)r'),
+              {'method': method, 'ret': ret, 'args': args},
+              instance=instance)
+
     # Some old versions of the Windows agent have a trailing \\r\\n
     # (ie CRLF escaped) for some reason. Strip that off.
     return ret['message'].replace('\\r\\n', '')
+
+
+def is_upgrade_required(current_version, available_version):
+    # NOTE(johngarbutt): agent version numbers are four part,
+    # so we need to use the loose version to compare them
+    current = version.LooseVersion(current_version)
+    available = version.LooseVersion(available_version)
+    return available > current
 
 
 class XenAPIBasedAgent(object):
@@ -145,37 +180,75 @@ class XenAPIBasedAgent(object):
         self.instance = instance
         self.vm_ref = vm_ref
 
+    def _add_instance_fault(self, error, exc_info):
+        LOG.warning(_("Ignoring error while configuring instance with "
+                      "agent: %s") % error,
+                    instance=self.instance, exc_info=True)
+        try:
+            ctxt = context.get_admin_context()
+            capi = conductor.API()
+            compute_utils.add_instance_fault_from_exc(
+                    ctxt, capi, self.instance, error, exc_info=exc_info)
+        except Exception:
+            pass
+
     def _call_agent(self, method, addl_args=None, timeout=None,
-                    success_code='0'):
-        return _call_agent(self.session, self.instance, self.vm_ref,
-                           method, addl_args, timeout, success_code)
+                    success_codes=None, ignore_errors=True):
+        try:
+            return _call_agent(self.session, self.instance, self.vm_ref,
+                               method, addl_args, timeout, success_codes)
+        except exception.AgentError as error:
+            if ignore_errors:
+                self._add_instance_fault(error, sys.exc_info())
+            else:
+                raise
 
-    def get_agent_version(self):
-        """Get the version of the agent running on the VM instance."""
-
+    def get_version(self):
         LOG.debug(_('Querying agent version'), instance=self.instance)
 
         # The agent can be slow to start for a variety of reasons. On Windows,
         # it will generally perform a setup process on first boot that can
         # take a couple of minutes and then reboot. On Linux, the system can
-        # also take a while to boot. So we need to be more patient than
-        # normal as well as watch for domid changes
-
-        expiration = time.time() + CONF.agent_version_timeout
+        # also take a while to boot.
+        expiration = time.time() + CONF.xenserver.agent_version_timeout
         while True:
             try:
-                return self._call_agent('version')
-            except exception.AgentTimeout:
+                # NOTE(johngarbutt): we can't use the xapi plugin
+                # timeout, because the domid may change when
+                # the server is rebooted
+                return self._call_agent('version', ignore_errors=False)
+            except exception.AgentError as error:
                 if time.time() > expiration:
-                    raise
+                    self._add_instance_fault(error, sys.exc_info())
+                    return
 
-    def agent_update(self, agent_build):
-        """Update agent on the VM instance."""
+    def _get_expected_build(self):
+        ctxt = context.get_admin_context()
+        agent_build = self.virtapi.agent_build_get_by_triple(
+            ctxt, 'xen', self.instance['os_type'],
+            self.instance['architecture'])
+        if agent_build:
+            LOG.debug(_('Latest agent build for %(hypervisor)s/%(os)s'
+                        '/%(architecture)s is %(version)s') % agent_build)
+        else:
+            LOG.debug(_('No agent build found for %(hypervisor)s/%(os)s'
+                        '/%(architecture)s') % {
+                            'hypervisor': 'xen',
+                            'os': self.instance['os_type'],
+                            'architecture': self.instance['architecture']})
+        return agent_build
 
-        LOG.debug(_('Updating agent to %s'), agent_build['version'],
-                  instance=self.instance)
+    def update_if_needed(self, version):
+        agent_build = self._get_expected_build()
+        if version and agent_build and \
+                is_upgrade_required(version, agent_build['version']):
+            LOG.debug(_('Updating agent to %s'), agent_build['version'],
+                      instance=self.instance)
+            self._perform_update(agent_build)
+        else:
+            LOG.debug(_('Skipping agent update.'), instance=self.instance)
 
-        # Send the encrypted password
+    def _perform_update(self, agent_build):
         args = {'url': agent_build['url'], 'md5sum': agent_build['md5hash']}
         try:
             self._call_agent('agentupdate', args)
@@ -188,7 +261,8 @@ class XenAPIBasedAgent(object):
     def _exchange_key_with_agent(self):
         dh = SimpleDH()
         args = {'pub': str(dh.get_public())}
-        resp = self._call_agent('key_init', args, success_code='D0')
+        resp = self._call_agent('key_init', args, success_codes=['D0'],
+                                ignore_errors=False)
         agent_pub = int(resp)
         dh.compute_shared(agent_pub)
         return dh
@@ -215,7 +289,12 @@ class XenAPIBasedAgent(object):
         """
         LOG.debug(_('Setting admin password'), instance=self.instance)
 
-        dh = self._exchange_key_with_agent()
+        try:
+            dh = self._exchange_key_with_agent()
+        except exception.AgentError as error:
+            self._add_instance_fault(error, sys.exc_info())
+            return
+
         # Some old versions of Linux and Windows agent expect trailing \n
         # on password to work correctly.
         enc_pass = dh.encrypt(new_pass + '\n')
@@ -228,8 +307,14 @@ class XenAPIBasedAgent(object):
         sshkey = self.instance.get('key_data')
         if not sshkey:
             return
+
         if self.instance['os_type'] == 'windows':
             LOG.debug(_("Skipping setting of ssh key for Windows."),
+                      instance=self.instance)
+            return
+
+        if self._skip_ssh_key_inject():
+            LOG.debug(_("Skipping agent ssh key injection for this image."),
                       instance=self.instance)
             return
 
@@ -244,6 +329,14 @@ class XenAPIBasedAgent(object):
         ])
         return self.inject_file(keyfile, key_data)
 
+    def inject_files(self, injected_files):
+        if self._skip_inject_files_at_boot():
+            LOG.debug(_("Skipping agent file injection for this image."),
+                      instance=self.instance)
+        else:
+            for path, contents in injected_files:
+                self.inject_file(path, contents)
+
     def inject_file(self, path, contents):
         LOG.debug(_('Injecting file path: %r'), path, instance=self.instance)
 
@@ -257,19 +350,31 @@ class XenAPIBasedAgent(object):
     def resetnetwork(self):
         LOG.debug(_('Resetting network'), instance=self.instance)
 
+        #NOTE(johngarbutt) old FreeBSD and Gentoo agents return 500 on success
         return self._call_agent('resetnetwork',
-                                timeout=CONF.agent_resetnetwork_timeout)
+                            timeout=CONF.xenserver.agent_resetnetwork_timeout,
+                            success_codes=['0', '500'])
+
+    def _skip_ssh_key_inject(self):
+        return self._get_sys_meta_key(SKIP_SSH_SM_KEY)
+
+    def _skip_inject_files_at_boot(self):
+        return self._get_sys_meta_key(SKIP_FILES_AT_BOOT_SM_KEY)
+
+    def _get_sys_meta_key(self, key):
+        sys_meta = utils.instance_sys_meta(self.instance)
+        raw_value = sys_meta.get(key, 'False')
+        return strutils.bool_from_string(raw_value, strict=False)
 
 
 def find_guest_agent(base_dir):
+    """tries to locate a guest agent at the path
+    specified by agent_rel_path
     """
-    tries to locate a guest agent at the path
-    specificed by agent_rel_path
-    """
-    if CONF.xenapi_disable_agent:
+    if CONF.xenserver.disable_agent:
         return False
 
-    agent_rel_path = CONF.xenapi_agent_path
+    agent_rel_path = CONF.xenserver.agent_path
     agent_path = os.path.join(base_dir, agent_rel_path)
     if os.path.isfile(agent_path):
         # The presence of the guest agent
@@ -297,7 +402,7 @@ def find_guest_agent(base_dir):
 def should_use_agent(instance):
     sys_meta = utils.instance_sys_meta(instance)
     if USE_AGENT_SM_KEY not in sys_meta:
-        return CONF.xenapi_use_agent_default
+        return CONF.xenserver.use_agent_default
     else:
         use_agent_raw = sys_meta[USE_AGENT_SM_KEY]
         try:
@@ -306,12 +411,11 @@ def should_use_agent(instance):
             LOG.warn(_("Invalid 'agent_present' value. "
                        "Falling back to the default."),
                        instance=instance)
-            return CONF.xenapi_use_agent_default
+            return CONF.xenserver.use_agent_default
 
 
 class SimpleDH(object):
-    """
-    This class wraps all the functionality needed to implement
+    """This class wraps all the functionality needed to implement
     basic Diffie-Hellman-Merkle key exchange in Python. It features
     intelligent defaults for the prime and base numbers needed for the
     calculation, while allowing you to supply your own. It requires that

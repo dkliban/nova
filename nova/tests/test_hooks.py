@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -61,9 +59,9 @@ class MockEntryPoint(object):
         return self.cls
 
 
-class HookTestCase(test.TestCase):
+class HookTestCase(test.NoDBTestCase):
 
-    def _mock_load_plugins(self, iload, iargs, ikwargs):
+    def _mock_load_plugins(self, iload, *iargs, **ikwargs):
         return [
             stevedore.extension.Extension('test_hook',
                 MockEntryPoint(SampleHookA), SampleHookA, SampleHookA()),
@@ -98,7 +96,7 @@ class HookTestCase(test.TestCase):
 
 
 class HookTestCaseWithFunction(HookTestCase):
-    def _mock_load_plugins(self, iload, iargs, ikwargs):
+    def _mock_load_plugins(self, iload, *iargs, **ikwargs):
         return [
             stevedore.extension.Extension('function_hook',
                 MockEntryPoint(SampleHookC), SampleHookC, SampleHookC()),

@@ -15,17 +15,17 @@
 
 import itertools
 
-from lxml import etree
 import webob
 
-from nova.api.openstack import wsgi
 from nova import compute
 from nova.compute import vm_states
+from nova import db
 from nova import exception
 from nova.objects import instance as instance_obj
 from nova.openstack.common import jsonutils
 from nova import test
 from nova.tests.api.openstack import fakes
+from nova.tests import fake_instance
 
 
 SENTINEL = object()
@@ -33,7 +33,8 @@ SENTINEL = object()
 
 def fake_compute_get(*args, **kwargs):
     def _return_server(*_args, **_kwargs):
-        return fakes.stub_instance(*args, **kwargs)
+        inst = fakes.stub_instance(*args, **kwargs)
+        return fake_instance.fake_instance_obj(_args[1], **inst)
     return _return_server
 
 
@@ -43,6 +44,8 @@ class HideServerAddressesTest(test.TestCase):
     def setUp(self):
         super(HideServerAddressesTest, self).setUp()
         fakes.stub_out_nw_api(self.stubs)
+        return_server = fakes.fake_instance_get()
+        self.stubs.Set(db, 'instance_get_by_uuid', return_server)
 
     def _make_request(self, url):
         req = webob.Request.blank(url)
@@ -130,22 +133,3 @@ class HideServerAddressesTest(test.TestCase):
         res = self._make_request('/v3/servers/' + fakes.get_fake_uuid())
 
         self.assertEqual(res.status_int, 404)
-
-
-class HideAddressesXmlTest(HideServerAddressesTest):
-    content_type = 'application/xml'
-
-    @staticmethod
-    def _get_server(body):
-        return etree.XML(body)
-
-    @staticmethod
-    def _get_servers(body):
-        return etree.XML(body).getchildren()
-
-    @staticmethod
-    def _get_addresses(server):
-        addresses = server.find('{%s}addresses' % wsgi.XMLNS_V11)
-        if addresses is None:
-            return SENTINEL
-        return addresses

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010-2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -75,10 +73,21 @@ EXP_VERSIONS = {
             },
         ],
     },
+    "v3.0": {
+        "id": "v3.0",
+        "status": "EXPERIMENTAL",
+        "updated": "2013-07-23T11:33:21Z",
+        "media-types": [
+            {
+                "base": "application/json",
+                "type": "application/vnd.openstack.compute+json;version=3",
+            }
+        ],
+    }
 }
 
 
-class VersionsTest(test.TestCase):
+class VersionsTest(test.NoDBTestCase):
 
     def test_get_version_list(self):
         req = webob.Request.blank('/')
@@ -96,6 +105,16 @@ class VersionsTest(test.TestCase):
                     {
                         "rel": "self",
                         "href": "http://localhost/v2/",
+                    }],
+            },
+            {
+                "id": "v3.0",
+                "status": "EXPERIMENTAL",
+                "updated": "2013-07-23T11:33:21Z",
+                "links": [
+                    {
+                        "rel": "self",
+                        "href": "http://localhost/v3/",
                     }],
             },
         ]
@@ -232,9 +251,9 @@ class VersionsTest(test.TestCase):
 
         self.assertTrue(root.xpath('/ns:versions', namespaces=NS))
         versions = root.xpath('ns:version', namespaces=NS)
-        self.assertEqual(len(versions), 1)
+        self.assertEqual(len(versions), 2)
 
-        for i, v in enumerate(['v2.0']):
+        for i, v in enumerate(['v2.0', 'v3.0']):
             version = versions[i]
             expected = EXP_VERSIONS[v]
             for key in ['id', 'status', 'updated']:
@@ -291,7 +310,7 @@ class VersionsTest(test.TestCase):
 
         f = feedparser.parse(res.body)
         self.assertEqual(f.feed.title, 'Available API Versions')
-        self.assertEqual(f.feed.updated, '2011-01-21T11:33:21Z')
+        self.assertEqual(f.feed.updated, '2013-07-23T11:33:21Z')
         self.assertEqual(f.feed.id, 'http://localhost/')
         self.assertEqual(f.feed.author, 'Rackspace')
         self.assertEqual(f.feed.author_detail.href,
@@ -299,7 +318,7 @@ class VersionsTest(test.TestCase):
         self.assertEqual(f.feed.links[0]['href'], 'http://localhost/')
         self.assertEqual(f.feed.links[0]['rel'], 'self')
 
-        self.assertEqual(len(f.entries), 1)
+        self.assertEqual(len(f.entries), 2)
         entry = f.entries[0]
         self.assertEqual(entry.id, 'http://localhost/v2/')
         self.assertEqual(entry.title, 'Version v2.0')
@@ -311,6 +330,17 @@ class VersionsTest(test.TestCase):
         self.assertEqual(entry.links[0]['href'], 'http://localhost/v2/')
         self.assertEqual(entry.links[0]['rel'], 'self')
 
+        entry = f.entries[1]
+        self.assertEqual(entry.id, 'http://localhost/v3/')
+        self.assertEqual(entry.title, 'Version v3.0')
+        self.assertEqual(entry.updated, '2013-07-23T11:33:21Z')
+        self.assertEqual(len(entry.content), 1)
+        self.assertEqual(entry.content[0].value,
+            'Version v3.0 EXPERIMENTAL (2013-07-23T11:33:21Z)')
+        self.assertEqual(len(entry.links), 1)
+        self.assertEqual(entry.links[0]['href'], 'http://localhost/v3/')
+        self.assertEqual(entry.links[0]['rel'], 'self')
+
     def test_multi_choice_image(self):
         req = webob.Request.blank('/images/1')
         req.accept = "application/json"
@@ -320,6 +350,23 @@ class VersionsTest(test.TestCase):
 
         expected = {
         "choices": [
+            {
+                "id": "v3.0",
+                "status": "EXPERIMENTAL",
+                "links": [
+                    {
+                        "href": "http://localhost/v3/images/1",
+                        "rel": "self",
+                    },
+                ],
+                "media-types": [
+                    {
+                        "base": "application/json",
+                        "type":
+                        "application/vnd.openstack.compute+json;version=3",
+                    }
+                ],
+            },
             {
                 "id": "v2.0",
                 "status": "CURRENT",
@@ -357,9 +404,9 @@ class VersionsTest(test.TestCase):
         root = etree.XML(res.body)
         self.assertTrue(root.xpath('/ns:choices', namespaces=NS))
         versions = root.xpath('ns:version', namespaces=NS)
-        self.assertEqual(len(versions), 1)
+        self.assertEqual(len(versions), 2)
 
-        version = versions[0]
+        version = versions[1]
         self.assertEqual(version.get('id'), 'v2.0')
         self.assertEqual(version.get('status'), 'CURRENT')
         media_types = version.xpath('ns:media-types/ns:media-type',
@@ -373,9 +420,22 @@ class VersionsTest(test.TestCase):
         self.assertTrue(common.compare_links(links,
             [{'rel': 'self', 'href': 'http://localhost/v2/images/1'}]))
 
+        version = versions[0]
+        self.assertEqual(version.get('id'), 'v3.0')
+        self.assertEqual(version.get('status'), 'EXPERIMENTAL')
+        media_types = version.xpath('ns:media-types/ns:media-type',
+                                    namespaces=NS)
+        self.assertTrue(common.
+                        compare_media_types(media_types,
+                                            EXP_VERSIONS['v3.0']['media-types']
+                                            ))
+
+        links = version.xpath('atom:link', namespaces=NS)
+        self.assertTrue(common.compare_links(links,
+            [{'rel': 'self', 'href': 'http://localhost/v3/images/1'}]))
+
     def test_multi_choice_server_atom(self):
-        """
-        Make sure multi choice responses do not have content-type
+        """Make sure multi choice responses do not have content-type
         application/atom+xml (should use default of json)
         """
         req = webob.Request.blank('/servers')
@@ -394,6 +454,23 @@ class VersionsTest(test.TestCase):
 
         expected = {
         "choices": [
+            {
+                "id": "v3.0",
+                "status": "EXPERIMENTAL",
+                "links": [
+                    {
+                        "href": "http://localhost/v3/servers/" + uuid,
+                        "rel": "self",
+                    },
+                ],
+                "media-types": [
+                    {
+                        "base": "application/json",
+                        "type":
+                        "application/vnd.openstack.compute+json;version=3",
+                    }
+                ],
+            },
             {
                 "id": "v2.0",
                 "status": "CURRENT",
@@ -422,7 +499,7 @@ class VersionsTest(test.TestCase):
                         matchers.DictMatches(expected))
 
 
-class VersionsViewBuilderTests(test.TestCase):
+class VersionsViewBuilderTests(test.NoDBTestCase):
     def test_view_builder(self):
         base_url = "http://example.org/"
 
@@ -461,12 +538,32 @@ class VersionsViewBuilderTests(test.TestCase):
         expected = "http://example.org/app/v2/"
 
         builder = views.versions.ViewBuilder(base_url)
-        actual = builder.generate_href()
+        actual = builder.generate_href('v2')
+
+        self.assertEqual(actual, expected)
+
+    def test_generate_href_v3(self):
+        base_url = "http://example.org/app/"
+
+        expected = "http://example.org/app/v3/"
+
+        builder = views.versions.ViewBuilder(base_url)
+        actual = builder.generate_href('v3.0')
+
+        self.assertEqual(actual, expected)
+
+    def test_generate_href_unknown(self):
+        base_url = "http://example.org/app/"
+
+        expected = "http://example.org/app/v2/"
+
+        builder = views.versions.ViewBuilder(base_url)
+        actual = builder.generate_href('foo')
 
         self.assertEqual(actual, expected)
 
 
-class VersionsSerializerTests(test.TestCase):
+class VersionsSerializerTests(test.NoDBTestCase):
     def test_versions_list_xml_serializer(self):
         versions_data = {
             'versions': [

@@ -16,9 +16,12 @@
 
 import datetime
 import iso8601
+
 import netaddr
+import six
 
 from nova.network import model as network_model
+from nova.openstack.common.gettextutils import _
 from nova.openstack.common import timeutils
 
 
@@ -40,7 +43,7 @@ def datetime_or_none(dt):
 # NOTE(danms): Being tolerant of isotime strings here will help us
 # during our objects transition
 def datetime_or_str_or_none(val):
-    if isinstance(val, basestring):
+    if isinstance(val, six.string_types):
         return timeutils.parse_isotime(val)
     return datetime_or_none(val)
 
@@ -53,12 +56,24 @@ def int_or_none(val):
         return int(val)
 
 
+def str_value(val):
+    if val is None:
+        raise ValueError(_('None is not valid here'))
+    return unicode(val)
+
+
 def str_or_none(val):
     """Attempt to stringify a value, or None."""
     if val is None:
         return val
     else:
-        return str(val)
+        return str_value(val)
+
+
+def cstring(val):
+    if val is None:
+        raise ValueError(_('None is not valid here'))
+    return str(val)
 
 
 def ip_or_none(version):
@@ -71,9 +86,11 @@ def ip_or_none(version):
     return validator
 
 
-def nested_object_or_none(objclass):
+def nested_object(objclass, none_ok=True):
     def validator(val, objclass=objclass):
-        if val is None or isinstance(val, objclass):
+        if none_ok and val is None:
+            return val
+        if isinstance(val, objclass):
             return val
         raise ValueError('An object of class %s is required here' % objclass)
     return validator
@@ -86,6 +103,34 @@ def network_model_or_none(val):
     if isinstance(val, network_model.NetworkInfo):
         return val
     return network_model.NetworkInfo.hydrate(val)
+
+
+def list_of_strings_or_none(val):
+    if val is None:
+        return val
+    if not isinstance(val, list):
+        raise ValueError(_('A list of strings is required here'))
+    if not all([isinstance(x, six.string_types) for x in val]):
+        raise ValueError(_('Invalid values found in list '
+                           '(strings are required)'))
+    return val
+
+
+def dict_of_strings_or_none(val):
+    if val is None:
+        return val
+    if not isinstance(val, dict):
+        try:
+            val = dict(val.iteritems())
+        except Exception:
+            raise ValueError(_('A dict of strings is required here'))
+    if not all([isinstance(x, six.string_types) for x in val.keys()]):
+        raise ValueError(_('Invalid keys found in dict '
+                           '(strings are required)'))
+    if not all([isinstance(x, six.string_types) for x in val.values()]):
+        raise ValueError(_('Invalid values found in dict '
+                           '(strings are required)'))
+    return val
 
 
 def dt_serializer(name):

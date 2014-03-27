@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -142,6 +140,9 @@ def image_ec2_id(image_id, image_type='ami'):
 
 
 def get_ip_info_for_instance_from_nw_info(nw_info):
+    if not isinstance(nw_info, network_model.NetworkInfo):
+        nw_info = network_model.NetworkInfo.hydrate(nw_info)
+
     ip_info = {}
     fixed_ips = nw_info.fixed_ips()
     ip_info['fixed_ips'] = [ip['address'] for ip in fixed_ips
@@ -162,11 +163,9 @@ def get_ip_info_for_instance(context, instance):
         # FIXME(comstud): Temporary as we transition to objects.
         info_cache = instance['info_cache'] or {}
         nw_info = info_cache.get('network_info')
-        # Make sure empty response is turned into the model
-        if not nw_info:
-            nw_info = []
-        if not isinstance(nw_info, network_model.NetworkInfo):
-            nw_info = network_model.NetworkInfo.hydrate(nw_info)
+    # Make sure empty response is turned into the model
+    if not nw_info:
+        nw_info = []
     return get_ip_info_for_instance_from_nw_info(nw_info)
 
 
@@ -406,3 +405,30 @@ def dict_from_dotted_str(items):
 def search_opts_from_filters(filters):
     return dict((f['name'].replace('-', '_'), f['value']['1'])
                 for f in filters if f['value']['1']) if filters else {}
+
+
+def regex_from_ec2_regex(ec2_re):
+    """Converts an EC2-style regex to a python regex.
+    Approach is based on python fnmatch.
+    """
+
+    iter_ec2_re = iter(ec2_re)
+
+    py_re = ''
+    for char in iter_ec2_re:
+        if char == '*':
+            py_re += '.*'
+        elif char == '?':
+            py_re += '.'
+        elif char == '\\':
+            try:
+                next_char = iter_ec2_re.next()
+            except StopIteration:
+                next_char = ''
+            if next_char == '*' or next_char == '?':
+                py_re += '[%s]' % next_char
+            else:
+                py_re += '\\\\' + next_char
+        else:
+            py_re += re.escape(char)
+    return '\A%s\Z(?s)' % py_re

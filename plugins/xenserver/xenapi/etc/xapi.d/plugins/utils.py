@@ -28,10 +28,14 @@ LOG = logging.getLogger(__name__)
 CHUNK_SIZE = 8192
 
 
+class CommandNotFound(Exception):
+    pass
+
+
 def delete_if_exists(path):
     try:
         os.unlink(path)
-    except OSError, e:
+    except OSError, e:  # noqa
         if e.errno == errno.ENOENT:
             LOG.warning("'%s' was already deleted, skipping delete" % path)
         else:
@@ -47,7 +51,7 @@ def _rename(src, dst):
     LOG.info("Renaming file '%s' -> '%s'" % (src, dst))
     try:
         os.rename(src, dst)
-    except OSError, e:
+    except OSError, e:  # noqa
         if e.errno == errno.EXDEV:
             LOG.error("Invalid cross-device link.  Perhaps %s and %s should "
                       "be symlinked on the same filesystem?" % (src, dst))
@@ -55,7 +59,7 @@ def _rename(src, dst):
 
 
 def make_subprocess(cmdline, stdout=False, stderr=False, stdin=False,
-                    universal_newlines=False, close_fds=True):
+                    universal_newlines=False, close_fds=True, env=None):
     """Make a subprocess according to the given command-line string
     """
     LOG.info("Running cmd '%s'" % " ".join(cmdline))
@@ -65,7 +69,14 @@ def make_subprocess(cmdline, stdout=False, stderr=False, stdin=False,
     kwargs['stdin'] = stdin and subprocess.PIPE or None
     kwargs['universal_newlines'] = universal_newlines
     kwargs['close_fds'] = close_fds
-    proc = subprocess.Popen(cmdline, **kwargs)
+    kwargs['env'] = env
+    try:
+        proc = subprocess.Popen(cmdline, **kwargs)
+    except OSError, e:  # noqa
+        if e.errno == errno.ENOENT:
+            raise CommandNotFound
+        else:
+            raise
     return proc
 
 
@@ -92,6 +103,7 @@ def finish_subprocess(proc, cmdline, cmd_input=None, ok_exit_codes=None):
         raise SubprocessException(' '.join(cmdline), ret, out, err)
     return out
 
+
 def run_command(cmd, cmd_input=None, ok_exit_codes=None):
     """Abstracts out the basics of issuing system commands. If the command
     returns anything in stderr, an exception is raised with that information.
@@ -106,8 +118,7 @@ def run_command(cmd, cmd_input=None, ok_exit_codes=None):
 
 
 def make_staging_area(sr_path):
-    """
-    The staging area is a place where we can temporarily store and
+    """The staging area is a place where we can temporarily store and
     manipulate VHDs. The use of the staging area is different for upload and
     download:
 
@@ -189,13 +200,11 @@ def _assert_vhd_not_hidden(path):
             value = line.split(':')[1].strip()
             if value == "1":
                 raise Exception(
-                    "VHD %(path)s is marked as hidden without child" %
-                    locals())
+                    "VHD %s is marked as hidden without child" % path)
 
 
 def _validate_vhd(vdi_path):
-    """
-    This checks for several errors in the VHD structure.
+    """This checks for several errors in the VHD structure.
 
     Most notably, it checks that the timestamp in the footer is correct, but
     may pick up other errors also.
@@ -232,12 +241,12 @@ def _validate_vhd(vdi_path):
 
         raise Exception(
             "VDI '%(vdi_path)s' has an invalid %(part)s: '%(details)s'"
-            "%(extra)s" % locals())
+            "%(extra)s" % {'vdi_path': vdi_path, 'part': part,
+                           'details': details, 'extra': extra})
 
 
 def _validate_vdi_chain(vdi_path):
-    """
-    This check ensures that the parent pointers on the VHDs are valid
+    """This check ensures that the parent pointers on the VHDs are valid
     before we move the VDI chain to the SR. This is *very* important
     because a bad parent pointer will corrupt the SR causing a cascade of
     failures.
@@ -252,11 +261,10 @@ def _validate_vdi_chain(vdi_path):
         elif 'has no parent' in first_line:
             return None
         elif 'query failed' in first_line:
-            raise Exception("VDI '%(path)s' not present which breaks"
-                            " the VDI chain, bailing out" % locals())
+            raise Exception("VDI '%s' not present which breaks"
+                            " the VDI chain, bailing out" % path)
         else:
-            raise Exception("Unexpected output '%(out)s' from vhd-util" %
-                            locals())
+            raise Exception("Unexpected output '%s' from vhd-util" % out)
 
     cur_path = vdi_path
     while cur_path:
@@ -355,16 +363,20 @@ def prepare_staging_area(sr_path, staging_path, vdi_uuids, seq_num=0):
         seq_num += 1
 
 
-def create_tarball(fileobj, path, callback=None):
+def create_tarball(fileobj, path, callback=None, compression_level=None):
     """Create a tarball from a given path.
 
     :param fileobj: a file-like object holding the tarball byte-stream.
                     If None, then only the callback will be used.
     :param path: path to create tarball from
     :param callback: optional callback to call on each chunk written
+    :param compression_level: compression level, e.g., 9 for gzip -9.
     """
     tar_cmd = ["tar", "-zc", "--directory=%s" % path, "."]
-    tar_proc = make_subprocess(tar_cmd, stdout=True, stderr=True)
+    env = os.environ.copy()
+    if compression_level and 1 <= compression_level <= 9:
+        env["GZIP"] = "-%d" % compression_level
+    tar_proc = make_subprocess(tar_cmd, stdout=True, stderr=True, env=env)
 
     while True:
         chunk = tar_proc.stdout.read(CHUNK_SIZE)

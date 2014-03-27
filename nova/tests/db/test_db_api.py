@@ -1,4 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
 # encoding=UTF8
 
 # Copyright 2010 United States Government as represented by the
@@ -28,6 +27,7 @@ import uuid as stdlib_uuid
 import mox
 import netaddr
 from oslo.config import cfg
+import six
 from sqlalchemy.dialects import sqlite
 from sqlalchemy import exc
 from sqlalchemy.exc import IntegrityError
@@ -45,11 +45,10 @@ from nova.db.sqlalchemy import models
 from nova.db.sqlalchemy import utils as db_utils
 from nova import exception
 from nova.openstack.common.db import exception as db_exc
-from nova.openstack.common.db.sqlalchemy import session as db_session
+from nova.openstack.common import jsonutils
 from nova.openstack.common import timeutils
 from nova.openstack.common import uuidutils
-from nova.quota import ReservableResource
-from nova.quota import resources
+from nova import quota
 from nova import test
 from nova.tests import matchers
 from nova import utils
@@ -59,8 +58,18 @@ CONF = cfg.CONF
 CONF.import_opt('reserved_host_memory_mb', 'nova.compute.resource_tracker')
 CONF.import_opt('reserved_host_disk_mb', 'nova.compute.resource_tracker')
 
-get_engine = db_session.get_engine
-get_session = db_session.get_session
+get_engine = sqlalchemy_api.get_engine
+get_session = sqlalchemy_api.get_session
+
+
+def _reservation_get(context, uuid):
+    result = sqlalchemy_api.model_query(context, models.Reservation,
+            read_deleted="no").filter_by(uuid=uuid).first()
+
+    if not result:
+        raise exception.ReservationNotFound(uuid=uuid)
+
+    return result
 
 
 def _quota_reserve(context, project_id, user_id):
@@ -82,18 +91,27 @@ def _quota_reserve(context, project_id, user_id):
     deltas = {}
     for i in range(3):
         resource = 'resource%d' % i
+        if i == 2:
+            # test for project level resources
+            resource = 'fixed_ips'
+            quotas[resource] = db.quota_create(context,
+                                               project_id, resource, i)
+            user_quotas[resource] = quotas[resource]
+        else:
+            quotas[resource] = db.quota_create(context,
+                                               project_id, resource, i)
+            user_quotas[resource] = db.quota_create(context, project_id,
+                                                    resource, i,
+                                                    user_id=user_id)
         sync_name = '_sync_%s' % resource
-        quotas[resource] = db.quota_create(context, project_id, resource, i)
-        user_quotas[resource] = db.quota_create(context, project_id,
-                                                resource, i, user_id=user_id)
-        resources[resource] = ReservableResource(
+        resources[resource] = quota.ReservableResource(
             resource, sync_name, 'quota_res_%d' % i)
         deltas[resource] = i
         setattr(sqlalchemy_api, sync_name, get_sync(resource, i))
         sqlalchemy_api.QUOTA_SYNC_FUNCTIONS[sync_name] = getattr(
             sqlalchemy_api, sync_name)
     return db.quota_reserve(context, resources, quotas, user_quotas, deltas,
-                    timeutils.utcnow(), timeutils.utcnow(),
+                    timeutils.utcnow(), CONF.until_refresh,
                     datetime.timedelta(days=1), project_id, user_id)
 
 
@@ -138,15 +156,18 @@ class DecoratorTestCase(test.TestCase):
 
         decorated_func = decorator(test_func)
 
-        self.assertEquals(test_func.func_name, decorated_func.func_name)
-        self.assertEquals(test_func.__doc__, decorated_func.__doc__)
-        self.assertEquals(test_func.__module__, decorated_func.__module__)
+        self.assertEqual(test_func.func_name, decorated_func.func_name)
+        self.assertEqual(test_func.__doc__, decorated_func.__doc__)
+        self.assertEqual(test_func.__module__, decorated_func.__module__)
 
     def test_require_context_decorator_wraps_functions_properly(self):
         self._test_decorator_wraps_helper(sqlalchemy_api.require_context)
 
     def test_require_admin_context_decorator_wraps_functions_properly(self):
         self._test_decorator_wraps_helper(sqlalchemy_api.require_admin_context)
+
+    def test_require_deadlock_retry_wraps_functions_properly(self):
+        self._test_decorator_wraps_helper(sqlalchemy_api._retry_on_deadlock)
 
 
 def _get_fake_aggr_values():
@@ -188,14 +209,14 @@ class NotDbApiTestCase(DbTestCase):
     def test_instance_get_all_by_filters_regex_unsupported_db(self):
         # Ensure that the 'LIKE' operator is used for unsupported dbs.
         self.create_instance_with_args(display_name='test1')
-        self.create_instance_with_args(display_name='test.*')
+        self.create_instance_with_args(display_name='test2')
         self.create_instance_with_args(display_name='diff')
         result = db.instance_get_all_by_filters(self.context,
-                                                {'display_name': 'test.*'})
-        self.assertEqual(1, len(result))
-        result = db.instance_get_all_by_filters(self.context,
-                                                {'display_name': '%test%'})
+                                                {'display_name': 'test'})
         self.assertEqual(2, len(result))
+        result = db.instance_get_all_by_filters(self.context,
+                                                {'display_name': 'di'})
+        self.assertEqual(1, len(result))
 
     def test_instance_get_all_by_filters_paginate(self):
         test1 = self.create_instance_with_args(display_name='test1')
@@ -227,6 +248,32 @@ class NotDbApiTestCase(DbTestCase):
                           self.context, {'display_name': '%test%'},
                           marker=str(stdlib_uuid.uuid4()))
 
+    def test_convert_objects_related_datetimes(self):
+
+        t1 = timeutils.utcnow()
+        t2 = t1 + datetime.timedelta(seconds=10)
+        t3 = t2 + datetime.timedelta(hours=1)
+
+        t2_utc = t2.replace(tzinfo=iso8601.iso8601.Utc())
+        t3_utc = t3.replace(tzinfo=iso8601.iso8601.Utc())
+
+        datetime_keys = ('created_at', 'deleted_at')
+
+        test1 = {'created_at': t1, 'deleted_at': t2, 'updated_at': t3}
+        expected_dict = {'created_at': t1, 'deleted_at': t2, 'updated_at': t3}
+        sqlalchemy_api.convert_objects_related_datetimes(test1, *datetime_keys)
+        self.assertEqual(test1, expected_dict)
+
+        test2 = {'created_at': t1, 'deleted_at': t2_utc, 'updated_at': t3}
+        expected_dict = {'created_at': t1, 'deleted_at': t2, 'updated_at': t3}
+        sqlalchemy_api.convert_objects_related_datetimes(test2, *datetime_keys)
+        self.assertEqual(test2, expected_dict)
+
+        test3 = {'deleted_at': t2_utc, 'updated_at': t3_utc}
+        expected_dict = {'deleted_at': t2, 'updated_at': t3_utc}
+        sqlalchemy_api.convert_objects_related_datetimes(test3, *datetime_keys)
+        self.assertEqual(test3, expected_dict)
+
 
 class AggregateDBApiTestCase(test.TestCase):
     def setUp(self):
@@ -237,7 +284,7 @@ class AggregateDBApiTestCase(test.TestCase):
 
     def test_aggregate_create_no_metadata(self):
         result = _create_aggregate(metadata=None)
-        self.assertEquals(result['name'], 'fake_aggregate')
+        self.assertEqual(result['name'], 'fake_aggregate')
 
     def test_aggregate_create_avoid_name_conflict(self):
         r1 = _create_aggregate(metadata=None)
@@ -290,11 +337,6 @@ class AggregateDBApiTestCase(test.TestCase):
         expected_metadata = db.aggregate_metadata_get(ctxt, result['id'])
         self.assertEqual(expected_metadata, {'availability_zone':
             'fake_avail_zone'})
-
-    def test_aggregate_create_low_privi_context(self):
-        self.assertRaises(exception.AdminRequired,
-                          db.aggregate_create,
-                          self.context, _get_fake_aggr_values())
 
     def test_aggregate_get(self):
         ctxt = context.get_admin_context()
@@ -349,7 +391,7 @@ class AggregateDBApiTestCase(test.TestCase):
                 hosts=['bar.openstack.org'], metadata={'badkey': 'bad'})
         r1 = db.aggregate_metadata_get_by_host(ctxt, 'foo.openstack.org')
         self.assertEqual(r1['fake_key1'], set(['fake_value1']))
-        self.assertFalse('badkey' in r1)
+        self.assertNotIn('badkey', r1)
 
     def test_aggregate_metadata_get_by_metadata_key(self):
         ctxt = context.get_admin_context()
@@ -362,8 +404,8 @@ class AggregateDBApiTestCase(test.TestCase):
         r1 = db.aggregate_metadata_get_by_metadata_key(ctxt, aggr['id'],
                                                         'availability_zone')
         self.assertEqual(r1['availability_zone'], set(['az1']))
-        self.assertTrue('availability_zone' in r1)
-        self.assertFalse('name' in r1)
+        self.assertIn('availability_zone', r1)
+        self.assertNotIn('name', r1)
 
     def test_aggregate_metadata_get_by_host_with_key(self):
         ctxt = context.get_admin_context()
@@ -381,13 +423,13 @@ class AggregateDBApiTestCase(test.TestCase):
         r1 = db.aggregate_metadata_get_by_host(ctxt, 'foo2.openstack.org',
                                                key='good')
         self.assertEqual(r1['good'], set(['value12', 'value23']))
-        self.assertFalse('fake_key1' in r1)
-        self.assertFalse('bad' in r1)
+        self.assertNotIn('fake_key1', r1)
+        self.assertNotIn('bad', r1)
         # Delete metadata
         db.aggregate_metadata_delete(ctxt, a3['id'], 'good')
         r2 = db.aggregate_metadata_get_by_host(ctxt, 'foo.openstack.org',
                                                key='good')
-        self.assertFalse('good' in r2)
+        self.assertNotIn('good', r2)
 
     def test_aggregate_host_get_by_metadata_key(self):
         ctxt = context.get_admin_context()
@@ -408,7 +450,7 @@ class AggregateDBApiTestCase(test.TestCase):
             'foo2.openstack.org': set(['value12', 'value23']),
             'foo3.openstack.org': set(['value23']),
         }, r1)
-        self.assertFalse('fake_key1' in r1)
+        self.assertNotIn('fake_key1', r1)
 
     def test_aggregate_get_by_host_not_found(self):
         ctxt = context.get_admin_context()
@@ -431,7 +473,7 @@ class AggregateDBApiTestCase(test.TestCase):
         self.assertEqual(0, len(expected))
         aggregate = db.aggregate_get(ctxt.elevated(read_deleted='yes'),
                                      result['id'])
-        self.assertEqual(aggregate['deleted'], True)
+        self.assertEqual(aggregate['deleted'], result['id'])
 
     def test_aggregate_update(self):
         ctxt = context.get_admin_context()
@@ -440,7 +482,7 @@ class AggregateDBApiTestCase(test.TestCase):
         self.assertEqual(result['availability_zone'], 'fake_avail_zone')
         new_values = _get_fake_aggr_values()
         new_values['availability_zone'] = 'different_avail_zone'
-        updated = db.aggregate_update(ctxt, 1, new_values)
+        updated = db.aggregate_update(ctxt, result['id'], new_values)
         self.assertNotEqual(result['availability_zone'],
                             updated['availability_zone'])
 
@@ -450,7 +492,7 @@ class AggregateDBApiTestCase(test.TestCase):
         values = _get_fake_aggr_values()
         values['metadata'] = _get_fake_aggr_metadata()
         values['availability_zone'] = 'different_avail_zone'
-        db.aggregate_update(ctxt, 1, values)
+        db.aggregate_update(ctxt, result['id'], values)
         expected = db.aggregate_metadata_get(ctxt, result['id'])
         updated = db.aggregate_get(ctxt, result['id'])
         self.assertThat(values['metadata'],
@@ -464,7 +506,7 @@ class AggregateDBApiTestCase(test.TestCase):
         values = _get_fake_aggr_values()
         values['metadata'] = _get_fake_aggr_metadata()
         values['metadata']['fake_key1'] = 'foo'
-        db.aggregate_update(ctxt, 1, values)
+        db.aggregate_update(ctxt, result['id'], values)
         expected = db.aggregate_metadata_get(ctxt, result['id'])
         self.assertThat(values['metadata'], matchers.DictMatches(expected))
 
@@ -484,6 +526,17 @@ class AggregateDBApiTestCase(test.TestCase):
         aggregate_id = 1
         new_values = _get_fake_aggr_values()
         self.assertRaises(exception.AggregateNotFound,
+                          db.aggregate_update, ctxt, aggregate_id, new_values)
+
+    def test_aggregate_update_raise_name_exist(self):
+        ctxt = context.get_admin_context()
+        _create_aggregate(context=ctxt, values={'name': 'test1'},
+                          metadata={'availability_zone': 'fake_avail_zone'})
+        _create_aggregate(context=ctxt, values={'name': 'test2'},
+                          metadata={'availability_zone': 'fake_avail_zone'})
+        aggregate_id = 1
+        new_values = {'name': 'test2'}
+        self.assertRaises(exception.AggregateNameExists,
                           db.aggregate_update, ctxt, aggregate_id, new_values)
 
     def test_aggregate_get_all(self):
@@ -518,6 +571,25 @@ class AggregateDBApiTestCase(test.TestCase):
         expected = db.aggregate_metadata_get(ctxt, result['id'])
         self.assertThat(metadata, matchers.DictMatches(expected))
 
+    def test_aggregate_metadata_add_retry(self):
+        ctxt = context.get_admin_context()
+        result = _create_aggregate(context=ctxt, metadata=None)
+
+        def counted():
+            def get_query(context, id, session, read_deleted):
+                get_query.counter += 1
+                raise db_exc.DBDuplicateEntry
+            get_query.counter = 0
+            return get_query
+
+        get_query = counted()
+        self.stubs.Set(sqlalchemy_api,
+                       '_aggregate_metadata_get_query', get_query)
+        self.assertRaises(db_exc.DBDuplicateEntry, sqlalchemy_api.
+                          aggregate_metadata_add, ctxt, result['id'], {},
+                          max_retries=5)
+        self.assertEqual(get_query.counter, 5)
+
     def test_aggregate_metadata_update(self):
         ctxt = context.get_admin_context()
         result = _create_aggregate(context=ctxt)
@@ -547,7 +619,7 @@ class AggregateDBApiTestCase(test.TestCase):
         db.aggregate_metadata_delete(ctxt, result['id'], 'availability_zone')
         expected = db.aggregate_metadata_get(ctxt, result['id'])
         aggregate = db.aggregate_get(ctxt, result['id'])
-        self.assertEquals(aggregate['availability_zone'], None)
+        self.assertIsNone(aggregate['availability_zone'])
         self.assertThat({}, matchers.DictMatches(expected))
 
     def test_aggregate_metadata_delete_raise_not_found(self):
@@ -633,6 +705,33 @@ class SqlAlchemyDbApiTestCase(DbTestCase):
         self.assertEqual(2, len(result))
         self.assertEqual(types.UnicodeType, type(result[0]))
 
+    def test_instance_get_active_by_window_joined(self):
+        now = datetime.datetime(2013, 10, 10, 17, 16, 37, 156701)
+        start_time = now - datetime.timedelta(minutes=10)
+        now1 = now + datetime.timedelta(minutes=1)
+        now2 = now + datetime.timedelta(minutes=2)
+        now3 = now + datetime.timedelta(minutes=3)
+        ctxt = context.get_admin_context()
+        self.create_instance_with_args(launched_at=now)
+        self.create_instance_with_args(launched_at=now1, terminated_at=now2)
+        self.create_instance_with_args(launched_at=now2, terminated_at=now3)
+        self.create_instance_with_args(launched_at=now3, terminated_at=None)
+        result = sqlalchemy_api.instance_get_active_by_window_joined(
+            ctxt, begin=now)
+        self.assertEqual(4, len(result))
+        result = sqlalchemy_api.instance_get_active_by_window_joined(
+            ctxt, begin=now3)
+        self.assertEqual(2, len(result))
+        result = sqlalchemy_api.instance_get_active_by_window_joined(
+            ctxt, begin=start_time, end=now)
+        self.assertEqual(0, len(result))
+        result = sqlalchemy_api.instance_get_active_by_window_joined(
+            ctxt, begin=start_time, end=now2)
+        self.assertEqual(2, len(result))
+        result = sqlalchemy_api.instance_get_active_by_window_joined(
+            ctxt, begin=now2, end=now3)
+        self.assertEqual(2, len(result))
+
 
 class MigrationTestCase(test.TestCase):
 
@@ -644,6 +743,7 @@ class MigrationTestCase(test.TestCase):
         self._create()
         self._create(status='reverted')
         self._create(status='confirmed')
+        self._create(status='error')
         self._create(source_compute='host2', source_node='b',
                 dest_compute='host1', dest_node='a')
         self._create(source_compute='host2', dest_compute='host3')
@@ -668,6 +768,7 @@ class MigrationTestCase(test.TestCase):
         for migration in migrations:
             self.assertNotEqual('confirmed', migration['status'])
             self.assertNotEqual('reverted', migration['status'])
+            self.assertNotEqual('error', migration['status'])
 
     def test_migration_get_in_progress_joins(self):
         self._create(source_compute='foo', system_metadata={'foo': 'bar'})
@@ -760,6 +861,10 @@ class MigrationTestCase(test.TestCase):
         db.migration_update(self.ctxt, migration['id'],
                             {"status": "CONFIRMED"})
 
+    def test_migration_update_not_found(self):
+        self.assertRaises(exception.MigrationNotFound,
+                          db.migration_update, self.ctxt, 42, {})
+
 
 class ModelsObjectComparatorMixin(object):
     def _dict_from_object(self, obj, ignored_keys):
@@ -785,6 +890,13 @@ class ModelsObjectComparatorMixin(object):
         conv_and_sort = lambda obj: sorted(map(obj_to_dict, obj), key=sort_key)
 
         self.assertEqual(conv_and_sort(objs1), conv_and_sort(objs2))
+
+    def _assertEqualOrderedListOfObjects(self, objs1, objs2,
+                                         ignored_keys=None):
+        obj_to_dict = lambda o: self._dict_from_object(o, ignored_keys)
+        conv = lambda obj: map(obj_to_dict, obj)
+
+        self.assertEqual(conv(objs1), conv(objs2))
 
     def _assertEqualListsOfPrimitivesAsSets(self, primitives1, primitives2):
         self.assertEqual(len(primitives1), len(primitives2))
@@ -858,40 +970,22 @@ class ReservationTestCase(test.TestCase, ModelsObjectComparatorMixin):
                 'expire': timeutils.utcnow() + datetime.timedelta(days=1),
                 'usage': {'id': 1}}
 
-    def test_reservation_create(self):
-        reservation = db.reservation_create(self.ctxt, **self.values)
-        self._assertEqualObjects(self.values, reservation, ignored_keys=(
-                        'deleted', 'updated_at',
-                        'deleted_at', 'id',
-                        'created_at', 'usage',
-                        'usage_id'))
-        self.assertEqual(reservation['usage_id'], self.values['usage']['id'])
-
-    def test_reservation_get(self):
-        reservation = db.reservation_create(self.ctxt, **self.values)
-        reservation_db = db.reservation_get(self.ctxt, self.values['uuid'])
-        self._assertEqualObjects(reservation, reservation_db)
-
-    def test_reservation_get_nonexistent(self):
-        self.assertRaises(exception.ReservationNotFound, db.reservation_get,
-                                    self.ctxt, 'non-exitent-resevation-uuid')
-
     def test_reservation_commit(self):
         reservations = _quota_reserve(self.ctxt, 'project1', 'user1')
         expected = {'project_id': 'project1', 'user_id': 'user1',
                 'resource0': {'reserved': 0, 'in_use': 0},
                 'resource1': {'reserved': 1, 'in_use': 1},
-                'resource2': {'reserved': 2, 'in_use': 2}}
+                'fixed_ips': {'reserved': 2, 'in_use': 2}}
         self.assertEqual(expected, db.quota_usage_get_all_by_project_and_user(
                                             self.ctxt, 'project1', 'user1'))
-        db.reservation_get(self.ctxt, reservations[0])
+        _reservation_get(self.ctxt, reservations[0])
         db.reservation_commit(self.ctxt, reservations, 'project1', 'user1')
         self.assertRaises(exception.ReservationNotFound,
-            db.reservation_get, self.ctxt, reservations[0])
+            _reservation_get, self.ctxt, reservations[0])
         expected = {'project_id': 'project1', 'user_id': 'user1',
                 'resource0': {'reserved': 0, 'in_use': 0},
                 'resource1': {'reserved': 0, 'in_use': 2},
-                'resource2': {'reserved': 0, 'in_use': 4}}
+                'fixed_ips': {'reserved': 0, 'in_use': 4}}
         self.assertEqual(expected, db.quota_usage_get_all_by_project_and_user(
                                             self.ctxt, 'project1', 'user1'))
 
@@ -900,17 +994,17 @@ class ReservationTestCase(test.TestCase, ModelsObjectComparatorMixin):
         expected = {'project_id': 'project1', 'user_id': 'user1',
                 'resource0': {'reserved': 0, 'in_use': 0},
                 'resource1': {'reserved': 1, 'in_use': 1},
-                'resource2': {'reserved': 2, 'in_use': 2}}
+                'fixed_ips': {'reserved': 2, 'in_use': 2}}
         self.assertEqual(expected, db.quota_usage_get_all_by_project_and_user(
                                             self.ctxt, 'project1', 'user1'))
-        db.reservation_get(self.ctxt, reservations[0])
+        _reservation_get(self.ctxt, reservations[0])
         db.reservation_rollback(self.ctxt, reservations, 'project1', 'user1')
         self.assertRaises(exception.ReservationNotFound,
-            db.reservation_get, self.ctxt, reservations[0])
+            _reservation_get, self.ctxt, reservations[0])
         expected = {'project_id': 'project1', 'user_id': 'user1',
                 'resource0': {'reserved': 0, 'in_use': 0},
                 'resource1': {'reserved': 0, 'in_use': 1},
-                'resource2': {'reserved': 0, 'in_use': 2}}
+                'fixed_ips': {'reserved': 0, 'in_use': 2}}
         self.assertEqual(expected, db.quota_usage_get_all_by_project_and_user(
                                             self.ctxt, 'project1', 'user1'))
 
@@ -922,7 +1016,7 @@ class ReservationTestCase(test.TestCase, ModelsObjectComparatorMixin):
         expected = {'project_id': 'project1', 'user_id': 'user1',
                 'resource0': {'reserved': 0, 'in_use': 0},
                 'resource1': {'reserved': 0, 'in_use': 1},
-                'resource2': {'reserved': 0, 'in_use': 2}}
+                'fixed_ips': {'reserved': 0, 'in_use': 2}}
         self.assertEqual(expected, db.quota_usage_get_all_by_project_and_user(
                                             self.ctxt, 'project1', 'user1'))
 
@@ -969,18 +1063,36 @@ class SecurityGroupRuleTestCase(test.TestCase, ModelsObjectComparatorMixin):
         for key, value in self._get_base_rule_values().items():
             self.assertEqual(value, security_group_rule[key])
 
-    def test_security_group_rule_get_by_security_group(self):
-        security_group = self._create_security_group({})
+    def _test_security_group_rule_get_by_security_group(self, columns=None):
+        instance = db.instance_create(self.ctxt,
+                                      {'system_metadata': {'foo': 'bar'}})
+        security_group = self._create_security_group({
+                'instances': [instance]})
         security_group_rule = self._create_security_group_rule(
-            {'parent_group': security_group})
+            {'parent_group': security_group, 'grantee_group': security_group})
         security_group_rule1 = self._create_security_group_rule(
-            {'parent_group': security_group})
-        found_rules = db.security_group_rule_get_by_security_group(self.ctxt,
-                                                        security_group['id'])
+            {'parent_group': security_group, 'grantee_group': security_group})
+        found_rules = db.security_group_rule_get_by_security_group(
+            self.ctxt, security_group['id'], columns_to_join=columns)
         self.assertEqual(len(found_rules), 2)
         rules_ids = [security_group_rule['id'], security_group_rule1['id']]
         for rule in found_rules:
-            self.assertIn(rule['id'], rules_ids)
+            if columns is None:
+                self.assertIn('grantee_group', dict(rule.iteritems()))
+                self.assertIn('instances',
+                              dict(rule.grantee_group.iteritems()))
+                self.assertIn(
+                    'system_metadata',
+                    dict(rule.grantee_group.instances[0].iteritems()))
+                self.assertIn(rule['id'], rules_ids)
+            else:
+                self.assertNotIn('grantee_group', dict(rule.iteritems()))
+
+    def test_security_group_rule_get_by_security_group(self):
+        self._test_security_group_rule_get_by_security_group()
+
+    def test_security_group_rule_get_by_security_group_no_joins(self):
+        self._test_security_group_rule_get_by_security_group(columns=[])
 
     def test_security_group_rule_get_by_security_group_grantee(self):
         security_group = self._create_security_group({})
@@ -1061,7 +1173,7 @@ class SecurityGroupTestCase(test.TestCase, ModelsObjectComparatorMixin):
 
     def test_security_group_create(self):
         security_group = self._create_security_group({})
-        self.assertFalse(security_group['id'] is None)
+        self.assertIsNotNone(security_group['id'])
         for key, value in self._get_base_values().iteritems():
             self.assertEqual(value, security_group[key])
 
@@ -1087,14 +1199,24 @@ class SecurityGroupTestCase(test.TestCase, ModelsObjectComparatorMixin):
         self._assertEqualObjects(security_group1,
                                  real_security_group)
 
+    def test_security_group_get_with_instance_columns(self):
+        instance = db.instance_create(self.ctxt,
+                                      {'system_metadata': {'foo': 'bar'}})
+        secgroup = self._create_security_group({'instances': [instance]})
+        secgroup = db.security_group_get(
+            self.ctxt, secgroup['id'],
+            columns_to_join=['instances.system_metadata'])
+        inst = secgroup.instances[0]
+        self.assertIn('system_metadata', dict(inst.iteritems()).keys())
+
     def test_security_group_get_no_instances(self):
         instance = db.instance_create(self.ctxt, {})
         sid = self._create_security_group({'instances': [instance]})['id']
 
         session = get_session()
         self.mox.StubOutWithMock(sqlalchemy_api, 'get_session')
-        sqlalchemy_api.get_session().AndReturn(session)
-        sqlalchemy_api.get_session().AndReturn(session)
+        sqlalchemy_api.get_session(use_slave=False).AndReturn(session)
+        sqlalchemy_api.get_session(use_slave=False).AndReturn(session)
         self.mox.ReplayAll()
 
         security_group = db.security_group_get(self.ctxt, sid,
@@ -1118,11 +1240,13 @@ class SecurityGroupTestCase(test.TestCase, ModelsObjectComparatorMixin):
         real_security_group1 = db.security_group_get_by_name(
                                 self.ctxt,
                                 security_group1['project_id'],
-                                security_group1['name'])
+                                security_group1['name'],
+                                columns_to_join=None)
         real_security_group2 = db.security_group_get_by_name(
                                 self.ctxt,
                                 security_group2['project_id'],
-                                security_group2['name'])
+                                security_group2['name'],
+                                columns_to_join=None)
         self._assertEqualObjects(security_group1, real_security_group1)
         self._assertEqualObjects(security_group2, real_security_group2)
 
@@ -1192,10 +1316,12 @@ class SecurityGroupTestCase(test.TestCase, ModelsObjectComparatorMixin):
             real.append(in_use)
         expected = [True, False]
 
-        self.assertEquals(expected, real)
+        self.assertEqual(expected, real)
 
     def test_security_group_ensure_default(self):
-        self.assertEquals(0, len(db.security_group_get_by_project(
+        self.ctxt.project_id = 'fake'
+        self.ctxt.user_id = 'fake'
+        self.assertEqual(0, len(db.security_group_get_by_project(
                                     self.ctxt,
                                     self.ctxt.project_id)))
 
@@ -1205,8 +1331,14 @@ class SecurityGroupTestCase(test.TestCase, ModelsObjectComparatorMixin):
                             self.ctxt,
                             self.ctxt.project_id)
 
-        self.assertEquals(1, len(security_groups))
-        self.assertEquals("default", security_groups[0]["name"])
+        self.assertEqual(1, len(security_groups))
+        self.assertEqual("default", security_groups[0]["name"])
+
+        usage = db.quota_usage_get(self.ctxt,
+                                   self.ctxt.project_id,
+                                   'security_groups',
+                                   self.ctxt.user_id)
+        self.assertEqual(1, usage.in_use)
 
     def test_security_group_update(self):
         security_group = self._create_security_group({})
@@ -1216,11 +1348,15 @@ class SecurityGroupTestCase(test.TestCase, ModelsObjectComparatorMixin):
                     'user_id': 'fake_user1',
                     'project_id': 'fake_proj1',
         }
+
+        columns_to_join = ['rules.grantee_group']
         updated_group = db.security_group_update(self.ctxt,
-                                                 security_group['id'],
-                                                 new_values)
+                                    security_group['id'],
+                                    new_values,
+                                    columns_to_join=['rules.grantee_group'])
         for key, value in new_values.iteritems():
             self.assertEqual(updated_group[key], value)
+        self.assertEqual(updated_group['rules'], [])
 
     def test_security_group_update_to_duplicate(self):
         security_group1 = self._create_security_group(
@@ -1308,6 +1444,18 @@ class InstanceTestCase(test.TestCase, ModelsObjectComparatorMixin):
         for key in dt_keys:
             self.assertEqual(inst[key], dt)
 
+    def test_instance_update_no_metadata_clobber(self):
+        meta = {'foo': 'bar'}
+        sys_meta = {'sfoo': 'sbar'}
+        values = {
+            'metadata': meta,
+            'system_metadata': sys_meta,
+            }
+        inst = db.instance_create(self.ctxt, {})
+        inst = db.instance_update(self.ctxt, inst['uuid'], values)
+        self.assertEqual({'foo': 'bar'}, meta)
+        self.assertEqual({'sfoo': 'sbar'}, sys_meta)
+
     def test_instance_get_all_with_meta(self):
         inst = self.create_instance_with_args()
         for inst in db.instance_get_all(self.ctxt):
@@ -1342,7 +1490,7 @@ class InstanceTestCase(test.TestCase, ModelsObjectComparatorMixin):
         values = {'created_at': '2011-01-31T00:00:00.0'}
         actual = db.instance_update(self.ctxt, instance['uuid'], values)
         expected = datetime.datetime(2011, 1, 31)
-        self.assertEquals(expected, actual["created_at"])
+        self.assertEqual(expected, actual["created_at"])
 
     def test_create_instance_unique_hostname(self):
         context1 = context.RequestContext('user1', 'p1')
@@ -1371,14 +1519,6 @@ class InstanceTestCase(test.TestCase, ModelsObjectComparatorMixin):
         self.create_instance_with_args(context=context2, hostname='h2')
         self.flags(osapi_compute_unique_server_name_scope=None)
 
-    def test_instance_get_all_with_meta(self):
-        inst = self.create_instance_with_args()
-        for inst in db.instance_get_all(self.ctxt):
-            meta = utils.metadata_to_dict(inst['metadata'])
-            self.assertEqual(meta, self.sample_data['metadata'])
-            sys_meta = utils.metadata_to_dict(inst['system_metadata'])
-            self.assertEqual(sys_meta, self.sample_data['system_metadata'])
-
     def test_instance_get_all_by_filters_with_meta(self):
         inst = self.create_instance_with_args()
         for inst in db.instance_get_all_by_filters(self.ctxt, {}):
@@ -1406,7 +1546,7 @@ class InstanceTestCase(test.TestCase, ModelsObjectComparatorMixin):
         uuids = [self.create_instance_with_args()['uuid'] for i in range(3)]
         meta = sqlalchemy_api._instance_metadata_get_multi(self.ctxt, uuids)
         for row in meta:
-            self.assertTrue(row['instance_uuid'] in uuids)
+            self.assertIn(row['instance_uuid'], uuids)
 
     def test_instance_metadata_get_multi_no_uuids(self):
         self.mox.StubOutWithMock(query.Query, 'filter')
@@ -1418,7 +1558,7 @@ class InstanceTestCase(test.TestCase, ModelsObjectComparatorMixin):
         sys_meta = sqlalchemy_api._instance_system_metadata_get_multi(
                 self.ctxt, uuids)
         for row in sys_meta:
-            self.assertTrue(row['instance_uuid'] in uuids)
+            self.assertIn(row['instance_uuid'], uuids)
 
     def test_instance_system_metadata_get_multi_no_uuids(self):
         self.mox.StubOutWithMock(query.Query, 'filter')
@@ -1433,6 +1573,23 @@ class InstanceTestCase(test.TestCase, ModelsObjectComparatorMixin):
                                                 {'display_name': 't.*st.'})
         self._assertEqualListsOfInstances(result, [i1, i2])
 
+    def test_instance_get_all_by_filters_changes_since(self):
+        i1 = self.create_instance_with_args(updated_at=
+                                            '2013-12-05T15:03:25.000000')
+        i2 = self.create_instance_with_args(updated_at=
+                                            '2013-12-05T15:03:26.000000')
+        changes_since = iso8601.parse_date('2013-12-05T15:03:25.000000')
+        result = db.instance_get_all_by_filters(self.ctxt,
+                                                {'changes-since':
+                                                 changes_since})
+        self._assertEqualListsOfInstances([i1, i2], result)
+
+        changes_since = iso8601.parse_date('2013-12-05T15:03:26.000000')
+        result = db.instance_get_all_by_filters(self.ctxt,
+                                                {'changes-since':
+                                                 changes_since})
+        self._assertEqualListsOfInstances([i2], result)
+
     def test_instance_get_all_by_filters_exact_match(self):
         instance = self.create_instance_with_args(host='host1')
         self.create_instance_with_args(host='host12')
@@ -1445,6 +1602,14 @@ class InstanceTestCase(test.TestCase, ModelsObjectComparatorMixin):
         self.create_instance_with_args()
         result = db.instance_get_all_by_filters(self.ctxt,
                                                 {'metadata': {'foo': 'bar'}})
+        self._assertEqualListsOfInstances([instance], result)
+
+    def test_instance_get_all_by_filters_system_metadata(self):
+        instance = self.create_instance_with_args(
+                system_metadata={'foo': 'bar'})
+        self.create_instance_with_args()
+        result = db.instance_get_all_by_filters(self.ctxt,
+                {'system_metadata': {'foo': 'bar'}})
         self._assertEqualListsOfInstances([instance], result)
 
     def test_instance_get_all_by_filters_unicode_value(self):
@@ -1536,7 +1701,8 @@ class InstanceTestCase(test.TestCase, ModelsObjectComparatorMixin):
         result = db.instance_get_all_by_filters(self.ctxt, {})
         self._assertEqualListsOfObjects([inst1, inst2], result,
             ignored_keys=['metadata', 'system_metadata',
-                          'deleted', 'deleted_at', 'info_cache'])
+                          'deleted', 'deleted_at', 'info_cache',
+                          'pci_devices'])
 
     def test_instance_get_all_by_filters_deleted_and_soft_deleted(self):
         inst1 = self.create_instance_with_args()
@@ -1547,7 +1713,8 @@ class InstanceTestCase(test.TestCase, ModelsObjectComparatorMixin):
                                                 {'deleted': True})
         self._assertEqualListsOfObjects([inst1, inst2], result,
             ignored_keys=['metadata', 'system_metadata',
-                          'deleted', 'deleted_at', 'info_cache'])
+                          'deleted', 'deleted_at', 'info_cache',
+                          'pci_devices'])
 
     def test_instance_get_all_by_filters_deleted_no_soft_deleted(self):
         inst1 = self.create_instance_with_args()
@@ -1559,7 +1726,7 @@ class InstanceTestCase(test.TestCase, ModelsObjectComparatorMixin):
                                                  'soft_deleted': False})
         self._assertEqualListsOfObjects([inst1], result,
                 ignored_keys=['deleted', 'deleted_at', 'metadata',
-                              'system_metadata', 'info_cache'])
+                              'system_metadata', 'info_cache', 'pci_devices'])
 
     def test_instance_get_all_by_filters_alive_and_soft_deleted(self):
         inst1 = self.create_instance_with_args()
@@ -1570,6 +1737,17 @@ class InstanceTestCase(test.TestCase, ModelsObjectComparatorMixin):
                                                 {'deleted': False,
                                                  'soft_deleted': True})
         self._assertEqualListsOfInstances([inst2, inst3], result)
+
+    def test_instance_get_all_by_filters_not_deleted(self):
+        inst1 = self.create_instance_with_args()
+        inst2 = self.create_instance_with_args(vm_state=vm_states.SOFT_DELETED)
+        inst3 = self.create_instance_with_args()
+        inst4 = self.create_instance_with_args(vm_state=vm_states.ACTIVE)
+        db.instance_destroy(self.ctxt, inst1['uuid'])
+        result = db.instance_get_all_by_filters(self.ctxt,
+                                                {'deleted': False})
+        self.assertIsNone(inst3.vm_state)
+        self._assertEqualListsOfInstances([inst3, inst4], result)
 
     def test_instance_get_all_by_filters_cleaned(self):
         inst1 = self.create_instance_with_args()
@@ -1604,7 +1782,7 @@ class InstanceTestCase(test.TestCase, ModelsObjectComparatorMixin):
         results = db.instance_get_all_hung_in_rebooting(self.ctxt, 10)
         self._assertEqualListsOfObjects([instance], results,
             ignored_keys=['task_state', 'info_cache', 'security_groups',
-                          'metadata', 'system_metadata'])
+                          'metadata', 'system_metadata', 'pci_devices'])
         db.instance_update(self.ctxt, instance['uuid'], {"task_state": None})
 
         # Ensure the newly rebooted instance is not returned.
@@ -1663,12 +1841,54 @@ class InstanceTestCase(test.TestCase, ModelsObjectComparatorMixin):
         # Make sure instance metadata is deleted as well
         self.assertEqual({}, instance_meta)
 
+    def test_delete_instance_faults_on_instance_destroy(self):
+        ctxt = context.get_admin_context()
+        uuid = str(stdlib_uuid.uuid4())
+        # Create faults
+        db.instance_create(ctxt, {'uuid': uuid})
+
+        fault_values = {
+            'message': 'message',
+            'details': 'detail',
+            'instance_uuid': uuid,
+            'code': 404,
+            'host': 'localhost'
+        }
+        fault = db.instance_fault_create(ctxt, fault_values)
+
+        # Retrieve the fault to ensure it was successfully added
+        faults = db.instance_fault_get_by_instance_uuids(ctxt, [uuid])
+        self.assertEqual(1, len(faults[uuid]))
+        self._assertEqualObjects(fault, faults[uuid][0])
+        db.instance_destroy(ctxt, uuid)
+        faults = db.instance_fault_get_by_instance_uuids(ctxt, [uuid])
+        # Make sure instance faults is deleted as well
+        self.assertEqual(0, len(faults[uuid]))
+
     def test_instance_update_with_and_get_original(self):
         instance = self.create_instance_with_args(vm_state='building')
         (old_ref, new_ref) = db.instance_update_and_get_original(self.ctxt,
                             instance['uuid'], {'vm_state': 'needscoffee'})
         self.assertEqual('building', old_ref['vm_state'])
         self.assertEqual('needscoffee', new_ref['vm_state'])
+
+    def test_instance_update_and_get_original_metadata(self):
+        instance = self.create_instance_with_args()
+        columns_to_join = ['metadata']
+        (old_ref, new_ref) = db.instance_update_and_get_original(
+            self.ctxt, instance['uuid'], {'vm_state': 'needscoffee'},
+            columns_to_join=columns_to_join)
+        meta = utils.metadata_to_dict(new_ref['metadata'])
+        self.assertEqual(meta, self.sample_data['metadata'])
+        sys_meta = utils.metadata_to_dict(new_ref['system_metadata'])
+        self.assertEqual(sys_meta, {})
+
+    def test_instance_update_and_get_original_metadata_none_join(self):
+        instance = self.create_instance_with_args()
+        (old_ref, new_ref) = db.instance_update_and_get_original(
+            self.ctxt, instance['uuid'], {'metadata': {'mk1': 'mv3'}})
+        meta = utils.metadata_to_dict(new_ref['metadata'])
+        self.assertEqual(meta, {'mk1': 'mv3'})
 
     def test_instance_update_unique_name(self):
         context1 = context.RequestContext('user1', 'p1')
@@ -1777,11 +1997,31 @@ class InstanceTestCase(test.TestCase, ModelsObjectComparatorMixin):
             self.ctxt, instance['uuid'],
             {'access_ip_v4': netaddr.IPAddress('1.2.3.4'),
              'access_ip_v6': netaddr.IPAddress('::1')})
-        self.assertTrue(isinstance(instance['access_ip_v4'], basestring))
-        self.assertTrue(isinstance(instance['access_ip_v6'], basestring))
+        self.assertIsInstance(instance['access_ip_v4'], six.string_types)
+        self.assertIsInstance(instance['access_ip_v6'], six.string_types)
         instance = db.instance_get_by_uuid(self.ctxt, instance['uuid'])
-        self.assertTrue(isinstance(instance['access_ip_v4'], basestring))
-        self.assertTrue(isinstance(instance['access_ip_v6'], basestring))
+        self.assertIsInstance(instance['access_ip_v4'], six.string_types)
+        self.assertIsInstance(instance['access_ip_v6'], six.string_types)
+
+    def test_instance_destroy(self):
+        ctxt = context.get_admin_context()
+        values = {
+            'metadata': {'key': 'value'}
+        }
+        inst_uuid = self.create_instance_with_args(**values)['uuid']
+        db.instance_destroy(ctxt, inst_uuid)
+
+        self.assertRaises(exception.InstanceNotFound,
+                          db.instance_get, ctxt, inst_uuid)
+        self.assertIsNone(db.instance_info_cache_get(ctxt, inst_uuid))
+        self.assertEqual({}, db.instance_metadata_get(ctxt, inst_uuid))
+
+    def test_instance_destroy_already_destroyed(self):
+        ctxt = context.get_admin_context()
+        instance = self.create_instance_with_args()
+        db.instance_destroy(ctxt, instance['uuid'])
+        self.assertRaises(exception.InstanceNotFound,
+                          db.instance_destroy, ctxt, instance['uuid'])
 
 
 class InstanceMetadataTestCase(test.TestCase):
@@ -1846,7 +2086,7 @@ class ServiceTestCase(test.TestCase, ModelsObjectComparatorMixin):
 
     def test_service_create(self):
         service = self._create_service({})
-        self.assertFalse(service['id'] is None)
+        self.assertIsNotNone(service['id'])
         for key, value in self._get_base_values().iteritems():
             self.assertEqual(value, service[key])
 
@@ -2030,10 +2270,10 @@ class BaseInstanceTypeTestCase(test.TestCase, ModelsObjectComparatorMixin):
             'is_public': True
         }
 
-    def _create_inst_type(self, values):
+    def _create_flavor(self, values, projects=None):
         v = self._get_base_values()
         v.update(values)
-        return db.flavor_create(self.ctxt, v)
+        return db.flavor_create(self.ctxt, v, projects)
 
 
 class InstanceActionTestCase(test.TestCase, ModelsObjectComparatorMixin):
@@ -2049,10 +2289,14 @@ class InstanceActionTestCase(test.TestCase, ModelsObjectComparatorMixin):
         super(InstanceActionTestCase, self).setUp()
         self.ctxt = context.get_admin_context()
 
-    def _create_action_values(self, uuid, action='run_instance', ctxt=None):
+    def _create_action_values(self, uuid, action='run_instance',
+                              ctxt=None, extra=None):
         if ctxt is None:
             ctxt = self.ctxt
-        return {
+
+        db.instance_create(ctxt, {'uuid': uuid})
+
+        values = {
             'action': action,
             'instance_uuid': uuid,
             'request_id': ctxt.request_id,
@@ -2061,6 +2305,9 @@ class InstanceActionTestCase(test.TestCase, ModelsObjectComparatorMixin):
             'start_time': timeutils.utcnow(),
             'message': 'action-message'
         }
+        if extra is not None:
+            values.update(extra)
+        return values
 
     def _create_event_values(self, uuid, event='schedule',
                              ctxt=None, extra=None):
@@ -2070,7 +2317,9 @@ class InstanceActionTestCase(test.TestCase, ModelsObjectComparatorMixin):
             'event': event,
             'instance_uuid': uuid,
             'request_id': ctxt.request_id,
-            'start_time': timeutils.utcnow()
+            'start_time': timeutils.utcnow(),
+            'host': 'fake-host',
+            'details': 'fake-details',
         }
         if extra is not None:
             values.update(extra)
@@ -2147,6 +2396,25 @@ class InstanceActionTestCase(test.TestCase, ModelsObjectComparatorMixin):
         # Retrieve the action to ensure it was successfully added
         actions = db.actions_get(self.ctxt, uuid1)
         self._assertEqualListsOfObjects(expected, actions)
+
+    def test_instance_actions_get_are_in_order(self):
+        """Ensure retrived actions are in order."""
+        uuid1 = str(stdlib_uuid.uuid4())
+
+        extra = {
+            'created_at': timeutils.utcnow()
+        }
+
+        action_values = self._create_action_values(uuid1, extra=extra)
+        action1 = db.action_start(self.ctxt, action_values)
+
+        action_values['action'] = 'delete'
+        action2 = db.action_start(self.ctxt, action_values)
+
+        actions = db.actions_get(self.ctxt, uuid1)
+        self.assertEqual(2, len(actions))
+
+        self._assertEqualOrderedListOfObjects([action2, action1], actions)
 
     def test_instance_action_get_by_instance_and_action(self):
         """Ensure we can get an action by instance UUID and action id."""
@@ -2271,6 +2539,34 @@ class InstanceActionTestCase(test.TestCase, ModelsObjectComparatorMixin):
 
         self._assertActionEventSaved(event, action['id'])
 
+    def test_instance_action_events_get_are_in_order(self):
+        """Ensure retrived action events are in order."""
+        uuid1 = str(stdlib_uuid.uuid4())
+
+        action = db.action_start(self.ctxt,
+                                 self._create_action_values(uuid1))
+
+        extra1 = {
+            'created_at': timeutils.utcnow()
+        }
+        extra2 = {
+            'created_at': timeutils.utcnow() + datetime.timedelta(seconds=5)
+        }
+
+        event_val1 = self._create_event_values(uuid1, 'schedule', extra=extra1)
+        event_val2 = self._create_event_values(uuid1, 'run', extra=extra1)
+        event_val3 = self._create_event_values(uuid1, 'stop', extra=extra2)
+
+        event1 = db.action_event_start(self.ctxt, event_val1)
+        event2 = db.action_event_start(self.ctxt, event_val2)
+        event3 = db.action_event_start(self.ctxt, event_val3)
+
+        events = db.action_events_get(self.ctxt, action['id'])
+        self.assertEqual(3, len(events))
+
+        self._assertEqualOrderedListOfObjects([event3, event2, event1], events,
+                                              ['instance_uuid', 'request_id'])
+
     def test_instance_action_event_get_by_id(self):
         """Get a specific instance action event."""
         ctxt2 = context.get_admin_context()
@@ -2321,6 +2617,7 @@ class InstanceFaultTestCase(test.TestCase, ModelsObjectComparatorMixin):
 
         # Create a fault
         fault_values = self._create_fault_values(uuid)
+        db.instance_create(self.ctxt, {'uuid': uuid})
         fault = db.instance_fault_create(self.ctxt, fault_values)
 
         ignored_keys = ['deleted', 'created_at', 'updated_at',
@@ -2340,6 +2637,8 @@ class InstanceFaultTestCase(test.TestCase, ModelsObjectComparatorMixin):
 
         # Create faults
         for uuid in uuids:
+            db.instance_create(self.ctxt, {'uuid': uuid})
+
             expected[uuid] = []
             for code in fault_codes:
                 fault_values = self._create_fault_values(uuid, code)
@@ -2369,65 +2668,71 @@ class InstanceFaultTestCase(test.TestCase, ModelsObjectComparatorMixin):
 class InstanceTypeTestCase(BaseInstanceTypeTestCase):
 
     def test_flavor_create(self):
-        inst_type = self._create_inst_type({})
+        flavor = self._create_flavor({})
         ignored_keys = ['id', 'deleted', 'deleted_at', 'updated_at',
                         'created_at', 'extra_specs']
 
-        self.assertFalse(inst_type['id'] is None)
-        self._assertEqualObjects(inst_type, self._get_base_values(),
+        self.assertIsNotNone(flavor['id'])
+        self._assertEqualObjects(flavor, self._get_base_values(),
                                  ignored_keys)
 
-    def test_instance_type_destroy(self):
+    def test_flavor_create_with_projects(self):
+        projects = ['fake-project1', 'fake-project2']
+        flavor = self._create_flavor({}, projects + ['fake-project2'])
+        access = db.flavor_access_get_by_flavor_id(self.ctxt,
+                                                   flavor['flavorid'])
+        self.assertEqual(projects, [x.project_id for x in access])
+
+    def test_flavor_destroy(self):
         specs1 = {'a': '1', 'b': '2'}
-        inst_type1 = self._create_inst_type({'name': 'name1', 'flavorid': 'a1',
-                                             'extra_specs': specs1})
+        flavor1 = self._create_flavor({'name': 'name1', 'flavorid': 'a1',
+                                       'extra_specs': specs1})
         specs2 = {'c': '4', 'd': '3'}
-        inst_type2 = self._create_inst_type({'name': 'name2', 'flavorid': 'a2',
-                                             'extra_specs': specs2})
+        flavor2 = self._create_flavor({'name': 'name2', 'flavorid': 'a2',
+                                       'extra_specs': specs2})
 
         db.flavor_destroy(self.ctxt, 'name1')
 
-        self.assertRaises(exception.InstanceTypeNotFound,
-                          db.flavor_get, self.ctxt, inst_type1['id'])
-        real_specs1 = db.flavor_extra_specs_get(self.ctxt,
-                                                       inst_type1['flavorid'])
+        self.assertRaises(exception.FlavorNotFound,
+                          db.flavor_get, self.ctxt, flavor1['id'])
+        real_specs1 = db.flavor_extra_specs_get(self.ctxt, flavor1['flavorid'])
         self._assertEqualObjects(real_specs1, {})
 
-        r_inst_type2 = db.flavor_get(self.ctxt, inst_type2['id'])
-        self._assertEqualObjects(inst_type2, r_inst_type2, 'extra_specs')
+        r_flavor2 = db.flavor_get(self.ctxt, flavor2['id'])
+        self._assertEqualObjects(flavor2, r_flavor2, 'extra_specs')
 
-    def test_instance_type_destroy_not_found(self):
-        self.assertRaises(exception.InstanceTypeNotFound,
+    def test_flavor_destroy_not_found(self):
+        self.assertRaises(exception.FlavorNotFound,
                           db.flavor_destroy, self.ctxt, 'nonexists')
 
     def test_flavor_create_duplicate_name(self):
-        self._create_inst_type({})
-        self.assertRaises(exception.InstanceTypeExists,
-                          self._create_inst_type,
+        self._create_flavor({})
+        self.assertRaises(exception.FlavorExists,
+                          self._create_flavor,
                           {'flavorid': 'some_random_flavor'})
 
     def test_flavor_create_duplicate_flavorid(self):
-        self._create_inst_type({})
-        self.assertRaises(exception.InstanceTypeIdExists,
-                          self._create_inst_type,
+        self._create_flavor({})
+        self.assertRaises(exception.FlavorIdExists,
+                          self._create_flavor,
                           {'name': 'some_random_name'})
 
     def test_flavor_create_with_extra_specs(self):
         extra_specs = dict(a='abc', b='def', c='ghi')
-        inst_type = self._create_inst_type({'extra_specs': extra_specs})
+        flavor = self._create_flavor({'extra_specs': extra_specs})
         ignored_keys = ['id', 'deleted', 'deleted_at', 'updated_at',
                         'created_at', 'extra_specs']
 
-        self._assertEqualObjects(inst_type, self._get_base_values(),
+        self._assertEqualObjects(flavor, self._get_base_values(),
                                  ignored_keys)
-        self._assertEqualObjects(extra_specs, inst_type['extra_specs'])
+        self._assertEqualObjects(extra_specs, flavor['extra_specs'])
 
-    def test_instance_type_get_all(self):
+    def test_flavor_get_all(self):
         # NOTE(boris-42): Remove base instance types
         for it in db.flavor_get_all(self.ctxt):
             db.flavor_destroy(self.ctxt, it['name'])
 
-        instance_types = [
+        flavors = [
             {'root_gb': 600, 'memory_mb': 100, 'disabled': True,
              'is_public': True, 'name': 'a1', 'flavorid': 'f1'},
             {'root_gb': 500, 'memory_mb': 200, 'disabled': True,
@@ -2441,7 +2746,7 @@ class InstanceTypeTestCase(BaseInstanceTypeTestCase):
             {'root_gb': 100, 'memory_mb': 600, 'disabled': True,
              'is_public': False, 'name': 'a6', 'flavorid': 'f6'}
         ]
-        instance_types = [self._create_inst_type(it) for it in instance_types]
+        flavors = [self._create_flavor(it) for it in flavors]
 
         lambda_filters = {
             'min_memory_mb': lambda it, v: it['memory_mb'] >= v,
@@ -2455,11 +2760,11 @@ class InstanceTypeTestCase(BaseInstanceTypeTestCase):
         disabled_filts = [{'disabled': x} for x in [True, False]]
         is_public_filts = [{'is_public': x} for x in [True, False, None]]
 
-        def assert_multi_filter_instance_type_get(filters=None):
+        def assert_multi_filter_flavor_get(filters=None):
             if filters is None:
                 filters = {}
 
-            expected_it = instance_types
+            expected_it = flavors
             for name, value in filters.iteritems():
                 filt = lambda it: lambda_filters[name](it, value)
                 expected_it = filter(filt, expected_it)
@@ -2468,17 +2773,17 @@ class InstanceTypeTestCase(BaseInstanceTypeTestCase):
             self._assertEqualListsOfObjects(expected_it, real_it)
 
         #no filter
-        assert_multi_filter_instance_type_get()
+        assert_multi_filter_flavor_get()
 
         #test only with one filter
         for filt in mem_filts:
-            assert_multi_filter_instance_type_get(filt)
+            assert_multi_filter_flavor_get(filt)
         for filt in root_filts:
-            assert_multi_filter_instance_type_get(filt)
+            assert_multi_filter_flavor_get(filt)
         for filt in disabled_filts:
-            assert_multi_filter_instance_type_get(filt)
+            assert_multi_filter_flavor_get(filt)
         for filt in is_public_filts:
-            assert_multi_filter_instance_type_get(filt)
+            assert_multi_filter_flavor_get(filt)
 
         #test all filters together
         for mem in mem_filts:
@@ -2488,119 +2793,170 @@ class InstanceTypeTestCase(BaseInstanceTypeTestCase):
                         filts = [f.items() for f in
                                     [mem, root, disabled, is_public]]
                         filts = dict(reduce(lambda x, y: x + y, filts, []))
-                        assert_multi_filter_instance_type_get(filts)
+                        assert_multi_filter_flavor_get(filts)
 
-    def test_instance_type_get(self):
-        inst_types = [{'name': 'abc', 'flavorid': '123'},
-                    {'name': 'def', 'flavorid': '456'},
-                    {'name': 'ghi', 'flavorid': '789'}]
-        inst_types = [self._create_inst_type(t) for t in inst_types]
+    def test_flavor_get_all_limit_sort(self):
+        def assert_sorted_by_key_dir(sort_key, asc=True):
+            sort_dir = 'asc' if asc else 'desc'
+            results = db.flavor_get_all(self.ctxt, sort_key='name',
+                                        sort_dir=sort_dir)
+            # Manually sort the results as we would expect them
+            expected_results = sorted(results,
+                                      key=lambda item: item['name'],
+                                      reverse=(not asc))
+            self.assertEqual(expected_results, results)
 
-        for inst_type in inst_types:
-            inst_type_by_id = db.flavor_get(self.ctxt, inst_type['id'])
-            self._assertEqualObjects(inst_type, inst_type_by_id)
+        def assert_sorted_by_key_both_dir(sort_key):
+            assert_sorted_by_key_dir(sort_key, True)
+            assert_sorted_by_key_dir(sort_key, False)
 
-    def test_instance_type_get_non_public(self):
-        inst_type = self._create_inst_type({'name': 'abc', 'flavorid': '123',
-                                            'is_public': False})
+        for attr in ['memory_mb', 'root_gb', 'deleted_at', 'name', 'deleted',
+                     'created_at', 'ephemeral_gb', 'updated_at', 'disabled',
+                     'vcpus', 'swap', 'rxtx_factor', 'is_public', 'flavorid',
+                     'vcpu_weight', 'id']:
+            assert_sorted_by_key_both_dir(attr)
+
+    def test_flavor_get_all_limit(self):
+        limited_flavors = db.flavor_get_all(self.ctxt, limit=2)
+        self.assertEqual(2, len(limited_flavors))
+
+    def test_flavor_get_all_list_marker(self):
+        all_flavors = db.flavor_get_all(self.ctxt)
+
+        # Set the 3rd result as the marker
+        marker_flavorid = all_flavors[2]['flavorid']
+        marked_flavors = db.flavor_get_all(self.ctxt, marker=marker_flavorid)
+        # We expect everything /after/ the 3rd result
+        expected_results = all_flavors[3:]
+        self.assertEqual(expected_results, marked_flavors)
+
+    def test_flavor_get_all_marker_not_found(self):
+        self.assertRaises(exception.MarkerNotFound,
+                db.flavor_get_all, self.ctxt, marker='invalid')
+
+    def test_flavor_get(self):
+        flavors = [{'name': 'abc', 'flavorid': '123'},
+                   {'name': 'def', 'flavorid': '456'},
+                   {'name': 'ghi', 'flavorid': '789'}]
+        flavors = [self._create_flavor(t) for t in flavors]
+
+        for flavor in flavors:
+            flavor_by_id = db.flavor_get(self.ctxt, flavor['id'])
+            self._assertEqualObjects(flavor, flavor_by_id)
+
+    def test_flavor_get_non_public(self):
+        flavor = self._create_flavor({'name': 'abc', 'flavorid': '123',
+                                      'is_public': False})
 
         # Admin can see it
-        inst_type_by_id = db.flavor_get(self.ctxt, inst_type['id'])
-        self._assertEqualObjects(inst_type, inst_type_by_id)
+        flavor_by_id = db.flavor_get(self.ctxt, flavor['id'])
+        self._assertEqualObjects(flavor, flavor_by_id)
 
         # Regular user can not
-        self.assertRaises(exception.InstanceTypeNotFound, db.flavor_get,
-                self.user_ctxt, inst_type['id'])
+        self.assertRaises(exception.FlavorNotFound, db.flavor_get,
+                self.user_ctxt, flavor['id'])
 
         # Regular user can see it after being granted access
-        db.flavor_access_add(self.ctxt, inst_type['flavorid'],
+        db.flavor_access_add(self.ctxt, flavor['flavorid'],
                 self.user_ctxt.project_id)
-        inst_type_by_id = db.flavor_get(self.user_ctxt, inst_type['id'])
-        self._assertEqualObjects(inst_type, inst_type_by_id)
+        flavor_by_id = db.flavor_get(self.user_ctxt, flavor['id'])
+        self._assertEqualObjects(flavor, flavor_by_id)
 
-    def test_instance_type_get_by_name(self):
-        inst_types = [{'name': 'abc', 'flavorid': '123'},
-                    {'name': 'def', 'flavorid': '456'},
-                    {'name': 'ghi', 'flavorid': '789'}]
-        inst_types = [self._create_inst_type(t) for t in inst_types]
+    def test_flavor_get_by_name(self):
+        flavors = [{'name': 'abc', 'flavorid': '123'},
+                   {'name': 'def', 'flavorid': '456'},
+                   {'name': 'ghi', 'flavorid': '789'}]
+        flavors = [self._create_flavor(t) for t in flavors]
 
-        for inst_type in inst_types:
-            inst_type_by_name = db.flavor_get_by_name(self.ctxt,
-                                                             inst_type['name'])
-            self._assertEqualObjects(inst_type, inst_type_by_name)
+        for flavor in flavors:
+            flavor_by_name = db.flavor_get_by_name(self.ctxt, flavor['name'])
+            self._assertEqualObjects(flavor, flavor_by_name)
 
-    def test_instance_type_get_by_name_not_found(self):
-        self._create_inst_type({})
-        self.assertRaises(exception.InstanceTypeNotFoundByName,
+    def test_flavor_get_by_name_not_found(self):
+        self._create_flavor({})
+        self.assertRaises(exception.FlavorNotFoundByName,
                           db.flavor_get_by_name, self.ctxt, 'nonexists')
 
-    def test_instance_type_get_by_name_non_public(self):
-        inst_type = self._create_inst_type({'name': 'abc', 'flavorid': '123',
-                                            'is_public': False})
+    def test_flavor_get_by_name_non_public(self):
+        flavor = self._create_flavor({'name': 'abc', 'flavorid': '123',
+                                      'is_public': False})
 
         # Admin can see it
-        inst_type_by_name = db.flavor_get_by_name(self.ctxt,
-                                                         inst_type['name'])
-        self._assertEqualObjects(inst_type, inst_type_by_name)
+        flavor_by_name = db.flavor_get_by_name(self.ctxt, flavor['name'])
+        self._assertEqualObjects(flavor, flavor_by_name)
 
         # Regular user can not
-        self.assertRaises(exception.InstanceTypeNotFoundByName,
+        self.assertRaises(exception.FlavorNotFoundByName,
                 db.flavor_get_by_name, self.user_ctxt,
-                inst_type['name'])
+                flavor['name'])
 
         # Regular user can see it after being granted access
-        db.flavor_access_add(self.ctxt, inst_type['flavorid'],
+        db.flavor_access_add(self.ctxt, flavor['flavorid'],
                 self.user_ctxt.project_id)
-        inst_type_by_name = db.flavor_get_by_name(self.user_ctxt,
-                                                         inst_type['name'])
-        self._assertEqualObjects(inst_type, inst_type_by_name)
+        flavor_by_name = db.flavor_get_by_name(self.user_ctxt, flavor['name'])
+        self._assertEqualObjects(flavor, flavor_by_name)
 
-    def test_instance_type_get_by_flavor_id(self):
-        inst_types = [{'name': 'abc', 'flavorid': '123'},
-                      {'name': 'def', 'flavorid': '456'},
-                      {'name': 'ghi', 'flavorid': '789'}]
-        inst_types = [self._create_inst_type(t) for t in inst_types]
+    def test_flavor_get_by_flavor_id(self):
+        flavors = [{'name': 'abc', 'flavorid': '123'},
+                   {'name': 'def', 'flavorid': '456'},
+                   {'name': 'ghi', 'flavorid': '789'}]
+        flavors = [self._create_flavor(t) for t in flavors]
 
-        for inst_type in inst_types:
-            params = (self.ctxt, inst_type['flavorid'])
-            inst_type_by_flavorid = db.flavor_get_by_flavor_id(*params)
-            self._assertEqualObjects(inst_type, inst_type_by_flavorid)
+        for flavor in flavors:
+            params = (self.ctxt, flavor['flavorid'])
+            flavor_by_flavorid = db.flavor_get_by_flavor_id(*params)
+            self._assertEqualObjects(flavor, flavor_by_flavorid)
 
-    def test_instance_type_get_by_flavor_not_found(self):
-        self._create_inst_type({})
+    def test_flavor_get_by_flavor_not_found(self):
+        self._create_flavor({})
         self.assertRaises(exception.FlavorNotFound,
                           db.flavor_get_by_flavor_id,
                           self.ctxt, 'nonexists')
 
-    def test_instance_type_get_by_flavor_id_non_public(self):
-        inst_type = self._create_inst_type({'name': 'abc', 'flavorid': '123',
-                                            'is_public': False})
+    def test_flavor_get_by_flavor_id_non_public(self):
+        flavor = self._create_flavor({'name': 'abc', 'flavorid': '123',
+                                      'is_public': False})
 
         # Admin can see it
-        inst_type_by_fid = db.flavor_get_by_flavor_id(self.ctxt,
-                inst_type['flavorid'])
-        self._assertEqualObjects(inst_type, inst_type_by_fid)
+        flavor_by_fid = db.flavor_get_by_flavor_id(self.ctxt,
+                                                   flavor['flavorid'])
+        self._assertEqualObjects(flavor, flavor_by_fid)
 
         # Regular user can not
         self.assertRaises(exception.FlavorNotFound,
                 db.flavor_get_by_flavor_id, self.user_ctxt,
-                inst_type['flavorid'])
+                flavor['flavorid'])
 
         # Regular user can see it after being granted access
-        db.flavor_access_add(self.ctxt, inst_type['flavorid'],
+        db.flavor_access_add(self.ctxt, flavor['flavorid'],
                 self.user_ctxt.project_id)
-        inst_type_by_fid = db.flavor_get_by_flavor_id(self.user_ctxt,
-                inst_type['flavorid'])
-        self._assertEqualObjects(inst_type, inst_type_by_fid)
+        flavor_by_fid = db.flavor_get_by_flavor_id(self.user_ctxt,
+                                                   flavor['flavorid'])
+        self._assertEqualObjects(flavor, flavor_by_fid)
 
-    def test_instance_type_get_by_flavor_id_deleted(self):
-        inst_type = self._create_inst_type({'name': 'abc', 'flavorid': '123'})
+    def test_flavor_get_by_flavor_id_deleted(self):
+        flavor = self._create_flavor({'name': 'abc', 'flavorid': '123'})
 
         db.flavor_destroy(self.ctxt, 'abc')
 
-        inst_type_by_fid = db.flavor_get_by_flavor_id(self.ctxt,
-                inst_type['flavorid'], read_deleted='yes')
-        self.assertEqual(inst_type['id'], inst_type_by_fid['id'])
+        flavor_by_fid = db.flavor_get_by_flavor_id(self.ctxt,
+                flavor['flavorid'], read_deleted='yes')
+        self.assertEqual(flavor['id'], flavor_by_fid['id'])
+
+    def test_flavor_get_by_flavor_id_deleted_and_recreat(self):
+        # NOTE(wingwj): Aims to test difference between mysql and postgresql
+        # for bug 1288636
+        param_dict = {'name': 'abc', 'flavorid': '123'}
+
+        self._create_flavor(param_dict)
+        db.flavor_destroy(self.ctxt, 'abc')
+
+        # Recreate the flavor with the same params
+        flavor = self._create_flavor(param_dict)
+
+        flavor_by_fid = db.flavor_get_by_flavor_id(self.ctxt,
+                flavor['flavorid'], read_deleted='yes')
+        self.assertEqual(flavor['id'], flavor_by_fid['id'])
 
 
 class InstanceTypeExtraSpecsTestCase(BaseInstanceTypeTestCase):
@@ -2614,50 +2970,52 @@ class InstanceTypeExtraSpecsTestCase(BaseInstanceTypeTestCase):
 
         # NOTE(boris-42): We have already tested flavor_create method
         #                 with extra_specs in InstanceTypeTestCase.
-        self.inst_types = [self._create_inst_type(v) for v in values]
+        self.flavors = [self._create_flavor(v) for v in values]
 
-    def test_instance_type_extra_specs_get(self):
-        for it in self.inst_types:
-            real_specs = db.flavor_extra_specs_get(self.ctxt,
-                                                          it['flavorid'])
+    def test_flavor_extra_specs_get(self):
+        for it in self.flavors:
+            real_specs = db.flavor_extra_specs_get(self.ctxt, it['flavorid'])
             self._assertEqualObjects(it['extra_specs'], real_specs)
 
-    def test_instance_type_extra_specs_get_item(self):
+    def test_flavor_extra_specs_get_item(self):
         expected = dict(f1=dict(a='a', b='b', c='c'),
                         f2=dict(d='d', e='e', f='f'))
 
         for flavor, specs in expected.iteritems():
             for key, val in specs.iteritems():
-                spec = db.flavor_extra_specs_get_item(self.ctxt, flavor,
-                                                             key)
+                spec = db.flavor_extra_specs_get_item(self.ctxt, flavor, key)
                 self.assertEqual(spec[key], val)
 
-    def test_instance_type_extra_specs_delete(self):
-        for it in self.inst_types:
+    def test_flavor_extra_specs_delete(self):
+        for it in self.flavors:
             specs = it['extra_specs']
             key = specs.keys()[0]
             del specs[key]
             db.flavor_extra_specs_delete(self.ctxt, it['flavorid'], key)
-            real_specs = db.flavor_extra_specs_get(self.ctxt,
-                                                          it['flavorid'])
+            real_specs = db.flavor_extra_specs_get(self.ctxt, it['flavorid'])
             self._assertEqualObjects(it['extra_specs'], real_specs)
 
-    def test_instance_type_extra_specs_update_or_create(self):
-        for it in self.inst_types:
+    def test_flavor_extra_specs_delete_failed(self):
+        for it in self.flavors:
+            self.assertRaises(exception.FlavorExtraSpecsNotFound,
+                          db.flavor_extra_specs_delete,
+                          self.ctxt, it['flavorid'], 'dummy')
+
+    def test_flavor_extra_specs_update_or_create(self):
+        for it in self.flavors:
             current_specs = it['extra_specs']
             current_specs.update(dict(b='b1', c='c1', d='d1', e='e1'))
             params = (self.ctxt, it['flavorid'], current_specs)
             db.flavor_extra_specs_update_or_create(*params)
-            real_specs = db.flavor_extra_specs_get(self.ctxt,
-                                                          it['flavorid'])
+            real_specs = db.flavor_extra_specs_get(self.ctxt, it['flavorid'])
             self._assertEqualObjects(current_specs, real_specs)
 
-    def test_instance_type_extra_specs_update_or_create_flavor_not_found(self):
+    def test_flavor_extra_specs_update_or_create_flavor_not_found(self):
         self.assertRaises(exception.FlavorNotFound,
                           db.flavor_extra_specs_update_or_create,
                           self.ctxt, 'nonexists', {})
 
-    def test_instance_type_extra_specs_update_or_create_retry(self):
+    def test_flavor_extra_specs_update_or_create_retry(self):
 
         def counted():
             def get_id(context, flavorid, session):
@@ -2667,8 +3025,7 @@ class InstanceTypeExtraSpecsTestCase(BaseInstanceTypeTestCase):
             return get_id
 
         get_id = counted()
-        self.stubs.Set(sqlalchemy_api,
-                       '_instance_type_get_id_from_flavor', get_id)
+        self.stubs.Set(sqlalchemy_api, '_flavor_get_id_from_flavor', get_id)
         self.assertRaises(db_exc.DBDuplicateEntry, sqlalchemy_api.
                           flavor_extra_specs_update_or_create,
                           self.ctxt, 1, {}, 5)
@@ -2677,105 +3034,103 @@ class InstanceTypeExtraSpecsTestCase(BaseInstanceTypeTestCase):
 
 class InstanceTypeAccessTestCase(BaseInstanceTypeTestCase):
 
-    def _create_inst_type_access(self, instance_type_id, project_id):
-        return db.flavor_access_add(self.ctxt, instance_type_id,
-                                           project_id)
+    def _create_flavor_access(self, flavor_id, project_id):
+        return db.flavor_access_add(self.ctxt, flavor_id, project_id)
 
-    def test_instance_type_access_get_by_flavor_id(self):
-        inst_types = ({'name': 'n1', 'flavorid': 'f1'},
-                      {'name': 'n2', 'flavorid': 'f2'})
-        it1, it2 = tuple((self._create_inst_type(v) for v in inst_types))
+    def test_flavor_access_get_by_flavor_id(self):
+        flavors = ({'name': 'n1', 'flavorid': 'f1'},
+                   {'name': 'n2', 'flavorid': 'f2'})
+        it1, it2 = tuple((self._create_flavor(v) for v in flavors))
 
-        access_it1 = [self._create_inst_type_access(it1['flavorid'], 'pr1'),
-                      self._create_inst_type_access(it1['flavorid'], 'pr2')]
+        access_it1 = [self._create_flavor_access(it1['flavorid'], 'pr1'),
+                      self._create_flavor_access(it1['flavorid'], 'pr2')]
 
-        access_it2 = [self._create_inst_type_access(it2['flavorid'], 'pr1')]
+        access_it2 = [self._create_flavor_access(it2['flavorid'], 'pr1')]
 
         for it, access_it in zip((it1, it2), (access_it1, access_it2)):
             params = (self.ctxt, it['flavorid'])
             real_access_it = db.flavor_access_get_by_flavor_id(*params)
             self._assertEqualListsOfObjects(access_it, real_access_it)
 
-    def test_instance_type_access_get_by_flavor_id_flavor_not_found(self):
+    def test_flavor_access_get_by_flavor_id_flavor_not_found(self):
         self.assertRaises(exception.FlavorNotFound,
                           db.flavor_get_by_flavor_id,
                           self.ctxt, 'nonexists')
 
-    def test_instance_type_access_add(self):
-        inst_type = self._create_inst_type({'flavorid': 'f1'})
+    def test_flavor_access_add(self):
+        flavor = self._create_flavor({'flavorid': 'f1'})
         project_id = 'p1'
 
-        access = self._create_inst_type_access(inst_type['flavorid'],
-                                               project_id)
-        # NOTE(boris-42): Check that instance_type_access_add doesn't fail and
+        access = self._create_flavor_access(flavor['flavorid'], project_id)
+        # NOTE(boris-42): Check that flavor_access_add doesn't fail and
         #                 returns correct value. This is enough because other
         #                 logic is checked by other methods.
-        self.assertFalse(access['id'] is None)
-        self.assertEqual(access['instance_type_id'], inst_type['id'])
+        self.assertIsNotNone(access['id'])
+        self.assertEqual(access['instance_type_id'], flavor['id'])
         self.assertEqual(access['project_id'], project_id)
 
-    def test_instance_type_access_add_to_non_existing_flavor(self):
+    def test_flavor_access_add_to_non_existing_flavor(self):
         self.assertRaises(exception.FlavorNotFound,
-                          self._create_inst_type_access,
+                          self._create_flavor_access,
                           'nonexists', 'does_not_matter')
 
-    def test_instance_type_access_add_duplicate_project_id_flavor(self):
-        inst_type = self._create_inst_type({'flavorid': 'f1'})
-        params = (inst_type['flavorid'], 'p1')
+    def test_flavor_access_add_duplicate_project_id_flavor(self):
+        flavor = self._create_flavor({'flavorid': 'f1'})
+        params = (flavor['flavorid'], 'p1')
 
-        self._create_inst_type_access(*params)
+        self._create_flavor_access(*params)
         self.assertRaises(exception.FlavorAccessExists,
-                          self._create_inst_type_access, *params)
+                          self._create_flavor_access, *params)
 
-    def test_instance_type_access_remove(self):
-        inst_types = ({'name': 'n1', 'flavorid': 'f1'},
-                      {'name': 'n2', 'flavorid': 'f2'})
-        it1, it2 = tuple((self._create_inst_type(v) for v in inst_types))
+    def test_flavor_access_remove(self):
+        flavors = ({'name': 'n1', 'flavorid': 'f1'},
+                   {'name': 'n2', 'flavorid': 'f2'})
+        it1, it2 = tuple((self._create_flavor(v) for v in flavors))
 
-        access_it1 = [self._create_inst_type_access(it1['flavorid'], 'pr1'),
-                      self._create_inst_type_access(it1['flavorid'], 'pr2')]
+        access_it1 = [self._create_flavor_access(it1['flavorid'], 'pr1'),
+                      self._create_flavor_access(it1['flavorid'], 'pr2')]
 
-        access_it2 = [self._create_inst_type_access(it2['flavorid'], 'pr1')]
+        access_it2 = [self._create_flavor_access(it2['flavorid'], 'pr1')]
 
         db.flavor_access_remove(self.ctxt, it1['flavorid'],
-                                       access_it1[1]['project_id'])
+                                access_it1[1]['project_id'])
 
         for it, access_it in zip((it1, it2), (access_it1[:1], access_it2)):
             params = (self.ctxt, it['flavorid'])
             real_access_it = db.flavor_access_get_by_flavor_id(*params)
             self._assertEqualListsOfObjects(access_it, real_access_it)
 
-    def test_instance_type_access_remove_flavor_not_found(self):
+    def test_flavor_access_remove_flavor_not_found(self):
         self.assertRaises(exception.FlavorNotFound,
                           db.flavor_access_remove,
                           self.ctxt, 'nonexists', 'does_not_matter')
 
-    def test_instance_type_access_remove_access_not_found(self):
-        inst_type = self._create_inst_type({'flavorid': 'f1'})
-        params = (inst_type['flavorid'], 'p1')
-        self._create_inst_type_access(*params)
+    def test_flavor_access_remove_access_not_found(self):
+        flavor = self._create_flavor({'flavorid': 'f1'})
+        params = (flavor['flavorid'], 'p1')
+        self._create_flavor_access(*params)
         self.assertRaises(exception.FlavorAccessNotFound,
                           db.flavor_access_remove,
-                          self.ctxt, inst_type['flavorid'], 'p2')
+                          self.ctxt, flavor['flavorid'], 'p2')
 
-    def test_instance_type_access_removed_after_instance_type_destroy(self):
-        inst_type1 = self._create_inst_type({'flavorid': 'f1', 'name': 'n1'})
-        inst_type2 = self._create_inst_type({'flavorid': 'f2', 'name': 'n2'})
+    def test_flavor_access_removed_after_flavor_destroy(self):
+        flavor1 = self._create_flavor({'flavorid': 'f1', 'name': 'n1'})
+        flavor2 = self._create_flavor({'flavorid': 'f2', 'name': 'n2'})
         values = [
-            (inst_type1['flavorid'], 'p1'),
-            (inst_type1['flavorid'], 'p2'),
-            (inst_type2['flavorid'], 'p3')
+            (flavor1['flavorid'], 'p1'),
+            (flavor1['flavorid'], 'p2'),
+            (flavor2['flavorid'], 'p3')
         ]
         for v in values:
-            self._create_inst_type_access(*v)
+            self._create_flavor_access(*v)
 
-        db.flavor_destroy(self.ctxt, inst_type1['name'])
+        db.flavor_destroy(self.ctxt, flavor1['name'])
 
-        p = (self.ctxt, inst_type1['flavorid'])
+        p = (self.ctxt, flavor1['flavorid'])
         self.assertEqual(0, len(db.flavor_access_get_by_flavor_id(*p)))
-        p = (self.ctxt, inst_type2['flavorid'])
+        p = (self.ctxt, flavor2['flavorid'])
         self.assertEqual(1, len(db.flavor_access_get_by_flavor_id(*p)))
-        db.flavor_destroy(self.ctxt, inst_type2['name'])
+        db.flavor_destroy(self.ctxt, flavor2['name'])
         self.assertEqual(0, len(db.flavor_access_get_by_flavor_id(*p)))
 
 
@@ -2867,8 +3222,8 @@ class FixedIPTestCase(BaseInstanceTypeTestCase):
 
         fip = db.fixed_ip_get_by_network_host(self.ctxt, 1, 'host')
 
-        self.assertEquals(1, fip['network_id'])
-        self.assertEquals('host', fip['host'])
+        self.assertEqual(1, fip['network_id'])
+        self.assertEqual('host', fip['host'])
 
     def _create_instance(self, **kwargs):
         instance = db.instance_create(self.ctxt, kwargs)
@@ -2988,7 +3343,7 @@ class FixedIPTestCase(BaseInstanceTypeTestCase):
             self.ctxt, dict(instance_uuid=instance_uuid))
 
         ips_list = db.fixed_ips_by_virtual_interface(self.ctxt, vif.id)
-        self.assertEquals(0, len(ips_list))
+        self.assertEqual(0, len(ips_list))
 
     def create_fixed_ip(self, **params):
         default_params = {'address': '192.168.0.1'}
@@ -3206,6 +3561,16 @@ class FixedIPTestCase(BaseInstanceTypeTestCase):
         ignored_keys = ['created_at', 'id', 'deleted_at', 'updated_at']
         self._assertEqualObjects(param, fixed_ip_data, ignored_keys)
 
+    def test_fixed_ip_get_by_address(self):
+        instance_uuid = self._create_instance()
+        db.fixed_ip_create(self.ctxt, {'address': '1.2.3.4',
+                                       'instance_uuid': instance_uuid,
+                                       })
+        fixed_ip = db.fixed_ip_get_by_address(self.ctxt, '1.2.3.4',
+                                              columns_to_join=['instance'])
+        self.assertIn('instance', fixed_ip.__dict__)
+        self.assertEqual(instance_uuid, fixed_ip.instance.uuid)
+
     def test_fixed_ip_get_by_address_detailed_not_found_exception(self):
         self.assertRaises(exception.FixedIpNotFoundForAddress,
                           db.fixed_ip_get_by_address_detailed, self.ctxt,
@@ -3246,7 +3611,8 @@ class FixedIPTestCase(BaseInstanceTypeTestCase):
         # Instance check here
         instance_data = db.instance_get_by_uuid(self.ctxt, instance_uuid)
         ignored_keys = ['info_cache', 'system_metadata',
-                        'security_groups', 'metadata']  # HOW ????
+                        'security_groups', 'metadata',
+                        'pci_devices']  # HOW ????
         self._assertEqualObjects(instance_data, fixed_ip_data[2], ignored_keys)
 
     def test_fixed_ip_update_not_found_for_address(self):
@@ -3364,6 +3730,24 @@ class FloatingIpTestCase(test.TestCase, ModelsObjectComparatorMixin):
                 alloc_addrs.append(float_addr)
             self._assertEqualListsOfPrimitivesAsSets(alloc_addrs, addresses)
 
+    def test_floating_ip_allocate_auto_assigned(self):
+        addresses = ['1.1.1.1', '1.1.1.2', '1.1.1.3', '1.1.1.4']
+
+        float_ips = []
+        for i in range(0, 2):
+            float_ips.append(self._create_floating_ip(
+                {"address": addresses[i]}))
+        for i in range(2, 4):
+            float_ips.append(self._create_floating_ip({"address": addresses[i],
+                                                       "auto_assigned": True}))
+
+        for i in range(0, 2):
+            float_ip = db.floating_ip_get(self.ctxt, float_ips[i].id)
+            self.assertFalse(float_ip.auto_assigned)
+        for i in range(2, 4):
+            float_ip = db.floating_ip_get(self.ctxt, float_ips[i].id)
+            self.assertTrue(float_ip.auto_assigned)
+
     def test_floating_ip_allocate_address_no_more_floating_ips(self):
         self.assertRaises(exception.NoMoreFloatingIps,
                           db.floating_ip_allocate_address,
@@ -3402,29 +3786,51 @@ class FloatingIpTestCase(test.TestCase, ModelsObjectComparatorMixin):
         ips_for_delete = []
         ips_for_non_delete = []
 
-        def create_ips(i):
-            return [{'address': '1.1.%s.%s' % (i, k)} for k in range(1, 256)]
+        def create_ips(i, j):
+            return [{'address': '1.1.%s.%s' % (i, k)} for k in range(1, j + 1)]
 
         # NOTE(boris-42): Create more then 256 ip to check that
         #                 _ip_range_splitter works properly.
         for i in range(1, 3):
-            ips_for_delete.extend(create_ips(i))
-        ips_for_non_delete.extend(create_ips(3))
+            ips_for_delete.extend(create_ips(i, 255))
+        ips_for_non_delete.extend(create_ips(3, 255))
 
         db.floating_ip_bulk_create(self.ctxt,
                                    ips_for_delete + ips_for_non_delete)
+
+        non_bulk_ips_for_delete = create_ips(4, 3)
+        non_bulk_ips_for_non_delete = create_ips(5, 3)
+        non_bulk_ips = non_bulk_ips_for_delete + non_bulk_ips_for_non_delete
+        project_id = 'fake_project'
+        reservations = quota.QUOTAS.reserve(self.ctxt,
+                                      floating_ips=len(non_bulk_ips),
+                                      project_id=project_id)
+        for dct in non_bulk_ips:
+            self._create_floating_ip(dct)
+        quota.QUOTAS.commit(self.ctxt, reservations, project_id=project_id)
+        self.assertEqual(db.quota_usage_get_all_by_project(
+                            self.ctxt, project_id),
+                            {'project_id': project_id,
+                             'floating_ips': {'in_use': 6, 'reserved': 0}})
+        ips_for_delete.extend(non_bulk_ips_for_delete)
+        ips_for_non_delete.extend(non_bulk_ips_for_non_delete)
+
         db.floating_ip_bulk_destroy(self.ctxt, ips_for_delete)
 
         expected_addresses = map(lambda x: x['address'], ips_for_non_delete)
         self._assertEqualListsOfPrimitivesAsSets(self._get_existing_ips(),
                                                  expected_addresses)
+        self.assertEqual(db.quota_usage_get_all_by_project(
+                            self.ctxt, project_id),
+                            {'project_id': project_id,
+                             'floating_ips': {'in_use': 3, 'reserved': 0}})
 
     def test_floating_ip_create(self):
         floating_ip = self._create_floating_ip({})
         ignored_keys = ['id', 'deleted', 'deleted_at', 'updated_at',
                         'created_at']
 
-        self.assertFalse(floating_ip['id'] is None)
+        self.assertIsNotNone(floating_ip['id'])
         self._assertEqualObjects(floating_ip, self._get_base_values(),
                                  ignored_keys)
 
@@ -3461,7 +3867,7 @@ class FloatingIpTestCase(test.TestCase, ModelsObjectComparatorMixin):
         result = db.floating_ip_fixed_ip_associate(self.ctxt,
                                                    float_addresses[0],
                                                    fixed_addresses[0], 'host')
-        self.assertTrue(result is None)
+        self.assertIsNone(result)
 
     def test_floating_ip_fixed_ip_associate_float_ip_not_found(self):
         self.assertRaises(exception.FloatingIpNotFoundForAddress,
@@ -3474,8 +3880,8 @@ class FloatingIpTestCase(test.TestCase, ModelsObjectComparatorMixin):
         db.floating_ip_deallocate(self.ctxt, float_ip.address)
 
         updated_float_ip = db.floating_ip_get(self.ctxt, float_ip.id)
-        self.assertTrue(updated_float_ip.project_id is None)
-        self.assertTrue(updated_float_ip.host is None)
+        self.assertIsNone(updated_float_ip.project_id)
+        self.assertIsNone(updated_float_ip.host)
         self.assertFalse(updated_float_ip.auto_assigned)
 
     def test_floating_ip_destroy(self):
@@ -3514,8 +3920,8 @@ class FloatingIpTestCase(test.TestCase, ModelsObjectComparatorMixin):
             fixed = db.floating_ip_disassociate(self.ctxt, float_ip.address)
             self.assertEqual(fixed.address, fixed_addr)
             updated_float_ip = db.floating_ip_get(self.ctxt, float_ip.id)
-            self.assertTrue(updated_float_ip.fixed_ip_id is None)
-            self.assertTrue(updated_float_ip.host is None)
+            self.assertIsNone(updated_float_ip.fixed_ip_id)
+            self.assertIsNone(updated_float_ip.host)
 
     def test_floating_ip_disassociate_not_found(self):
         self.assertRaises(exception.FloatingIpNotFoundForAddress,
@@ -3689,10 +4095,19 @@ class FloatingIpTestCase(test.TestCase, ModelsObjectComparatorMixin):
 
 class InstanceDestroyConstraints(test.TestCase):
 
-    def test_destroy_with_equal_any_constraint_met(self):
+    def test_destroy_with_equal_any_constraint_met_single_value(self):
         ctx = context.get_admin_context()
         instance = db.instance_create(ctx, {'task_state': 'deleting'})
         constraint = db.constraint(task_state=db.equal_any('deleting'))
+        db.instance_destroy(ctx, instance['uuid'], constraint)
+        self.assertRaises(exception.InstanceNotFound, db.instance_get_by_uuid,
+                          ctx, instance['uuid'])
+
+    def test_destroy_with_equal_any_constraint_met(self):
+        ctx = context.get_admin_context()
+        instance = db.instance_create(ctx, {'task_state': 'deleting'})
+        constraint = db.constraint(task_state=db.equal_any('deleting',
+                                                           'error'))
         db.instance_destroy(ctx, instance['uuid'], constraint)
         self.assertRaises(exception.InstanceNotFound, db.instance_get_by_uuid,
                           ctx, instance['uuid'])
@@ -3737,41 +4152,38 @@ class VolumeUsageDBApiTestCase(test.TestCase):
     def test_vol_usage_update_no_totals_update(self):
         ctxt = context.get_admin_context()
         now = timeutils.utcnow()
+        timeutils.set_time_override(now)
         start_time = now - datetime.timedelta(seconds=10)
 
-        self.mox.StubOutWithMock(timeutils, 'utcnow')
-        timeutils.utcnow().AndReturn(now)
-        timeutils.utcnow().AndReturn(now)
-        timeutils.utcnow().AndReturn(now)
-        self.mox.ReplayAll()
-
-        expected_vol_usages = [{'volume_id': u'1',
-                                'instance_uuid': 'fake-instance-uuid1',
-                                'project_id': 'fake-project-uuid1',
-                                'user_id': 'fake-user-uuid1',
-                                'curr_reads': 1000,
-                                'curr_read_bytes': 2000,
-                                'curr_writes': 3000,
-                                'curr_write_bytes': 4000,
-                                'curr_last_refreshed': now,
-                                'tot_reads': 0,
-                                'tot_read_bytes': 0,
-                                'tot_writes': 0,
-                                'tot_write_bytes': 0,
-                                'tot_last_refreshed': None},
-                               {'volume_id': u'2',
-                                'instance_uuid': 'fake-instance-uuid2',
-                                'project_id': 'fake-project-uuid2',
-                                'user_id': 'fake-user-uuid2',
-                                'curr_reads': 100,
-                                'curr_read_bytes': 200,
-                                'curr_writes': 300,
-                                'curr_write_bytes': 400,
-                                'tot_reads': 0,
-                                'tot_read_bytes': 0,
-                                'tot_writes': 0,
-                                'tot_write_bytes': 0,
-                                'tot_last_refreshed': None}]
+        expected_vol_usages = {
+            u'1': {'volume_id': u'1',
+                   'instance_uuid': 'fake-instance-uuid1',
+                   'project_id': 'fake-project-uuid1',
+                   'user_id': 'fake-user-uuid1',
+                   'curr_reads': 1000,
+                   'curr_read_bytes': 2000,
+                   'curr_writes': 3000,
+                   'curr_write_bytes': 4000,
+                   'curr_last_refreshed': now,
+                   'tot_reads': 0,
+                   'tot_read_bytes': 0,
+                   'tot_writes': 0,
+                   'tot_write_bytes': 0,
+                   'tot_last_refreshed': None},
+            u'2': {'volume_id': u'2',
+                   'instance_uuid': 'fake-instance-uuid2',
+                   'project_id': 'fake-project-uuid2',
+                   'user_id': 'fake-user-uuid2',
+                   'curr_reads': 100,
+                   'curr_read_bytes': 200,
+                   'curr_writes': 300,
+                   'curr_write_bytes': 400,
+                   'tot_reads': 0,
+                   'tot_read_bytes': 0,
+                   'tot_writes': 0,
+                   'tot_write_bytes': 0,
+                   'tot_last_refreshed': None}
+        }
 
         def _compare(vol_usage, expected):
             for key, value in expected.items():
@@ -3801,24 +4213,18 @@ class VolumeUsageDBApiTestCase(test.TestCase):
 
         vol_usages = db.vol_get_usage_by_time(ctxt, start_time)
         self.assertEqual(len(vol_usages), 2)
-        _compare(vol_usages[0], expected_vol_usages[0])
-        _compare(vol_usages[1], expected_vol_usages[1])
+        for usage in vol_usages:
+            _compare(usage, expected_vol_usages[usage.volume_id])
 
     def test_vol_usage_update_totals_update(self):
         ctxt = context.get_admin_context()
         now = datetime.datetime(1, 1, 1, 1, 0, 0)
         start_time = now - datetime.timedelta(seconds=10)
-
-        self.mox.StubOutWithMock(timeutils, 'utcnow')
-        timeutils.utcnow().AndReturn(now)
         now1 = now + datetime.timedelta(minutes=1)
-        timeutils.utcnow().AndReturn(now1)
         now2 = now + datetime.timedelta(minutes=2)
-        timeutils.utcnow().AndReturn(now2)
         now3 = now + datetime.timedelta(minutes=3)
-        timeutils.utcnow().AndReturn(now3)
-        self.mox.ReplayAll()
 
+        timeutils.set_time_override(now)
         db.vol_usage_update(ctxt, u'1', rd_req=100, rd_bytes=200,
                             wr_req=300, wr_bytes=400,
                             instance_id='fake-instance-uuid',
@@ -3829,6 +4235,7 @@ class VolumeUsageDBApiTestCase(test.TestCase):
         self.assertEqual(current_usage['tot_reads'], 0)
         self.assertEqual(current_usage['curr_reads'], 100)
 
+        timeutils.set_time_override(now1)
         db.vol_usage_update(ctxt, u'1', rd_req=200, rd_bytes=300,
                             wr_req=400, wr_bytes=500,
                             instance_id='fake-instance-uuid',
@@ -3840,6 +4247,7 @@ class VolumeUsageDBApiTestCase(test.TestCase):
         self.assertEqual(current_usage['tot_reads'], 200)
         self.assertEqual(current_usage['curr_reads'], 0)
 
+        timeutils.set_time_override(now2)
         db.vol_usage_update(ctxt, u'1', rd_req=300, rd_bytes=400,
                             wr_req=500, wr_bytes=600,
                             instance_id='fake-instance-uuid',
@@ -3850,6 +4258,7 @@ class VolumeUsageDBApiTestCase(test.TestCase):
         self.assertEqual(current_usage['tot_reads'], 200)
         self.assertEqual(current_usage['curr_reads'], 300)
 
+        timeutils.set_time_override(now3)
         db.vol_usage_update(ctxt, u'1', rd_req=400, rd_bytes=500,
                             wr_req=600, wr_bytes=700,
                             instance_id='fake-instance-uuid',
@@ -3876,7 +4285,7 @@ class VolumeUsageDBApiTestCase(test.TestCase):
                                'curr_write_bytes': 0,
                                'curr_last_refreshed': now2}
 
-        self.assertEquals(1, len(vol_usages))
+        self.assertEqual(1, len(vol_usages))
         for key, value in expected_vol_usages.items():
             self.assertEqual(vol_usages[0][key], value, key)
 
@@ -4006,10 +4415,14 @@ class TaskLogTestCase(test.TestCase):
         result = db.task_log_get_all(self.context, self.task_name, self.begin,
                                      self.end, host=self.host)
         self.assertEqual(len(result), 1)
+        result = db.task_log_get_all(self.context, self.task_name, self.begin,
+                                     self.end, host=self.host, state='')
+        self.assertEqual(len(result), 0)
 
     def test_task_log_begin_task(self):
         db.task_log_begin_task(self.context, 'fake', self.begin,
-                               self.end, self.host, message=self.message)
+                               self.end, self.host, task_items=42,
+                               message=self.message)
         result = db.task_log_get(self.context, 'fake', self.begin,
                                  self.end, self.host)
         self.assertEqual(result['task_name'], 'fake')
@@ -4028,6 +4441,12 @@ class TaskLogTestCase(test.TestCase):
         result = db.task_log_get(self.context, self.task_name, self.begin,
                                  self.end, self.host)
         self.assertEqual(result['errors'], 1)
+
+    def test_task_log_end_task_task_not_running(self):
+        self.assertRaises(exception.TaskNotRunning,
+                          db.task_log_end_task, self.context, 'nonexistent',
+                          self.begin, self.end, self.host, 42,
+                          message=self.message)
 
 
 class BlockDeviceMappingTestCase(test.TestCase):
@@ -4069,7 +4488,7 @@ class BlockDeviceMappingTestCase(test.TestCase):
 
     def test_block_device_mapping_create(self):
         bdm = self._create_bdm({})
-        self.assertFalse(bdm is None)
+        self.assertIsNotNone(bdm)
 
     def test_block_device_mapping_update(self):
         bdm = self._create_bdm({})
@@ -4108,11 +4527,56 @@ class BlockDeviceMappingTestCase(test.TestCase):
         self.assertEqual(bdm_real['device_name'], 'fake_name')
         self.assertEqual(bdm_real['destination_type'], 'camelot')
 
+        # check create without device_name
+        bdm1 = dict(values)
+        bdm1['device_name'] = None
+        db.block_device_mapping_update_or_create(self.ctxt, bdm1, legacy=False)
+        bdm_real = db.block_device_mapping_get_all_by_instance(self.ctxt, uuid)
+        self.assertEqual(len(bdm_real), 2)
+        bdm_real = bdm_real[1]
+        self.assertIsNone(bdm_real['device_name'])
+
+        # check create multiple devices without device_name
+        bdm2 = dict(values)
+        bdm2['device_name'] = None
+        db.block_device_mapping_update_or_create(self.ctxt, bdm2, legacy=False)
+        bdm_real = db.block_device_mapping_get_all_by_instance(self.ctxt, uuid)
+        self.assertEqual(len(bdm_real), 3)
+        bdm_real = bdm_real[2]
+        self.assertIsNone(bdm_real['device_name'])
+
+    def test_block_device_mapping_update_or_create_multiple_ephemeral(self):
+        uuid = self.instance['uuid']
+        values = {
+            'instance_uuid': uuid,
+            'source_type': 'blank',
+            'guest_format': 'myformat',
+        }
+
+        bdm1 = dict(values)
+        bdm1['device_name'] = '/dev/sdb'
+        db.block_device_mapping_update_or_create(self.ctxt, bdm1, legacy=False)
+
+        bdm2 = dict(values)
+        bdm2['device_name'] = '/dev/sdc'
+        db.block_device_mapping_update_or_create(self.ctxt, bdm2, legacy=False)
+
+        bdm_real = sorted(
+            db.block_device_mapping_get_all_by_instance(self.ctxt, uuid),
+            key=lambda bdm: bdm['device_name']
+        )
+
+        self.assertEqual(len(bdm_real), 2)
+        for bdm, device_name in zip(bdm_real, ['/dev/sdb', '/dev/sdc']):
+            self.assertEqual(bdm['device_name'], device_name)
+            self.assertEqual(bdm['guest_format'], 'myformat')
+
     def test_block_device_mapping_update_or_create_check_remove_virt(self):
         uuid = self.instance['uuid']
         values = {
             'instance_uuid': uuid,
             'source_type': 'blank',
+            'destination_type': 'local',
             'guest_format': 'swap',
         }
 
@@ -4130,27 +4594,6 @@ class BlockDeviceMappingTestCase(test.TestCase):
         self.assertEqual(bdm_real['source_type'], 'blank')
         self.assertEqual(bdm_real['guest_format'], 'swap')
         db.block_device_mapping_destroy(self.ctxt, bdm_real['id'])
-
-        # check that old ephemerals are deleted no matter what
-        val3 = dict(values)
-        val3['device_name'] = 'device3'
-        val3['guest_format'] = None
-        val4 = dict(values)
-        val4['device_name'] = 'device4'
-        val4['guest_format'] = None
-        db.block_device_mapping_create(self.ctxt, val3, legacy=False)
-        db.block_device_mapping_create(self.ctxt, val4, legacy=False)
-        bdm_real = db.block_device_mapping_get_all_by_instance(self.ctxt, uuid)
-        self.assertEqual(len(bdm_real), 2)
-
-        val5 = dict(values)
-        val5['device_name'] = 'device5'
-        val5['guest_format'] = None
-        db.block_device_mapping_update_or_create(self.ctxt, val5, legacy=False)
-        bdm_real = db.block_device_mapping_get_all_by_instance(self.ctxt, uuid)
-        self.assertEqual(len(bdm_real), 1)
-        bdm_real = bdm_real[0]
-        self.assertEqual(bdm_real['device_name'], 'device5')
 
     def test_block_device_mapping_get_all_by_instance(self):
         uuid1 = self.instance['uuid']
@@ -4180,7 +4623,7 @@ class BlockDeviceMappingTestCase(test.TestCase):
                                                           bdm['instance_uuid'])
         self.assertEqual(len(bdm), 0)
 
-    def test_block_device_mapping_destory_by_instance_and_volumne(self):
+    def test_block_device_mapping_destroy_by_instance_and_volumne(self):
         vol_id1 = '69f5c254-1a5b-4fff-acf7-cb369904f58f'
         vol_id2 = '69f5c254-1a5b-4fff-acf7-cb369904f59f'
 
@@ -4205,6 +4648,18 @@ class BlockDeviceMappingTestCase(test.TestCase):
         bdms = db.block_device_mapping_get_all_by_instance(self.ctxt, uuid)
         self.assertEqual(len(bdms), 1)
         self.assertEqual(bdms[0]['device_name'], 'fake2')
+
+    def test_block_device_mapping_get_by_volume_id(self):
+        self._create_bdm({'volume_id': 'fake_id'})
+        bdm = db.block_device_mapping_get_by_volume_id(self.ctxt, 'fake_id')
+        self.assertEqual(bdm['volume_id'], 'fake_id')
+
+    def test_block_device_mapping_get_by_volume_id_join_instance(self):
+        self._create_bdm({'volume_id': 'fake_id'})
+        bdm = db.block_device_mapping_get_by_volume_id(self.ctxt, 'fake_id',
+                ['instance'])
+        self.assertEqual(bdm['volume_id'], 'fake_id')
+        self.assertEqual(bdm['instance']['uuid'], self.instance['uuid'])
 
 
 class AgentBuildTestCase(test.TestCase, ModelsObjectComparatorMixin):
@@ -4260,6 +4715,13 @@ class AgentBuildTestCase(test.TestCase, ModelsObjectComparatorMixin):
         self.assertRaises(exception.AgentBuildExists, db.agent_build_create,
                           self.ctxt, values)
 
+    def test_agent_build_get_all_by_hypervisor(self):
+        values = {'hypervisor': 'kvm', 'os': 'FreeBSD',
+                  'architecture': 'x86_64'}
+        created = db.agent_build_create(self.ctxt, values)
+        actual = db.agent_build_get_all(self.ctxt, hypervisor='kvm')
+        self._assertEqualListsOfObjects([created], actual)
+
 
 class VirtualInterfaceTestCase(test.TestCase, ModelsObjectComparatorMixin):
     def setUp(self):
@@ -4291,7 +4753,7 @@ class VirtualInterfaceTestCase(test.TestCase, ModelsObjectComparatorMixin):
 
     def test_virtual_interface_create(self):
         vif = self._create_virt_interface({})
-        self.assertFalse(vif['id'] is None)
+        self.assertIsNotNone(vif['id'])
         ignored_keys = ['id', 'deleted', 'deleted_at', 'updated_at',
                         'created_at', 'uuid']
         self._assertEqualObjects(vif, self._get_base_values(), ignored_keys)
@@ -4416,12 +4878,6 @@ class NetworkTestCase(test.TestCase, ModelsObjectComparatorMixin):
             network.id)
         return network, instance
 
-    def test_network_in_use_on_host(self):
-        network, _ = self._get_associated_fixed_ip('host.net', '192.0.2.0/30',
-            '192.0.2.1')
-        self.assertTrue(db.network_in_use_on_host(self.ctxt, network.id,
-            'host.net'))
-
     def test_network_get_associated_fixed_ips(self):
         network, instance = self._get_associated_fixed_ip('host.net',
             '192.0.2.0/30', '192.0.2.1')
@@ -4482,7 +4938,7 @@ class NetworkTestCase(test.TestCase, ModelsObjectComparatorMixin):
 
     def test_network_update_nonexistent(self):
         self.assertRaises(exception.NetworkNotFound,
-            db.network_update, self.ctxt, 'nonexistent', {})
+            db.network_update, self.ctxt, 123456, {})
 
     def test_network_update_with_duplicate_vlan(self):
         values1 = {'host': 'localhost', 'project_id': 'project1', 'vlan': 1}
@@ -4502,7 +4958,7 @@ class NetworkTestCase(test.TestCase, ModelsObjectComparatorMixin):
 
     def test_network_set_host_nonexistent_network(self):
         self.assertRaises(exception.NetworkNotFound,
-            db.network_set_host, self.ctxt, 'nonexistent', 'nonexistent')
+            db.network_set_host, self.ctxt, 123456, 'nonexistent')
 
     def test_network_set_host_with_initially_no_host(self):
         values = {'host': 'example.com', 'project_id': 'project1'}
@@ -4543,10 +4999,6 @@ class NetworkTestCase(test.TestCase, ModelsObjectComparatorMixin):
             'virtual_interface_id': vif.id})
         self._assertEqualListsOfObjects([net1, net2, net3],
             db.network_get_all_by_host(self.ctxt, host))
-
-    def test_network_get_by_cidr_nonexistent(self):
-        self.assertRaises(exception.NetworkNotFoundForCidr,
-            db.network_get_by_cidr(self.ctxt, '192.0.2.0/29'))
 
     def test_network_get_by_cidr(self):
         cidr = '192.0.2.0/30'
@@ -4591,6 +5043,24 @@ class NetworkTestCase(test.TestCase, ModelsObjectComparatorMixin):
         network_db = db.network_get_all(self.ctxt)
         self.assertEqual(1, len(network_db))
         self._assertEqualObjects(network, network_db[0])
+
+    def test_network_get_all_admin_user(self):
+        network1 = db.network_create_safe(self.ctxt, {})
+        network2 = db.network_create_safe(self.ctxt,
+                                          {'project_id': 'project1'})
+        self._assertEqualListsOfObjects([network1, network2],
+                                        db.network_get_all(self.ctxt,
+                                                           project_only=True))
+
+    def test_network_get_all_normal_user(self):
+        normal_ctxt = context.RequestContext('fake', 'fake')
+        db.network_create_safe(self.ctxt, {})
+        db.network_create_safe(self.ctxt, {'project_id': 'project1'})
+        network1 = db.network_create_safe(self.ctxt,
+                                          {'project_id': 'fake'})
+        network_db = db.network_get_all(normal_ctxt, project_only=True)
+        self.assertEqual(1, len(network_db))
+        self._assertEqualObjects(network1, network_db[0])
 
     def test_network_get(self):
         network = db.network_create_safe(self.ctxt, {})
@@ -4642,7 +5112,7 @@ class KeyPairTestCase(test.TestCase, ModelsObjectComparatorMixin):
         }
         key_pair = self._create_key_pair(param)
 
-        self.assertTrue(key_pair['id'] is not None)
+        self.assertIsNotNone(key_pair['id'])
         ignored_keys = ['deleted', 'created_at', 'updated_at',
                         'deleted_at', 'id']
         self._assertEqualObjects(key_pair, param, ignored_keys)
@@ -4798,8 +5268,8 @@ class QuotaTestCase(test.TestCase, ModelsObjectComparatorMixin):
         quotas = {}
         deltas = {}
         reservable_resources = {}
-        for i, resource in enumerate(resources):
-            if isinstance(resource, ReservableResource):
+        for i, resource in enumerate(quota.resources):
+            if isinstance(resource, quota.ReservableResource):
                 quotas[resource.name] = db.quota_create(self.ctxt, 'project1',
                                                         resource.name, 100)
                 deltas[resource.name] = i
@@ -4835,7 +5305,7 @@ class QuotaTestCase(test.TestCase, ModelsObjectComparatorMixin):
                                               None, None, 'project1')
         resources_names = reservable_resources.keys()
         for reservation_uuid in reservations_uuids:
-            reservation = db.reservation_get(self.ctxt, reservation_uuid)
+            reservation = _reservation_get(self.ctxt, reservation_uuid)
             usage = db.quota_usage_get(self.ctxt, 'project1',
                                        reservation.resource)
             self.assertEqual(usage.in_use, usages[reservation.resource],
@@ -4850,12 +5320,15 @@ class QuotaTestCase(test.TestCase, ModelsObjectComparatorMixin):
         db.quota_destroy_all_by_project(self.ctxt, 'project1')
         self.assertEqual(db.quota_get_all_by_project(self.ctxt, 'project1'),
                             {'project_id': 'project1'})
+        self.assertEqual(db.quota_get_all_by_project_and_user(self.ctxt,
+                            'project1', 'user1'),
+                            {'project_id': 'project1', 'user_id': 'user1'})
         self.assertEqual(db.quota_usage_get_all_by_project(
                             self.ctxt, 'project1'),
                             {'project_id': 'project1'})
         for r in reservations:
             self.assertRaises(exception.ReservationNotFound,
-                            db.reservation_get, self.ctxt, r)
+                            _reservation_get, self.ctxt, r)
 
     def test_quota_destroy_all_by_project_and_user(self):
         reservations = _quota_reserve(self.ctxt, 'project1', 'user1')
@@ -4868,10 +5341,11 @@ class QuotaTestCase(test.TestCase, ModelsObjectComparatorMixin):
         self.assertEqual(db.quota_usage_get_all_by_project_and_user(
                             self.ctxt, 'project1', 'user1'),
                             {'project_id': 'project1',
-                             'user_id': 'user1'})
+                             'user_id': 'user1',
+                             'fixed_ips': {'in_use': 2, 'reserved': 2}})
         for r in reservations:
             self.assertRaises(exception.ReservationNotFound,
-                            db.reservation_get, self.ctxt, r)
+                            _reservation_get, self.ctxt, r)
 
     def test_quota_usage_get_nonexistent(self):
         self.assertRaises(exception.QuotaUsageNotFound, db.quota_usage_get,
@@ -4890,7 +5364,7 @@ class QuotaTestCase(test.TestCase, ModelsObjectComparatorMixin):
         expected = {'project_id': 'p1',
                     'resource0': {'in_use': 0, 'reserved': 0},
                     'resource1': {'in_use': 1, 'reserved': 1},
-                    'resource2': {'in_use': 2, 'reserved': 2}}
+                    'fixed_ips': {'in_use': 2, 'reserved': 2}}
         self.assertEqual(expected, db.quota_usage_get_all_by_project(
                          self.ctxt, 'p1'))
 
@@ -4900,7 +5374,7 @@ class QuotaTestCase(test.TestCase, ModelsObjectComparatorMixin):
                     'user_id': 'u1',
                     'resource0': {'in_use': 0, 'reserved': 0},
                     'resource1': {'in_use': 1, 'reserved': 1},
-                    'resource2': {'in_use': 2, 'reserved': 2}}
+                    'fixed_ips': {'in_use': 2, 'reserved': 2}}
         self.assertEqual(expected, db.quota_usage_get_all_by_project_and_user(
                          self.ctxt, 'p1', 'u1'))
 
@@ -5023,8 +5497,8 @@ class ComputeNodeTestCase(test.TestCase, ModelsObjectComparatorMixin):
     def setUp(self):
         super(ComputeNodeTestCase, self).setUp()
         self.ctxt = context.get_admin_context()
-        self.service_dict = dict(host='host1', binary='binary1',
-                            topic='compute', report_count=1,
+        self.service_dict = dict(host='host1', binary='nova-compute',
+                            topic=CONF.compute_topic, report_count=1,
                             disabled=False)
         self.service = db.service_create(self.ctxt, self.service_dict)
         self.compute_node_dict = dict(vcpus=2, memory_mb=1024, local_gb=2048,
@@ -5037,64 +5511,128 @@ class ComputeNodeTestCase(test.TestCase, ModelsObjectComparatorMixin):
                                  disk_available_least=100,
                                  hypervisor_hostname='abracadabra104',
                                  host_ip='127.0.0.1',
-                                 supported_instances='')
+                                 supported_instances='',
+                                 pci_stats='',
+                                 metrics='',
+                                 extra_resources='',
+                                 stats='')
         # add some random stats
         self.stats = dict(num_instances=3, num_proj_12345=2,
                      num_proj_23456=2, num_vm_building=3)
-        self.compute_node_dict['stats'] = self.stats
+        self.compute_node_dict['stats'] = jsonutils.dumps(self.stats)
         self.flags(reserved_host_memory_mb=0)
         self.flags(reserved_host_disk_mb=0)
         self.item = db.compute_node_create(self.ctxt, self.compute_node_dict)
 
-    def _stats_as_dict(self, stats):
-        d = {}
-        for s in stats:
-            key = s['key']
-            d[key] = s['value']
-        return d
-
-    def _stats_equal(self, stats, new_stats):
-        for k, v in stats.iteritems():
-            self.assertEqual(v, int(new_stats[k]))
-
     def test_compute_node_create(self):
         self._assertEqualObjects(self.compute_node_dict, self.item,
                                 ignored_keys=self._ignored_keys + ['stats'])
-        new_stats = self._stats_as_dict(self.item['stats'])
-        self._stats_equal(self.stats, new_stats)
+        new_stats = jsonutils.loads(self.item['stats'])
+        self.assertEqual(self.stats, new_stats)
 
     def test_compute_node_get_all(self):
-        nodes = db.compute_node_get_all(self.ctxt)
-        self.assertEqual(1, len(nodes))
-        node = nodes[0]
-        self._assertEqualObjects(self.compute_node_dict, node,
-                        ignored_keys=self._ignored_keys + ['stats', 'service'])
-        new_stats = self._stats_as_dict(node['stats'])
-        self._stats_equal(self.stats, new_stats)
+        date_fields = set(['created_at', 'updated_at',
+                           'deleted_at', 'deleted'])
+        for no_date_fields in [False, True]:
+            nodes = db.compute_node_get_all(self.ctxt, no_date_fields)
+            self.assertEqual(1, len(nodes))
+            node = nodes[0]
+            self._assertEqualObjects(self.compute_node_dict, node,
+                                     ignored_keys=self._ignored_keys +
+                                                  ['stats', 'service'])
+            node_fields = set(node.keys())
+            if no_date_fields:
+                self.assertFalse(date_fields & node_fields)
+            else:
+                self.assertTrue(date_fields <= node_fields)
+            new_stats = jsonutils.loads(node['stats'])
+            self.assertEqual(self.stats, new_stats)
+
+    def test_compute_node_get_all_deleted_compute_node(self):
+        # Create a service and compute node and ensure we can find its stats;
+        # delete the service and compute node when done and loop again
+        for x in range(2, 5):
+            # Create a service
+            service_data = self.service_dict.copy()
+            service_data['host'] = 'host-%s' % x
+            service = db.service_create(self.ctxt, service_data)
+
+            # Create a compute node
+            compute_node_data = self.compute_node_dict.copy()
+            compute_node_data['service_id'] = service['id']
+            compute_node_data['stats'] = jsonutils.dumps(self.stats.copy())
+            compute_node_data['hypervisor_hostname'] = 'hypervisor-%s' % x
+            node = db.compute_node_create(self.ctxt, compute_node_data)
+
+            # Ensure the "new" compute node is found
+            nodes = db.compute_node_get_all(self.ctxt, False)
+            self.assertEqual(2, len(nodes))
+            found = None
+            for n in nodes:
+                if n['id'] == node['id']:
+                    found = n
+                    break
+            self.assertIsNotNone(found)
+            # Now ensure the match has stats!
+            self.assertNotEqual(jsonutils.loads(found['stats']), {})
+
+            # Now delete the newly-created compute node to ensure the related
+            # compute node stats are wiped in a cascaded fashion
+            db.compute_node_delete(self.ctxt, node['id'])
+
+            # Clean up the service
+            db.service_destroy(self.ctxt, service['id'])
+
+    def test_compute_node_get_all_mult_compute_nodes_one_service_entry(self):
+        service_data = self.service_dict.copy()
+        service_data['host'] = 'host2'
+        service = db.service_create(self.ctxt, service_data)
+
+        existing_node = dict(self.item.iteritems())
+        existing_node['service'] = dict(self.service.iteritems())
+        expected = [existing_node]
+
+        for name in ['bm_node1', 'bm_node2']:
+            compute_node_data = self.compute_node_dict.copy()
+            compute_node_data['service_id'] = service['id']
+            compute_node_data['stats'] = jsonutils.dumps(self.stats)
+            compute_node_data['hypervisor_hostname'] = 'bm_node_1'
+            node = db.compute_node_create(self.ctxt, compute_node_data)
+
+            node = dict(node.iteritems())
+            node['service'] = dict(service.iteritems())
+
+            expected.append(node)
+
+        result = sorted(db.compute_node_get_all(self.ctxt, False),
+                        key=lambda n: n['hypervisor_hostname'])
+
+        self._assertEqualListsOfObjects(expected, result,
+                                        ignored_keys=['stats'])
 
     def test_compute_node_get(self):
         compute_node_id = self.item['id']
         node = db.compute_node_get(self.ctxt, compute_node_id)
         self._assertEqualObjects(self.compute_node_dict, node,
                         ignored_keys=self._ignored_keys + ['stats', 'service'])
-        new_stats = self._stats_as_dict(node['stats'])
-        self._stats_equal(self.stats, new_stats)
+        new_stats = jsonutils.loads(node['stats'])
+        self.assertEqual(self.stats, new_stats)
 
     def test_compute_node_update(self):
         compute_node_id = self.item['id']
-        stats = self._stats_as_dict(self.item['stats'])
+        stats = jsonutils.loads(self.item['stats'])
         # change some values:
         stats['num_instances'] = 8
         stats['num_tribbles'] = 1
         values = {
             'vcpus': 4,
-            'stats': stats,
+            'stats': jsonutils.dumps(stats),
         }
         item_updated = db.compute_node_update(self.ctxt, compute_node_id,
                                               values)
         self.assertEqual(4, item_updated['vcpus'])
-        new_stats = self._stats_as_dict(item_updated['stats'])
-        self._stats_equal(stats, new_stats)
+        new_stats = jsonutils.loads(item_updated['stats'])
+        self.assertEqual(stats, new_stats)
 
     def test_compute_node_delete(self):
         compute_node_id = self.item['id']
@@ -5111,7 +5649,7 @@ class ComputeNodeTestCase(test.TestCase, ModelsObjectComparatorMixin):
             service = db.service_create(self.ctxt, new_service)
             self.compute_node_dict['service_id'] = service['id']
             self.compute_node_dict['hypervisor_hostname'] = 'testhost' + str(i)
-            self.compute_node_dict['stats'] = self.stats
+            self.compute_node_dict['stats'] = jsonutils.dumps(self.stats)
             node = db.compute_node_create(self.ctxt, self.compute_node_dict)
             nodes_created.append(node)
         nodes = db.compute_node_search_by_hypervisor(self.ctxt, 'host')
@@ -5147,39 +5685,6 @@ class ComputeNodeTestCase(test.TestCase, ModelsObjectComparatorMixin):
                                         {'updated_at': first.updated_at,
                                          'free_ram_mb': '13'})
         self.assertNotEqual(first['updated_at'], second['updated_at'])
-
-    def test_compute_node_stat_unchanged(self):
-        # don't update unchanged stat values:
-        stats = self.item['stats']
-        stats_updated_at = dict([(stat['key'], stat['updated_at'])
-                                  for stat in stats])
-        stats_values = self._stats_as_dict(stats)
-        new_values = {'stats': stats_values}
-        compute_node_id = self.item['id']
-        db.compute_node_update(self.ctxt, compute_node_id, new_values)
-        updated_node = db.compute_node_get(self.ctxt, compute_node_id)
-        updated_stats = updated_node['stats']
-        for stat in updated_stats:
-            self.assertEqual(stat['updated_at'], stats_updated_at[stat['key']])
-
-    def test_compute_node_stat_prune(self):
-        for stat in self.item['stats']:
-            if stat['key'] == 'num_instances':
-                num_instance_stat = stat
-                break
-
-        values = {
-            'stats': dict(num_instances=1)
-        }
-        db.compute_node_update(self.ctxt, self.item['id'], values,
-                               prune_stats=True)
-        item_updated = db.compute_node_get_all(self.ctxt)[0]
-        self.assertEqual(1, len(item_updated['stats']))
-
-        stat = item_updated['stats'][0]
-        self.assertEqual(num_instance_stat['id'], stat['id'])
-        self.assertEqual(num_instance_stat['key'], stat['key'])
-        self.assertEqual(1, int(stat['value']))
 
 
 class ProviderFwRuleTestCase(test.TestCase, ModelsObjectComparatorMixin):
@@ -5288,14 +5793,15 @@ class ConsoleTestCase(test.TestCase, ModelsObjectComparatorMixin):
              'compute_host': 'compute_host2',
             },
         ]
-        console_pools = [db.console_pool_create(self.ctxt, val)
+        self.console_pools = [db.console_pool_create(self.ctxt, val)
                          for val in pools_data]
         instance_uuid = uuidutils.generate_uuid()
+        db.instance_create(self.ctxt, {'uuid': instance_uuid})
         self.console_data = [dict([('instance_name', 'name' + str(x)),
                                   ('instance_uuid', instance_uuid),
                                   ('password', 'pass' + str(x)),
                                   ('port', 7878 + x),
-                                  ('pool_id', console_pools[x]['id'])])
+                                  ('pool_id', self.console_pools[x]['id'])])
                              for x in xrange(len(pools_data))]
         self.consoles = [db.console_create(self.ctxt, val)
                          for val in self.console_data]
@@ -5332,6 +5838,15 @@ class ConsoleTestCase(test.TestCase, ModelsObjectComparatorMixin):
         instance_uuid = self.consoles[0]['instance_uuid']
         consoles_get = db.console_get_all_by_instance(self.ctxt, instance_uuid)
         self._assertEqualListsOfObjects(self.consoles, consoles_get)
+
+    def test_console_get_all_by_instance_with_pool(self):
+        instance_uuid = self.consoles[0]['instance_uuid']
+        consoles_get = db.console_get_all_by_instance(self.ctxt, instance_uuid,
+                                                      columns_to_join=['pool'])
+        self._assertEqualListsOfObjects(self.consoles, consoles_get,
+                                        ignored_keys=['pool'])
+        self._assertEqualListsOfObjects([pool for pool in self.console_pools],
+                                        [c['pool'] for c in consoles_get])
 
     def test_console_get_all_by_instance_empty(self):
         consoles_get = db.console_get_all_by_instance(self.ctxt,
@@ -5399,7 +5914,7 @@ class CellTestCase(test.TestCase, ModelsObjectComparatorMixin):
 
     def test_cell_create(self):
         cell = db.cell_create(self.ctxt, self._get_cell_base_values())
-        self.assertFalse(cell['id'] is None)
+        self.assertIsNotNone(cell['id'])
         self._assertEqualObjects(cell, self._get_cell_base_values(),
                                  ignored_keys=self._ignored_keys)
 
@@ -5413,8 +5928,7 @@ class CellTestCase(test.TestCase, ModelsObjectComparatorMixin):
             'is_parent': False,
         }
         test_cellname = self._get_cell_base_values()['name']
-        db.cell_update(self.ctxt, test_cellname, new_values)
-        updated_cell = db.cell_get(self.ctxt, test_cellname)
+        updated_cell = db.cell_update(self.ctxt, test_cellname, new_values)
         self._assertEqualObjects(updated_cell, new_values,
                                  ignored_keys=self._ignored_keys + ['name'])
 
@@ -5495,7 +6009,7 @@ class ConsolePoolTestCase(test.TestCase, ModelsObjectComparatorMixin):
     def test_console_pool_create(self):
         console_pool = db.console_pool_create(
             self.ctxt, self.test_console_pool_1)
-        self.assertTrue(console_pool.get('id') is not None)
+        self.assertIsNotNone(console_pool.get('id'))
         ignored_keys = ['deleted', 'created_at', 'updated_at',
                         'deleted_at', 'id']
         self._assertEqualObjects(
@@ -5591,6 +6105,14 @@ class DnsdomainTestCase(test.TestCase):
         domain = db.dnsdomain_get(self.ctxt, self.domain)
         self.assertIsNone(domain)
 
+    def test_dnsdomain_get_all(self):
+        d_list = ['test.domain.one', 'test.domain.two']
+        db.dnsdomain_register_for_zone(self.ctxt, d_list[0], 'zone')
+        db.dnsdomain_register_for_zone(self.ctxt, d_list[1], 'zone')
+        db_list = db.dnsdomain_get_all(self.ctxt)
+        db_domain_list = [d.domain for d in db_list]
+        self.assertEqual(sorted(d_list), sorted(db_domain_list))
+
 
 class BwUsageTestCase(test.TestCase, ModelsObjectComparatorMixin):
 
@@ -5606,30 +6128,32 @@ class BwUsageTestCase(test.TestCase, ModelsObjectComparatorMixin):
         start_period = now - datetime.timedelta(seconds=10)
         uuid3_refreshed = now - datetime.timedelta(seconds=5)
 
-        expected_bw_usages = [{'uuid': 'fake_uuid1',
-                               'mac': 'fake_mac1',
-                               'start_period': start_period,
-                               'bw_in': 100,
-                               'bw_out': 200,
-                               'last_ctr_in': 12345,
-                               'last_ctr_out': 67890,
-                               'last_refreshed': now},
-                              {'uuid': 'fake_uuid2',
-                               'mac': 'fake_mac2',
-                               'start_period': start_period,
-                               'bw_in': 200,
-                               'bw_out': 300,
-                               'last_ctr_in': 22345,
-                               'last_ctr_out': 77890,
-                               'last_refreshed': now},
-                              {'uuid': 'fake_uuid3',
-                               'mac': 'fake_mac3',
-                               'start_period': start_period,
-                               'bw_in': 400,
-                               'bw_out': 500,
-                               'last_ctr_in': 32345,
-                               'last_ctr_out': 87890,
-                               'last_refreshed': uuid3_refreshed}]
+        expected_bw_usages = {
+            'fake_uuid1': {'uuid': 'fake_uuid1',
+                           'mac': 'fake_mac1',
+                           'start_period': start_period,
+                           'bw_in': 100,
+                           'bw_out': 200,
+                           'last_ctr_in': 12345,
+                           'last_ctr_out': 67890,
+                           'last_refreshed': now},
+            'fake_uuid2': {'uuid': 'fake_uuid2',
+                           'mac': 'fake_mac2',
+                           'start_period': start_period,
+                           'bw_in': 200,
+                           'bw_out': 300,
+                           'last_ctr_in': 22345,
+                           'last_ctr_out': 77890,
+                           'last_refreshed': now},
+            'fake_uuid3': {'uuid': 'fake_uuid3',
+                           'mac': 'fake_mac3',
+                           'start_period': start_period,
+                           'bw_in': 400,
+                           'bw_out': 500,
+                           'last_ctr_in': 32345,
+                           'last_ctr_out': 87890,
+                           'last_refreshed': uuid3_refreshed}
+        }
 
         bw_usages = db.bw_usage_get_by_uuids(self.ctxt,
                 ['fake_uuid1', 'fake_uuid2'], start_period)
@@ -5656,8 +6180,8 @@ class BwUsageTestCase(test.TestCase, ModelsObjectComparatorMixin):
         bw_usages = db.bw_usage_get_by_uuids(self.ctxt,
                 ['fake_uuid1', 'fake_uuid2', 'fake_uuid3'], start_period)
         self.assertEqual(len(bw_usages), 3)
-        for i, expected in enumerate(expected_bw_usages):
-            self._assertEqualObjects(bw_usages[i], expected,
+        for usage in bw_usages:
+            self._assertEqualObjects(expected_bw_usages[usage['uuid']], usage,
                                      ignored_keys=self._ignored_keys)
 
     def test_bw_usage_get(self):
@@ -5698,7 +6222,7 @@ class Ec2TestCase(test.TestCase):
             try:
                 method(self.ctxt, value)
             except exception.NotFound as exc:
-                self.assertTrue(unicode(value) in unicode(exc))
+                self.assertIn(unicode(value), unicode(exc))
 
         check_exc_format(db.get_ec2_volume_id_by_uuid, 'fake')
         check_exc_format(db.get_volume_uuid_by_ec2_id, 123456)
@@ -5837,6 +6361,12 @@ class ArchiveTestCase(test.TestCase):
         metadata = MetaData(bind=self.engine)
         metadata.reflect()
         for table_name in metadata.tables:
+            # NOTE(rpodolyaka): migration 209 introduced a few new tables,
+            #                   which don't have shadow tables and it's
+            #                   completely OK, so we should skip them here
+            if table_name.startswith("dump_"):
+                continue
+
             if table_name.startswith("shadow_"):
                 self.assertIn(table_name[7:], metadata.tables)
                 continue
@@ -5901,9 +6431,7 @@ class ArchiveTestCase(test.TestCase):
                 self.uuid_tablenames_to_cleanup.add(tablename)
 
     def _test_archive_deleted_rows_for_one_uuid_table(self, tablename):
-        """
-        :returns: 0 on success, 1 if no uuid column, 2 if insert failed
-        """
+        """:returns: 0 on success, 1 if no uuid column, 2 if insert failed."""
         main_table = db_utils.get_table(self.engine, tablename)
         if not hasattr(main_table.c, "uuid"):
             # Not a uuid table, so skip it.
@@ -5965,7 +6493,7 @@ class ArchiveTestCase(test.TestCase):
         self.conn.execute(ins_stmt)
         update_statement = self.dns_domains.update().\
                            where(self.dns_domains.c.domain == uuidstr0).\
-                           values(deleted=1)
+                           values(deleted=True)
         self.conn.execute(update_statement)
         qdd = select([self.dns_domains], self.dns_domains.c.domain ==
                                             uuidstr0)
@@ -6136,7 +6664,7 @@ class InstanceGroupDBApiTestCase(test.TestCase, ModelsObjectComparatorMixin):
         db.instance_group_update(self.context, result1['uuid'],
                                  values)
         result2 = db.instance_group_get(self.context, result1['uuid'])
-        self.assertEquals(result1['uuid'], result2['uuid'])
+        self.assertEqual(result1['uuid'], result2['uuid'])
         ignored_keys = ['id', 'uuid', 'deleted', 'deleted_at', 'updated_at',
                         'created_at']
         self._assertEqualObjects(result2, values, ignored_keys)
@@ -6146,15 +6674,28 @@ class InstanceGroupDBApiTestCase(test.TestCase, ModelsObjectComparatorMixin):
         result = self._create_instance_group(self.context, values)
         db.instance_group_delete(self.context, result['uuid'])
         self.assertRaises(exception.InstanceGroupNotFound,
-                          db.instance_group_get, self.context, result['uuid'])
+                          db.instance_group_delete, self.context,
+                          result['uuid'])
+
+    def test_instance_group_get_nonexistent(self):
+        self.assertRaises(exception.InstanceGroupNotFound,
+                          db.instance_group_get,
+                          self.context,
+                          'nonexistent')
+
+    def test_instance_group_delete_nonexistent(self):
+        self.assertRaises(exception.InstanceGroupNotFound,
+                          db.instance_group_delete,
+                          self.context,
+                          'nonexistent')
 
     def test_instance_group_get_all(self):
         groups = db.instance_group_get_all(self.context)
-        self.assertEquals(0, len(groups))
+        self.assertEqual(0, len(groups))
         value = self._get_default_values()
         result1 = self._create_instance_group(self.context, value)
         groups = db.instance_group_get_all(self.context)
-        self.assertEquals(1, len(groups))
+        self.assertEqual(1, len(groups))
         value = self._get_default_values()
         result2 = self._create_instance_group(self.context, value)
         groups = db.instance_group_get_all(self.context)
@@ -6164,12 +6705,12 @@ class InstanceGroupDBApiTestCase(test.TestCase, ModelsObjectComparatorMixin):
     def test_instance_group_get_all_by_project_id(self):
         groups = db.instance_group_get_all_by_project_id(self.context,
                                                          'invalid_project_id')
-        self.assertEquals(0, len(groups))
+        self.assertEqual(0, len(groups))
         values = self._get_default_values()
         result1 = self._create_instance_group(self.context, values)
         groups = db.instance_group_get_all_by_project_id(self.context,
                                                          'fake_project')
-        self.assertEquals(1, len(groups))
+        self.assertEqual(1, len(groups))
         values = self._get_default_values()
         values['project_id'] = 'new_project_id'
         result2 = self._create_instance_group(self.context, values)
@@ -6195,7 +6736,7 @@ class InstanceGroupDBApiTestCase(test.TestCase, ModelsObjectComparatorMixin):
         values['name'] = 'new_fake_name'
         db.instance_group_update(self.context, id, values)
         result = db.instance_group_get(self.context, id)
-        self.assertEquals(result['name'], 'new_fake_name')
+        self.assertEqual(result['name'], 'new_fake_name')
         # update metadata
         values = self._get_default_values()
         metadataInput = {'key11': 'value1',
@@ -6282,10 +6823,10 @@ class InstanceGroupMetadataDBApiTestCase(InstanceGroupDBApiTestCase):
         self._assertEqualObjects(metadata, metadata3)
         db.instance_group_metadata_delete(self.context, id, 'key1')
         metadata = db.instance_group_metadata_get(self.context, id)
-        self.assertTrue('key1' not in metadata)
+        self.assertNotIn('key1', metadata)
         db.instance_group_metadata_delete(self.context, id, 'key2')
         metadata = db.instance_group_metadata_get(self.context, id)
-        self.assertTrue('key2' not in metadata)
+        self.assertNotIn('key2', metadata)
 
     def test_instance_group_metadata_invalid_ids(self):
         values = self._get_default_values()
@@ -6323,7 +6864,7 @@ class InstanceGroupMembersDBApiTestCase(InstanceGroupDBApiTestCase):
         result = self._create_instance_group(self.context, values)
         id = result['uuid']
         members = db.instance_group_members_get(self.context, id)
-        self.assertEquals(members, [])
+        self.assertEqual(members, [])
         members2 = ['instance_id1', 'instance_id2']
         db.instance_group_members_add(self.context, id, members2)
         members = db.instance_group_members_get(self.context, id)
@@ -6394,7 +6935,7 @@ class InstanceGroupPoliciesDBApiTestCase(InstanceGroupDBApiTestCase):
         result = self._create_instance_group(self.context, values)
         id = result['uuid']
         policies = db.instance_group_policies_get(self.context, id)
-        self.assertEquals(policies, [])
+        self.assertEqual(policies, [])
         policies2 = ['policy1', 'policy2']
         db.instance_group_policies_add(self.context, id, policies2)
         policies = db.instance_group_policies_get(self.context, id)
@@ -6444,3 +6985,188 @@ class InstanceGroupPoliciesDBApiTestCase(InstanceGroupDBApiTestCase):
         self.assertRaises(exception.InstanceGroupPolicyNotFound,
                           db.instance_group_policy_delete,
                           self.context, id, 'invalid_policy')
+
+
+class PciDeviceDBApiTestCase(test.TestCase, ModelsObjectComparatorMixin):
+    def setUp(self):
+        super(PciDeviceDBApiTestCase, self).setUp()
+        self.user_id = 'fake_user'
+        self.project_id = 'fake_project'
+        self.context = context.RequestContext(self.user_id, self.project_id)
+        self.admin_context = context.get_admin_context()
+        self.ignored_keys = ['id', 'deleted', 'deleted_at', 'updated_at',
+                             'created_at']
+
+    def _get_fake_pci_devs(self):
+        return {'id': 3353,
+                'compute_node_id': 1,
+                'address': '0000:0f:08.7',
+                'vendor_id': '8086',
+                'product_id': '1520',
+                'dev_type': 'type-VF',
+                'dev_id': 'pci_0000:0f:08.7',
+                'extra_info': None,
+                'label': 'label_8086_1520',
+                'status': 'available',
+                'instance_uuid': '00000000-0000-0000-0000-000000000010',
+                }, {'id': 3356,
+                'compute_node_id': 1,
+                'address': '0000:0f:03.7',
+                'vendor_id': '8083',
+                'product_id': '1523',
+                'dev_type': 'type-VF',
+                'dev_id': 'pci_0000:0f:08.7',
+                'extra_info': None,
+                'label': 'label_8086_1520',
+                'status': 'available',
+                'instance_uuid': '00000000-0000-0000-0000-000000000010',
+                }
+
+    def _create_fake_pci_devs(self):
+        v1, v2 = self._get_fake_pci_devs()
+        db.pci_device_update(self.admin_context, v1['compute_node_id'],
+                             v1['address'], v1)
+        db.pci_device_update(self.admin_context, v2['compute_node_id'],
+                             v2['address'], v2)
+        return (v1, v2)
+
+    def test_pci_device_get_by_addr(self):
+        v1, v2 = self._create_fake_pci_devs()
+        result = db.pci_device_get_by_addr(self.admin_context, 1,
+                                           '0000:0f:08.7')
+        self._assertEqualObjects(v1, result, self.ignored_keys)
+
+    def test_pci_device_get_by_addr_not_found(self):
+        self._create_fake_pci_devs()
+        self.assertRaises(exception.PciDeviceNotFound,
+                          db.pci_device_get_by_addr, self.admin_context,
+                          1, '0000:0f:08:09')
+
+    def test_pci_device_get_by_addr_low_priv(self):
+        self._create_fake_pci_devs()
+        self.assertRaises(exception.AdminRequired,
+                          db.pci_device_get_by_addr,
+                          self.context, 1, '0000:0f:08.7')
+
+    def test_pci_device_get_by_id(self):
+        v1, v2 = self._create_fake_pci_devs()
+        result = db.pci_device_get_by_id(self.admin_context, 3353)
+        ignored_keys = ['id', 'deleted', 'deleted_at', 'updated_at',
+                        'created_at']
+        self._assertEqualObjects(v1, result, self.ignored_keys)
+
+    def test_pci_device_get_by_id_not_found(self):
+        self._create_fake_pci_devs()
+        self.assertRaises(exception.PciDeviceNotFoundById,
+                          db.pci_device_get_by_id,
+                          self.admin_context, 3354)
+
+    def test_pci_device_get_by_id_low_priv(self):
+        self._create_fake_pci_devs()
+        self.assertRaises(exception.AdminRequired,
+                          db.pci_device_get_by_id,
+                          self.context, 3553)
+
+    def test_pci_device_get_all_by_node(self):
+        v1, v2 = self._create_fake_pci_devs()
+        results = db.pci_device_get_all_by_node(self.admin_context, 1)
+        self._assertEqualListsOfObjects(results, [v1, v2], self.ignored_keys)
+
+    def test_pci_device_get_all_by_node_empty(self):
+        v1, v2 = self._get_fake_pci_devs()
+        results = db.pci_device_get_all_by_node(self.admin_context, 9)
+        self.assertEqual(len(results), 0)
+
+    def test_pci_device_get_all_by_node_low_priv(self):
+        self._create_fake_pci_devs()
+        self.assertRaises(exception.AdminRequired,
+                          db.pci_device_get_all_by_node,
+                          self.context, 1)
+
+    def test_pci_device_get_by_instance_uuid(self):
+        v1, v2 = self._get_fake_pci_devs()
+        v1['status'] = 'allocated'
+        v2['status'] = 'allocated'
+        db.pci_device_update(self.admin_context, v1['compute_node_id'],
+                             v1['address'], v1)
+        db.pci_device_update(self.admin_context, v2['compute_node_id'],
+                             v2['address'], v2)
+        results = db.pci_device_get_all_by_instance_uuid(
+            self.context,
+            '00000000-0000-0000-0000-000000000010')
+        self._assertEqualListsOfObjects(results, [v1, v2], self.ignored_keys)
+
+    def test_pci_device_get_by_instance_uuid_check_status(self):
+        v1, v2 = self._get_fake_pci_devs()
+        v1['status'] = 'allocated'
+        v2['status'] = 'claimed'
+        db.pci_device_update(self.admin_context, v1['compute_node_id'],
+                             v1['address'], v1)
+        db.pci_device_update(self.admin_context, v2['compute_node_id'],
+                             v2['address'], v2)
+        results = db.pci_device_get_all_by_instance_uuid(
+            self.context,
+            '00000000-0000-0000-0000-000000000010')
+        self._assertEqualListsOfObjects(results, [v1], self.ignored_keys)
+
+    def test_pci_device_update(self):
+        v1, v2 = self._get_fake_pci_devs()
+        v1['status'] = 'allocated'
+        db.pci_device_update(self.admin_context, v1['compute_node_id'],
+                             v1['address'], v1)
+        result = db.pci_device_get_by_addr(
+            self.admin_context, 1, '0000:0f:08.7')
+        self._assertEqualObjects(v1, result, self.ignored_keys)
+
+        v1['status'] = 'claimed'
+        db.pci_device_update(self.admin_context, v1['compute_node_id'],
+                             v1['address'], v1)
+        result = db.pci_device_get_by_addr(
+            self.admin_context, 1, '0000:0f:08.7')
+        self._assertEqualObjects(v1, result, self.ignored_keys)
+
+    def test_pci_device_update_low_priv(self):
+        v1, v2 = self._get_fake_pci_devs()
+        self.assertRaises(exception.AdminRequired,
+                          db.pci_device_update, self.context,
+                          v1['compute_node_id'], v1['address'], v1)
+
+    def test_pci_device_destroy(self):
+        v1, v2 = self._create_fake_pci_devs()
+        results = db.pci_device_get_all_by_node(self.admin_context, 1)
+        self._assertEqualListsOfObjects(results, [v1, v2], self.ignored_keys)
+        db.pci_device_destroy(self.admin_context, v1['compute_node_id'],
+                              v1['address'])
+        results = db.pci_device_get_all_by_node(self.admin_context, 1)
+        self._assertEqualListsOfObjects(results, [v2], self.ignored_keys)
+
+    def test_pci_device_destroy_exception(self):
+        v1, v2 = self._get_fake_pci_devs()
+        db.pci_device_update(self.admin_context, v1['compute_node_id'],
+                             v1['address'], v1)
+        results = db.pci_device_get_all_by_node(self.admin_context, 1)
+        self._assertEqualListsOfObjects(results, [v1], self.ignored_keys)
+        self.assertRaises(exception.PciDeviceNotFound,
+                          db.pci_device_destroy,
+                          self.admin_context,
+                          v2['compute_node_id'],
+                          v2['address'])
+
+
+class RetryOnDeadlockTestCase(test.TestCase):
+    def test_without_deadlock(self):
+        @sqlalchemy_api._retry_on_deadlock
+        def call_api(*args, **kwargs):
+            return True
+        self.assertTrue(call_api())
+
+    def test_raise_deadlock(self):
+        self.attempts = 2
+
+        @sqlalchemy_api._retry_on_deadlock
+        def call_api(*args, **kwargs):
+            while self.attempts:
+                self.attempts = self.attempts - 1
+                raise db_exc.DBDeadlock("fake exception")
+            return True
+        self.assertTrue(call_api())

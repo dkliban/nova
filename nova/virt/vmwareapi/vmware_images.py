@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 VMware, Inc.
 # Copyright (c) 2011 Citrix Systems, Inc.
 # Copyright 2011 OpenStack Foundation
@@ -18,6 +16,8 @@
 """
 Utility functions for Image transfer.
 """
+
+import os
 
 from nova import exception
 from nova.image import glance
@@ -88,6 +88,31 @@ def start_transfer(context, read_file_handle, data_size,
             write_file_handle.close()
 
 
+def upload_iso_to_datastore(iso_path, instance, **kwargs):
+    LOG.debug(_("Uploading iso %s to datastore") % iso_path,
+              instance=instance)
+    with open(iso_path, 'r') as iso_file:
+        write_file_handle = read_write_util.VMwareHTTPWriteFile(
+            kwargs.get("host"),
+            kwargs.get("data_center_name"),
+            kwargs.get("datastore_name"),
+            kwargs.get("cookies"),
+            kwargs.get("file_path"),
+            os.fstat(iso_file.fileno()).st_size)
+
+        LOG.debug(_("Uploading iso of size : %s ") %
+                  os.fstat(iso_file.fileno()).st_size)
+        block_size = 0x10000
+        data = iso_file.read(block_size)
+        while len(data) > 0:
+            write_file_handle.write(data)
+            data = iso_file.read(block_size)
+        write_file_handle.close()
+
+    LOG.debug(_("Uploaded iso %s to datastore") % iso_path,
+              instance=instance)
+
+
 def fetch_image(context, image, instance, **kwargs):
     """Download image from the glance image server."""
     LOG.debug(_("Downloading image %s from glance image server") % image,
@@ -122,15 +147,19 @@ def upload_image(context, image, instance, **kwargs):
                                 kwargs.get("file_path"))
     file_size = read_file_handle.get_size()
     (image_service, image_id) = glance.get_remote_image_service(context, image)
+    metadata = image_service.show(context, image_id)
+
     # The properties and other fields that we need to set for the image.
     image_metadata = {"disk_format": "vmdk",
                       "is_public": "false",
-                      "name": kwargs.get("snapshot_name"),
+                      "name": metadata['name'],
                       "status": "active",
                       "container_format": "bare",
                       "size": file_size,
                       "properties": {"vmware_adaptertype":
                                             kwargs.get("adapter_type"),
+                                     "vmware_disktype":
+                                            kwargs.get("disk_type"),
                                      "vmware_ostype": kwargs.get("os_type"),
                                      "vmware_image_version":
                                             kwargs.get("image_version"),
@@ -143,8 +172,7 @@ def upload_image(context, image, instance, **kwargs):
 
 
 def get_vmdk_size_and_properties(context, image, instance):
-    """
-    Get size of the vmdk file that is to be downloaded for attach in spawn.
+    """Get size of the vmdk file that is to be downloaded for attach in spawn.
     Need this to create the dummy virtual disk for the meta-data file. The
     geometry of the disk created depends on the size.
     """

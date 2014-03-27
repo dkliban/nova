@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2010 OpenStack Foundation
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
@@ -22,6 +20,7 @@ Scheduler Service
 """
 
 from oslo.config import cfg
+from oslo import messaging
 
 from nova.compute import rpcapi as compute_rpcapi
 from nova.compute import task_states
@@ -29,27 +28,34 @@ from nova.compute import utils as compute_utils
 from nova.compute import vm_states
 from nova.conductor import api as conductor_api
 from nova.conductor.tasks import live_migrate
-import nova.context
 from nova import exception
 from nova import manager
+from nova.objects import instance as instance_obj
 from nova.openstack.common import excutils
 from nova.openstack.common import importutils
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
 from nova.openstack.common import periodic_task
-from nova.openstack.common.rpc import common as rpc_common
 from nova import quota
 from nova.scheduler import utils as scheduler_utils
 
 
 LOG = logging.getLogger(__name__)
 
-scheduler_driver_opt = cfg.StrOpt('scheduler_driver',
-        default='nova.scheduler.filter_scheduler.FilterScheduler',
-        help='Default driver to use for the scheduler')
-
+scheduler_driver_opts = [
+    cfg.StrOpt('scheduler_driver',
+               default='nova.scheduler.filter_scheduler.FilterScheduler',
+               help='Default driver to use for the scheduler'),
+    cfg.IntOpt('scheduler_driver_task_period',
+               default=60,
+               help='How often (in seconds) to run periodic tasks in '
+                    'the scheduler driver of your choice. '
+                    'Please note this is likely to interact with the value '
+                    'of service_down_time, but exactly how they interact '
+                    'will depend on your choice of scheduler driver.'),
+]
 CONF = cfg.CONF
-CONF.register_opt(scheduler_driver_opt)
+CONF.register_opts(scheduler_driver_opts)
 
 QUOTAS = quota.QUOTAS
 
@@ -57,7 +63,7 @@ QUOTAS = quota.QUOTAS
 class SchedulerManager(manager.Manager):
     """Chooses a host to run instances on."""
 
-    RPC_API_VERSION = '2.8'
+    target = messaging.Target(version='2.9')
 
     def __init__(self, scheduler_driver=None, *args, **kwargs):
         if not scheduler_driver:
@@ -66,38 +72,21 @@ class SchedulerManager(manager.Manager):
         self.compute_rpcapi = compute_rpcapi.ComputeAPI()
         super(SchedulerManager, self).__init__(service_name='scheduler',
                                                *args, **kwargs)
-
-    def post_start_hook(self):
-        """After we start up and can receive messages via RPC, tell all
-        compute nodes to send us their capabilities.
-        """
-        ctxt = nova.context.get_admin_context()
-        compute_rpcapi.ComputeAPI().publish_service_capabilities(ctxt)
-
-    def update_service_capabilities(self, context, service_name,
-                                    host, capabilities):
-        """Process a capability update from a service node."""
-        if not isinstance(capabilities, list):
-            capabilities = [capabilities]
-        for capability in capabilities:
-            if capability is None:
-                capability = {}
-            self.driver.update_service_capabilities(service_name, host,
-                                                    capability)
+        self.additional_endpoints.append(_SchedulerManagerV3Proxy(self))
 
     def create_volume(self, context, volume_id, snapshot_id,
                       reservations=None, image_id=None):
         #function removed in RPC API 2.3
         pass
 
-    @rpc_common.client_exceptions(exception.NoValidHost,
-                                  exception.ComputeServiceUnavailable,
-                                  exception.InvalidHypervisorType,
-                                  exception.UnableToMigrateToSelf,
-                                  exception.DestinationHypervisorTooOld,
-                                  exception.InvalidLocalStorage,
-                                  exception.InvalidSharedStorage,
-                                  exception.MigrationPreCheckError)
+    @messaging.expected_exceptions(exception.NoValidHost,
+                                   exception.ComputeServiceUnavailable,
+                                   exception.InvalidHypervisorType,
+                                   exception.UnableToMigrateToSelf,
+                                   exception.DestinationHypervisorTooOld,
+                                   exception.InvalidLocalStorage,
+                                   exception.InvalidSharedStorage,
+                                   exception.MigrationPreCheckError)
     def live_migration(self, context, instance, dest,
                        block_migration, disk_over_commit):
         try:
@@ -132,13 +121,12 @@ class SchedulerManager(manager.Manager):
     def _schedule_live_migration(self, context, instance, dest,
             block_migration, disk_over_commit):
         task = live_migrate.LiveMigrationTask(context, instance,
-                    dest, block_migration, disk_over_commit,
-                    self.driver.select_hosts)
+                    dest, block_migration, disk_over_commit)
         return task.execute()
 
     def run_instance(self, context, request_spec, admin_password,
             injected_files, requested_networks, is_first_time,
-            filter_properties):
+            filter_properties, legacy_bdm_in_spec=True):
         """Tries to call schedule_run_instance on the driver.
         Sets instance vm_state to ERROR on exceptions
         """
@@ -148,7 +136,8 @@ class SchedulerManager(manager.Manager):
             try:
                 return self.driver.schedule_run_instance(context,
                         request_spec, admin_password, injected_files,
-                        requested_networks, is_first_time, filter_properties)
+                        requested_networks, is_first_time, filter_properties,
+                        legacy_bdm_in_spec)
 
             except exception.NoValidHost as ex:
                 # don't re-raise
@@ -163,8 +152,6 @@ class SchedulerManager(manager.Manager):
                                                   'task_state': None},
                                                   context, ex, request_spec)
 
-    # NOTE(timello): This method is deprecated and its functionality has
-    # been moved to conductor. This should be removed in RPC_API_VERSION 3.0.
     def prep_resize(self, context, image, request_spec, filter_properties,
                     instance, instance_type, reservations):
         """Tries to call schedule_prep_resize on the driver.
@@ -187,8 +174,13 @@ class SchedulerManager(manager.Manager):
                 filter_properties.pop('context', None)
 
                 (host, node) = (host_state['host'], host_state['nodename'])
+                attrs = ['metadata', 'system_metadata', 'info_cache',
+                         'security_groups']
+                inst_obj = instance_obj.Instance._from_db_object(
+                        context, instance_obj.Instance(), instance,
+                        expected_attrs=attrs)
                 self.compute_rpcapi.prep_resize(
-                    context, image, instance, instance_type, host,
+                    context, image, inst_obj, instance_type, host,
                     reservations, request_spec=request_spec,
                     filter_properties=filter_properties, node=node)
 
@@ -273,21 +265,28 @@ class SchedulerManager(manager.Manager):
     def _expire_reservations(self, context):
         QUOTAS.expire(context)
 
+    @periodic_task.periodic_task(spacing=CONF.scheduler_driver_task_period,
+                                 run_immediately=True)
+    def _run_periodic_tasks(self, context):
+        self.driver.run_periodic_tasks(context)
+
     # NOTE(russellb) This method can be removed in 3.0 of this API.  It is
     # deprecated in favor of the method in the base API.
     def get_backdoor_port(self, context):
         return self.backdoor_port
 
-    @rpc_common.client_exceptions(exception.NoValidHost)
+    # NOTE(hanlind): This method can be removed in v4.0 of the RPC API.
+    @messaging.expected_exceptions(exception.NoValidHost)
     def select_hosts(self, context, request_spec, filter_properties):
         """Returns host(s) best suited for this request_spec
         and filter_properties.
         """
-        hosts = self.driver.select_hosts(context, request_spec,
+        dests = self.driver.select_destinations(context, request_spec,
             filter_properties)
+        hosts = [dest['host'] for dest in dests]
         return jsonutils.to_primitive(hosts)
 
-    @rpc_common.client_exceptions(exception.NoValidHost)
+    @messaging.expected_exceptions(exception.NoValidHost)
     def select_destinations(self, context, request_spec, filter_properties):
         """Returns destinations(s) best suited for this request_spec and
         filter_properties.
@@ -298,3 +297,32 @@ class SchedulerManager(manager.Manager):
         dests = self.driver.select_destinations(context, request_spec,
             filter_properties)
         return jsonutils.to_primitive(dests)
+
+
+class _SchedulerManagerV3Proxy(object):
+
+    target = messaging.Target(version='3.0')
+
+    def __init__(self, manager):
+        self.manager = manager
+
+    def select_destinations(self, ctxt, request_spec, filter_properties):
+        return self.manager.select_destinations(ctxt,
+                request_spec=request_spec, filter_properties=filter_properties)
+
+    def run_instance(self, ctxt, request_spec, admin_password,
+            injected_files, requested_networks, is_first_time,
+            filter_properties, legacy_bdm_in_spec):
+        return self.manager.run_instance(ctxt, request_spec=request_spec,
+                admin_password=admin_password, injected_files=injected_files,
+                requested_networks=requested_networks,
+                is_first_time=is_first_time,
+                filter_properties=filter_properties,
+                legacy_bdm_in_spec=legacy_bdm_in_spec)
+
+    def prep_resize(self, ctxt, instance, instance_type, image,
+            request_spec, filter_properties, reservations):
+        return self.manager.prep_resize(ctxt, instance=instance,
+                instance_type=instance_type, image=image,
+                request_spec=request_spec, filter_properties=filter_properties,
+                reservations=reservations)

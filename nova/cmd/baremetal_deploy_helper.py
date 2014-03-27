@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 NTT DOCOMO, INC.
 # All Rights Reserved.
 #
@@ -36,13 +34,19 @@ from nova.openstack.common import excutils
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova.openstack.common import processutils
+from nova.openstack.common import units
 from nova import utils
 from nova.virt.baremetal import baremetal_states
 from nova.virt.baremetal import db
+from nova.virt.disk import api as disk
 
 
 QUEUE = Queue.Queue()
 LOG = logging.getLogger(__name__)
+
+
+class BareMetalDeployException(Exception):
+    pass
 
 
 # All functions are called from deploy() directly or indirectly.
@@ -82,14 +86,19 @@ def logout_iscsi(portal_address, portal_port, target_iqn):
                   check_exit_code=[0])
 
 
-def make_partitions(dev, root_mb, swap_mb):
-    """Create partitions for root and swap on a disk device."""
+def make_partitions(dev, root_mb, swap_mb, ephemeral_mb):
+    """Create partitions for root, ephemeral and swap on a disk device."""
     # Lead in with 1MB to allow room for the partition table itself, otherwise
     # the way sfdisk adjusts doesn't shift the partition up to compensate, and
     # we lose the space.
     # http://bazaar.launchpad.net/~ubuntu-branches/ubuntu/raring/util-linux/
     # raring/view/head:/fdisk/sfdisk.c#L1940
-    stdin_command = ('1,%d,83;\n,%d,82;\n0,0;\n0,0;\n' % (root_mb, swap_mb))
+    if ephemeral_mb:
+        stdin_command = ('1,%d,83;\n,%d,82;\n,%d,83;\n0,0;\n' %
+                (ephemeral_mb, swap_mb, root_mb))
+    else:
+        stdin_command = ('1,%d,83;\n,%d,82;\n0,0;\n0,0;\n' %
+                (root_mb, swap_mb))
     utils.execute('sfdisk', '-uM', dev, process_input=stdin_command,
             run_as_root=True,
             attempts=3,
@@ -122,6 +131,11 @@ def mkswap(dev, label='swap1'):
                   dev,
                   run_as_root=True,
                   check_exit_code=[0])
+
+
+def mkfs_ephemeral(dev, label="ephemeral0"):
+    #TODO(jogo) support non-default mkfs options as well
+    disk.mkfs("default", label, dev)
 
 
 def block_uuid(dev):
@@ -165,30 +179,46 @@ def get_dev(address, port, iqn, lun):
 
 def get_image_mb(image_path):
     """Get size of an image in Megabyte."""
-    mb = 1024 * 1024
+    mb = units.Mi
     image_byte = os.path.getsize(image_path)
     # round up size to MB
     image_mb = int((image_byte + mb - 1) / mb)
     return image_mb
 
 
-def work_on_disk(dev, root_mb, swap_mb, image_path):
-    """Creates partitions and write an image to the root partition."""
-    root_part = "%s-part1" % dev
-    swap_part = "%s-part2" % dev
+def work_on_disk(dev, root_mb, swap_mb, ephemeral_mb, image_path,
+                 preserve_ephemeral):
+    """Creates partitions and write an image to the root partition.
+
+    :param preserve_ephemeral: If True, no filesystem is written to the
+        ephemeral block device, preserving whatever content it had (if the
+        partition table has not changed).
+    """
+    def raise_exception(msg):
+        LOG.error(msg)
+        raise BareMetalDeployException(msg)
+
+    if ephemeral_mb:
+        ephemeral_part = "%s-part1" % dev
+        swap_part = "%s-part2" % dev
+        root_part = "%s-part3" % dev
+    else:
+        root_part = "%s-part1" % dev
+        swap_part = "%s-part2" % dev
 
     if not is_block_device(dev):
-        LOG.warn(_("parent device '%s' not found"), dev)
-        return
-    make_partitions(dev, root_mb, swap_mb)
+        raise_exception(_("parent device '%s' not found") % dev)
+    make_partitions(dev, root_mb, swap_mb, ephemeral_mb)
     if not is_block_device(root_part):
-        LOG.warn(_("root device '%s' not found"), root_part)
-        return
+        raise_exception(_("root device '%s' not found") % root_part)
     if not is_block_device(swap_part):
-        LOG.warn(_("swap device '%s' not found"), swap_part)
-        return
+        raise_exception(_("swap device '%s' not found") % swap_part)
+    if ephemeral_mb and not is_block_device(ephemeral_part):
+        raise_exception(_("ephemeral device '%s' not found") % ephemeral_part)
     dd(image_path, root_part)
     mkswap(swap_part)
+    if ephemeral_mb and not preserve_ephemeral:
+        mkfs_ephemeral(ephemeral_part)
 
     try:
         root_uuid = block_uuid(root_part)
@@ -199,8 +229,13 @@ def work_on_disk(dev, root_mb, swap_mb, image_path):
 
 
 def deploy(address, port, iqn, lun, image_path, pxe_config_path,
-           root_mb, swap_mb):
-    """All-in-one function to deploy a node."""
+           root_mb, swap_mb, ephemeral_mb, preserve_ephemeral=False):
+    """All-in-one function to deploy a node.
+
+    :param preserve_ephemeral: If True, no filesystem is written to the
+        ephemeral block device, preserving whatever content it had (if the
+        partition table has not changed).
+    """
     dev = get_dev(address, port, iqn, lun)
     image_mb = get_image_mb(image_path)
     if image_mb > root_mb:
@@ -208,13 +243,14 @@ def deploy(address, port, iqn, lun, image_path, pxe_config_path,
     discovery(address, port)
     login_iscsi(address, port, iqn)
     try:
-        root_uuid = work_on_disk(dev, root_mb, swap_mb, image_path)
+        root_uuid = work_on_disk(dev, root_mb, swap_mb, ephemeral_mb,
+                image_path, preserve_ephemeral)
     except processutils.ProcessExecutionError as err:
         with excutils.save_and_reraise_exception():
             # Log output if there was a error
             LOG.error(_("Cmd     : %s"), err.cmd)
-            LOG.error(_("StdOut  : %s"), err.stdout)
-            LOG.error(_("StdErr  : %s"), err.stderr)
+            LOG.error(_("StdOut  : %r"), err.stdout)
+            LOG.error(_("StdErr  : %r"), err.stderr)
     finally:
         logout_iscsi(address, port, iqn)
     switch_pxe_config(pxe_config_path, root_uuid)
@@ -313,6 +349,8 @@ class BareMetalDeploy(object):
                   'pxe_config_path': d['pxe_config_path'],
                   'root_mb': int(d['root_mb']),
                   'swap_mb': int(d['swap_mb']),
+                  'ephemeral_mb': int(d['ephemeral_mb']),
+                  'preserve_ephemeral': d['preserve_ephemeral'],
                  }
         # Restart worker, if needed
         if not self.worker.isAlive():

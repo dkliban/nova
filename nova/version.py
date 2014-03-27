@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #    Copyright 2011 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -15,6 +13,8 @@
 #    under the License.
 
 import pbr.version
+
+from nova.openstack.common.gettextutils import _
 
 NOVA_VENDOR = "OpenStack Foundation"
 NOVA_PRODUCT = "OpenStack Nova"
@@ -62,7 +62,7 @@ def _load_config():
             NOVA_PACKAGE = cfg.get("Nova", "package")
     except Exception as ex:
         LOG = logging.getLogger(__name__)
-        LOG.error("Failed to load %(cfgfile)s: %(ex)s",
+        LOG.error(_("Failed to load %(cfgfile)s: %(ex)s"),
                   {'cfgfile': cfgfile, 'ex': ex})
 
 

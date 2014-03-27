@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -23,7 +21,7 @@ from nova.compute import vm_states
 from nova import test
 
 
-class StatsTestCase(test.TestCase):
+class StatsTestCase(test.NoDBTestCase):
     def setUp(self):
         super(StatsTestCase, self).setUp()
         self.stats = stats.Stats()
@@ -104,8 +102,8 @@ class StatsTestCase(test.TestCase):
         self.assertEqual(2, self.stats.num_os_type("Linux"))
         self.assertEqual(1, self.stats.num_os_type("FreeBSD"))
 
-        self.assertEquals(2, self.stats.num_instances_for_project("1234"))
-        self.assertEquals(1, self.stats.num_instances_for_project("2345"))
+        self.assertEqual(2, self.stats.num_instances_for_project("1234"))
+        self.assertEqual(1, self.stats.num_instances_for_project("2345"))
 
         self.assertEqual(1, self.stats["num_task_None"])
         self.assertEqual(2, self.stats["num_task_" + task_states.SCHEDULING])
@@ -174,8 +172,7 @@ class StatsTestCase(test.TestCase):
         vms = [vm_states.ACTIVE, vm_states.BUILDING, vm_states.PAUSED]
         tasks = [task_states.RESIZE_MIGRATING, task_states.REBUILDING,
                  task_states.RESIZE_PREP, task_states.IMAGE_SNAPSHOT,
-                 task_states.IMAGE_LIVE_SNAPSHOT, task_states.IMAGE_BACKUP,
-                 task_states.RESCUING]
+                 task_states.IMAGE_BACKUP, task_states.RESCUING]
 
         for state in vms:
             self.stats._increment("num_vm_" + state)

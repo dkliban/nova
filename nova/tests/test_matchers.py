@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 Hewlett-Packard Development Company, L.P.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -108,7 +106,7 @@ class TestDictListMatches(testtools.TestCase, helpers.TestMatchersInterface):
          ]
 
 
-class TestDictMatches(testtools.TestCase, helpers.TestMatchersInterface):
+class TestIsSubDictOf(testtools.TestCase, helpers.TestMatchersInterface):
 
     matches_matcher = matchers.IsSubDictOf(
         {'foo': 'bar', 'baz': 'DONTCARE',

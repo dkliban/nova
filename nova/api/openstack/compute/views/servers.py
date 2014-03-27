@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010-2011 OpenStack Foundation
 # Copyright 2011 Piston Cloud Computing, Inc.
 # All Rights Reserved.
@@ -47,7 +45,7 @@ class ViewBuilder(common.ViewBuilder):
     )
 
     _fault_statuses = (
-        "ERROR",
+        "ERROR", "DELETED"
     )
 
     def __init__(self):
@@ -88,7 +86,7 @@ class ViewBuilder(common.ViewBuilder):
             "server": {
                 "id": instance["uuid"],
                 "name": instance["display_name"],
-                "status": self._get_vm_state(instance),
+                "status": self._get_vm_status(instance),
                 "tenant_id": instance.get("project_id") or "",
                 "user_id": instance.get("user_id") or "",
                 "metadata": self._get_metadata(instance),
@@ -105,9 +103,10 @@ class ViewBuilder(common.ViewBuilder):
                                          self._collection_name),
             },
         }
-        _inst_fault = self._get_fault(request, instance)
-        if server["server"]["status"] in self._fault_statuses and _inst_fault:
-            server['server']['fault'] = _inst_fault
+        if server["server"]["status"] in self._fault_statuses:
+            _inst_fault = self._get_fault(request, instance)
+            if _inst_fault:
+                server['server']['fault'] = _inst_fault
 
         if server["server"]["status"] in self._progress_statuses:
             server["server"]["progress"] = instance.get("progress", 0)
@@ -145,7 +144,10 @@ class ViewBuilder(common.ViewBuilder):
             return utils.instance_meta(instance)
 
     @staticmethod
-    def _get_vm_state(instance):
+    def _get_vm_status(instance):
+        # If the instance is deleted the vm and task states don't really matter
+        if instance.get("deleted"):
+            return "DELETED"
         return common.status_from_state(instance.get("vm_state"),
                                         instance.get("task_state"))
 
@@ -198,7 +200,8 @@ class ViewBuilder(common.ViewBuilder):
         }
 
     def _get_fault(self, request, instance):
-        fault = instance.get("fault", None)
+        # This can result in a lazy load of the fault information
+        fault = instance.fault
 
         if not fault:
             return None
@@ -228,16 +231,15 @@ class ViewBuilderV3(ViewBuilder):
         """Initialize view builder."""
         super(ViewBuilderV3, self).__init__()
         self._address_builder = views_addresses.ViewBuilderV3()
+        self._image_builder = views_images.ViewBuilderV3()
 
     def show(self, request, instance):
         """Detailed view of a single instance."""
-        ip_v4 = instance.get('access_ip_v4')
-        ip_v6 = instance.get('access_ip_v6')
         server = {
             "server": {
                 "id": instance["uuid"],
                 "name": instance["display_name"],
-                "status": self._get_vm_state(instance),
+                "status": self._get_vm_status(instance),
                 "tenant_id": instance.get("project_id") or "",
                 "user_id": instance.get("user_id") or "",
                 "metadata": self._get_metadata(instance),
@@ -247,18 +249,20 @@ class ViewBuilderV3(ViewBuilder):
                 "created": timeutils.isotime(instance["created_at"]),
                 "updated": timeutils.isotime(instance["updated_at"]),
                 "addresses": self._get_addresses(request, instance),
-                "access_ip_v4": str(ip_v4) if ip_v4 is not None else '',
-                "access_ip_v6": str(ip_v6) if ip_v6 is not None else '',
                 "links": self._get_links(request,
                                          instance["uuid"],
                                          self._collection_name),
             },
         }
-        _inst_fault = self._get_fault(request, instance)
-        if server["server"]["status"] in self._fault_statuses and _inst_fault:
-            server['server']['fault'] = _inst_fault
+        if server["server"]["status"] in self._fault_statuses:
+            _inst_fault = self._get_fault(request, instance)
+            if _inst_fault:
+                server['server']['fault'] = _inst_fault
 
         if server["server"]["status"] in self._progress_statuses:
             server["server"]["progress"] = instance.get("progress", 0)
 
+        # We should modify the "image" to empty dictionary
+        if not server["server"]["image"]:
+            server["server"]["image"] = {}
         return server

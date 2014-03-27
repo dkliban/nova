@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #    Copyright 2011 OpenStack Foundation
 #    Copyright 2011 Ilya Alekseyev
 #
@@ -26,6 +24,7 @@ from nova import exception
 from nova.openstack.common.gettextutils import _
 from nova import test
 from nova.tests.db import fakes as db_fakes
+from nova.tests.objects import test_network
 
 
 class FixedIpCommandsTestCase(test.TestCase):
@@ -80,7 +79,7 @@ class FloatingIpCommandsTestCase(test.TestCase):
     def test_address_to_hosts(self):
         def assert_loop(result, expected):
             for ip in result:
-                self.assertTrue(str(ip) in expected)
+                self.assertIn(str(ip), expected)
 
         address_to_hosts = self.commands.address_to_hosts
         # /32 and /31
@@ -143,12 +142,14 @@ class NetworkCommandsTestCase(test.TestCase):
         def fake_network_get_by_cidr(context, cidr):
             self.assertTrue(context.to_dict()['is_admin'])
             self.assertEqual(cidr, self.fake_net['cidr'])
-            return db_fakes.FakeModel(self.fake_net)
+            return db_fakes.FakeModel(dict(test_network.fake_network,
+                                           **self.fake_net))
 
         def fake_network_get_by_uuid(context, uuid):
             self.assertTrue(context.to_dict()['is_admin'])
             self.assertEqual(uuid, self.fake_net['uuid'])
-            return db_fakes.FakeModel(self.fake_net)
+            return db_fakes.FakeModel(dict(test_network.fake_network,
+                                           **self.fake_net))
 
         def fake_network_update(context, network_id, values):
             self.assertTrue(context.to_dict()['is_admin'])
@@ -309,7 +310,7 @@ class FlavorCommandsTestCase(test.TestCase):
         actual_specs = db.flavor_extra_specs_get(
                               context.get_admin_context(),
                               self.instance_type_id)
-        self.assertEquals(empty_specs, actual_specs)
+        self.assertEqual(empty_specs, actual_specs)
 
     def test_extra_specs_set_unset(self):
         expected_specs = {'k1': 'v1'}
@@ -320,7 +321,7 @@ class FlavorCommandsTestCase(test.TestCase):
         actual_specs = db.flavor_extra_specs_get(
                               context.get_admin_context(),
                               self.instance_type_flavorid)
-        self.assertEquals(expected_specs, actual_specs)
+        self.assertEqual(expected_specs, actual_specs)
 
         self.unset_key(self.instance_type_name, "k1")
         self._test_extra_specs_empty()
@@ -335,13 +336,13 @@ class FlavorCommandsTestCase(test.TestCase):
         actual_specs = db.flavor_extra_specs_get(
                               context.get_admin_context(),
                               self.instance_type_flavorid)
-        self.assertEquals(expected_specs, actual_specs)
+        self.assertEqual(expected_specs, actual_specs)
 
         self.set_key(self.instance_type_name, "k1", "v2")
         actual_specs = db.flavor_extra_specs_get(
                               context.get_admin_context(),
                               self.instance_type_flavorid)
-        self.assertEquals(updated_specs, actual_specs)
+        self.assertEqual(updated_specs, actual_specs)
 
         self.unset_key(self.instance_type_name, "k1")
 
@@ -356,7 +357,7 @@ class FlavorCommandsTestCase(test.TestCase):
         actual_specs = db.flavor_extra_specs_get(
                               context.get_admin_context(),
                               self.instance_type_flavorid)
-        self.assertEquals(two_items_extra_specs, actual_specs)
+        self.assertEqual(two_items_extra_specs, actual_specs)
 
         self.unset_key(self.instance_type_name, "k1")
         self.unset_key(self.instance_type_name, "k3")
@@ -378,7 +379,7 @@ class ProjectCommandsTestCase(test.TestCase):
         sys.stdout = sys.__stdout__
         result = output.getvalue()
         print_format = "%-36s %-10s" % ('instances', 'unlimited')
-        self.assertEquals((print_format in result), True)
+        self.assertEqual((print_format in result), True)
 
     def test_quota_update_invalid_key(self):
         self.assertEqual(2, self.commands.quota('admin', 'volumes1', '10'))

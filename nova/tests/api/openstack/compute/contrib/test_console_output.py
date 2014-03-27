@@ -52,7 +52,7 @@ def fake_get_not_found(*args, **kwargs):
     raise exception.NotFound()
 
 
-class ConsoleOutputExtensionTest(test.TestCase):
+class ConsoleOutputExtensionTest(test.NoDBTestCase):
 
     def setUp(self):
         super(ConsoleOutputExtensionTest, self).setUp()
@@ -176,3 +176,15 @@ class ConsoleOutputExtensionTest(test.TestCase):
         req.headers["content-type"] = "application/json"
         res = req.get_response(self.app)
         self.assertEqual(res.status_int, 400)
+
+    def test_not_implemented(self):
+        self.stubs.Set(compute_api.API, 'get_console_output',
+                       fakes.fake_not_implemented)
+        body = {'os-getConsoleOutput': {}}
+        req = webob.Request.blank('/v2/fake/servers/1/action')
+        req.method = "POST"
+        req.body = jsonutils.dumps(body)
+        req.headers["content-type"] = "application/json"
+
+        res = req.get_response(self.app)
+        self.assertEqual(res.status_int, 501)

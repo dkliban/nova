@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -95,7 +93,7 @@ class Controller(object):
         return dict(consoles=[_translate_keys(console)
                               for console in consoles])
 
-    def create(self, req, server_id):
+    def create(self, req, server_id, body):
         """Creates a new console."""
         self.console_api.create_console(
                                 req.environ['nova.context'],
@@ -113,7 +111,7 @@ class Controller(object):
             raise exc.HTTPNotFound()
         return _translate_detail_keys(console)
 
-    def update(self, req, server_id, id):
+    def update(self, req, server_id, id, body):
         """You can't update a console."""
         raise exc.HTTPNotImplemented()
 

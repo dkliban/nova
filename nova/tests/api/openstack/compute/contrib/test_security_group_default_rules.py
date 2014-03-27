@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 Metacloud, Inc
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -109,9 +107,9 @@ class TestSecurityGroupDefaultRules(test.TestCase):
         res_dict = self.controller.create(req,
                                           {'security_group_default_rule': sgr})
         security_group_default_rule = res_dict['security_group_default_rule']
-        self.assertNotEquals(security_group_default_rule['id'], 0)
-        self.assertEquals(security_group_default_rule['ip_range']['cidr'],
-                          '0.0.0.0/0')
+        self.assertNotEqual(security_group_default_rule['id'], 0)
+        self.assertEqual(security_group_default_rule['ip_range']['cidr'],
+                         '0.0.0.0/0')
 
     def test_create_security_group_default_rule_with_blank_to_port(self):
         sgr = security_group_default_rule_template(to_port='')
@@ -145,9 +143,9 @@ class TestSecurityGroupDefaultRules(test.TestCase):
         res_dict = self.controller.create(req,
                                           {'security_group_default_rule': sgr})
         security_group_default_rule = res_dict['security_group_default_rule']
-        self.assertNotEquals(security_group_default_rule['id'], 0)
-        self.assertEquals(security_group_default_rule['ip_range']['cidr'],
-                          '0.0.0.0/0')
+        self.assertNotEqual(security_group_default_rule['id'], 0)
+        self.assertEqual(security_group_default_rule['ip_range']['cidr'],
+                         '0.0.0.0/0')
 
     def test_create_security_group_default_rule_non_numerical_to_port(self):
         sgr = security_group_default_rule_template(to_port='invalid')
@@ -260,7 +258,7 @@ class TestSecurityGroupDefaultRules(test.TestCase):
             self.called = True
 
         def return_security_group_default_rule(context, id):
-            self.assertEquals(sgr['id'], id)
+            self.assertEqual(sgr['id'], id)
             return security_group_default_rule_db(sgr)
 
         self.stubs.Set(nova.db, 'security_group_default_rule_destroy',
@@ -417,7 +415,7 @@ class TestSecurityGroupDefaultRuleXMLSerializer(test.TestCase):
             if child_tag == 'ip_range':
                 for gr_child in child:
                     gr_child_tag = self._tag(gr_child)
-                    self.assertTrue(gr_child_tag in raw_rule[child_tag])
+                    self.assertIn(gr_child_tag, raw_rule[child_tag])
                     seen.add('%s/%s' % (child_tag, gr_child_tag))
                     self.assertEqual(gr_child.text,
                                      raw_rule[child_tag][gr_child_tag])

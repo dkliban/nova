@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 IBM Corp.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -57,7 +55,7 @@ class fake_loaded_extension_info(object):
         return {'core1': None, 'core2': None, 'noncore1': None}
 
 
-class ExtensionLoadingTestCase(test.TestCase):
+class ExtensionLoadingTestCase(test.NoDBTestCase):
 
     def _set_v3_core(self, core_extensions):
         openstack.API_V3_CORE_EXTENSIONS = core_extensions
@@ -72,10 +70,10 @@ class ExtensionLoadingTestCase(test.TestCase):
 
     def test_extensions_blacklist(self):
         app = compute.APIRouterV3()
-        self.assertIn('os-fixed-ips', app._loaded_extension_info.extensions)
-        CONF.set_override('extensions_blacklist', ['os-fixed-ips'], 'osapi_v3')
+        self.assertIn('os-hosts', app._loaded_extension_info.extensions)
+        CONF.set_override('extensions_blacklist', ['os-hosts'], 'osapi_v3')
         app = compute.APIRouterV3()
-        self.assertNotIn('os-fixed-ips', app._loaded_extension_info.extensions)
+        self.assertNotIn('os-hosts', app._loaded_extension_info.extensions)
 
     def test_extensions_whitelist_accept(self):
         # NOTE(maurosr): just to avoid to get an exception raised for not
@@ -85,11 +83,11 @@ class ExtensionLoadingTestCase(test.TestCase):
         self.addCleanup(self._set_v3_core, v3_core)
 
         app = compute.APIRouterV3()
-        self.assertIn('os-fixed-ips', app._loaded_extension_info.extensions)
-        CONF.set_override('extensions_whitelist', ['servers', 'os-fixed-ips'],
+        self.assertIn('os-hosts', app._loaded_extension_info.extensions)
+        CONF.set_override('extensions_whitelist', ['servers', 'os-hosts'],
                           'osapi_v3')
         app = compute.APIRouterV3()
-        self.assertIn('os-fixed-ips', app._loaded_extension_info.extensions)
+        self.assertIn('os-hosts', app._loaded_extension_info.extensions)
 
     def test_extensions_whitelist_block(self):
         # NOTE(maurosr): just to avoid to get an exception raised for not
@@ -99,10 +97,10 @@ class ExtensionLoadingTestCase(test.TestCase):
         self.addCleanup(self._set_v3_core, v3_core)
 
         app = compute.APIRouterV3()
-        self.assertIn('os-fixed-ips', app._loaded_extension_info.extensions)
+        self.assertIn('os-hosts', app._loaded_extension_info.extensions)
         CONF.set_override('extensions_whitelist', ['servers'], 'osapi_v3')
         app = compute.APIRouterV3()
-        self.assertNotIn('os-fixed-ips', app._loaded_extension_info.extensions)
+        self.assertNotIn('os-hosts', app._loaded_extension_info.extensions)
 
     def test_blacklist_overrides_whitelist(self):
         # NOTE(maurosr): just to avoid to get an exception raised for not
@@ -112,12 +110,12 @@ class ExtensionLoadingTestCase(test.TestCase):
         self.addCleanup(self._set_v3_core, v3_core)
 
         app = compute.APIRouterV3()
-        self.assertIn('os-fixed-ips', app._loaded_extension_info.extensions)
-        CONF.set_override('extensions_whitelist', ['servers', 'os-fixed-ips'],
+        self.assertIn('os-hosts', app._loaded_extension_info.extensions)
+        CONF.set_override('extensions_whitelist', ['servers', 'os-hosts'],
                           'osapi_v3')
-        CONF.set_override('extensions_blacklist', ['os-fixed-ips'], 'osapi_v3')
+        CONF.set_override('extensions_blacklist', ['os-hosts'], 'osapi_v3')
         app = compute.APIRouterV3()
-        self.assertNotIn('os-fixed-ips', app._loaded_extension_info.extensions)
+        self.assertNotIn('os-hosts', app._loaded_extension_info.extensions)
         self.assertIn('servers', app._loaded_extension_info.extensions)
         self.assertEqual(len(app._loaded_extension_info.extensions), 1)
 

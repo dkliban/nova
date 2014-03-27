@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (C) 2013 Red Hat, Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -106,6 +104,17 @@ def set_vif_host_backend_802qbh_config(conf, devname, profileid,
         conf.target_dev = tapname
 
 
+def set_vif_host_backend_direct_config(conf, devname):
+    """Populate a LibvirtConfigGuestInterface instance
+    with direct Interface.
+    """
+
+    conf.net_type = "direct"
+    conf.source_mode = "passthrough"
+    conf.source_dev = devname
+    conf.model = "virtio"
+
+
 def set_vif_bandwidth_config(conf, inst_type):
     """Config vif inbound/outbound bandwidth limit. parameters are
     set in instance_type_extra_specs table, key is in  the format
@@ -115,7 +124,7 @@ def set_vif_bandwidth_config(conf, inst_type):
     bandwidth_items = ['vif_inbound_average', 'vif_inbound_peak',
         'vif_inbound_burst', 'vif_outbound_average', 'vif_outbound_peak',
         'vif_outbound_burst']
-    for key, value in inst_type['extra_specs'].iteritems():
+    for key, value in inst_type.get('extra_specs', {}).iteritems():
         scope = key.split(':')
         if len(scope) > 1 and scope[0] == 'quota':
             if scope[1] in bandwidth_items:

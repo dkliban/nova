@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -19,10 +17,11 @@ import functools
 import itertools
 import os
 import re
-import urlparse
 
 from oslo.config import cfg
+import six.moves.urllib.parse as urlparse
 import webob
+from webob import exc
 
 from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
@@ -37,7 +36,7 @@ from nova import quota
 osapi_opts = [
     cfg.IntOpt('osapi_max_limit',
                default=1000,
-               help='the maximum number of items returned in a single '
+               help='The maximum number of items returned in a single '
                     'response from a collection resource'),
     cfg.StrOpt('osapi_compute_link_prefix',
                help='Base URL that will be presented to users in links '
@@ -52,6 +51,12 @@ CONF.register_opts(osapi_opts)
 LOG = logging.getLogger(__name__)
 QUOTAS = quota.QUOTAS
 
+CONF.import_opt('enable', 'nova.cells.opts', group='cells')
+
+# NOTE(cyeoh): A common regexp for acceptable names (user supplied)
+# that we want all new extensions to conform to unless there is a very
+# good reason not to.
+VALID_NAME_REGEX = re.compile("^(?! )[\w. _-]+(?<! )$", re.UNICODE)
 
 XML_NS_V11 = 'http://docs.openstack.org/compute/api/v1.1'
 
@@ -60,7 +65,11 @@ _STATE_MAP = {
     vm_states.ACTIVE: {
         'default': 'ACTIVE',
         task_states.REBOOTING: 'REBOOT',
+        task_states.REBOOT_PENDING: 'REBOOT',
+        task_states.REBOOT_STARTED: 'REBOOT',
         task_states.REBOOTING_HARD: 'HARD_REBOOT',
+        task_states.REBOOT_PENDING_HARD: 'HARD_REBOOT',
+        task_states.REBOOT_STARTED_HARD: 'HARD_REBOOT',
         task_states.UPDATING_PASSWORD: 'PASSWORD',
         task_states.REBUILDING: 'REBUILD',
         task_states.REBUILD_BLOCK_DEVICE_MAPPING: 'REBUILD',
@@ -76,6 +85,10 @@ _STATE_MAP = {
     },
     vm_states.STOPPED: {
         'default': 'SHUTOFF',
+        task_states.RESIZE_PREP: 'RESIZE',
+        task_states.RESIZE_MIGRATING: 'RESIZE',
+        task_states.RESIZE_MIGRATED: 'RESIZE',
+        task_states.RESIZE_FINISH: 'RESIZE',
     },
     vm_states.RESIZED: {
         'default': 'VERIFY_RESIZE',
@@ -100,7 +113,7 @@ _STATE_MAP = {
         'default': 'DELETED',
     },
     vm_states.SOFT_DELETED: {
-        'default': 'DELETED',
+        'default': 'SOFT_DELETED',
     },
     vm_states.SHELVED: {
         'default': 'SHELVED',
@@ -123,12 +136,20 @@ def status_from_state(vm_state, task_state='default'):
     return status
 
 
-def vm_state_from_status(status):
-    """Map the server status string to a vm state."""
+def task_and_vm_state_from_status(status):
+    """Map the server status string to list of vm states and
+    list of task states.
+    """
+    vm_states = set()
+    task_states = set()
     for state, task_map in _STATE_MAP.iteritems():
-        status_string = task_map.get("default")
-        if status.lower() == status_string.lower():
-            return state
+        for task_state, mapped_state in task_map.iteritems():
+            status_string = mapped_state
+            if status.lower() == status_string.lower():
+                vm_states.add(state)
+                task_states.add(task_state)
+    # Add sort to avoid different order on set in Python 3
+    return sorted(vm_states), sorted(task_states)
 
 
 def get_pagination_params(request):
@@ -145,23 +166,25 @@ def get_pagination_params(request):
     """
     params = {}
     if 'limit' in request.GET:
-        params['limit'] = _get_limit_param(request)
+        params['limit'] = _get_int_param(request, 'limit')
+    if 'page_size' in request.GET:
+        params['page_size'] = _get_int_param(request, 'page_size')
     if 'marker' in request.GET:
         params['marker'] = _get_marker_param(request)
     return params
 
 
-def _get_limit_param(request):
-    """Extract integer limit from request or fail."""
+def _get_int_param(request, param):
+    """Extract integer param from request or fail."""
     try:
-        limit = int(request.GET['limit'])
+        int_param = int(request.GET[param])
     except ValueError:
-        msg = _('limit param must be an integer')
+        msg = _('%s param must be an integer') % param
         raise webob.exc.HTTPBadRequest(explanation=msg)
-    if limit < 0:
-        msg = _('limit param must be positive')
+    if int_param < 0:
+        msg = _('%s param must be positive') % param
         raise webob.exc.HTTPBadRequest(explanation=msg)
-    return limit
+    return int_param
 
 
 def _get_marker_param(request):
@@ -283,7 +306,7 @@ def remove_version_from_href(href):
 
 
 def check_img_metadata_properties_quota(context, metadata):
-    if metadata is None:
+    if not metadata:
         return
     try:
         QUOTAS.limit_check(context, metadata_items=len(metadata))
@@ -357,7 +380,7 @@ def get_networks_for_instance(context, instance):
 
 
 def raise_http_conflict_for_instance_invalid_state(exc, action):
-    """Return a webob.exc.HTTPConflict instance containing a message
+    """Raises a webob.exc.HTTPConflict instance containing a message
     appropriate to return via the API based on the original
     InstanceInvalidState exception.
     """
@@ -463,8 +486,7 @@ class ViewBuilder(object):
     """Model API responses as dictionaries."""
 
     def _get_project_id(self, request):
-        """
-        Get project id from request url if present or empty string
+        """Get project id from request url if present or empty string
         otherwise
         """
         project_id = request.environ["nova.context"].project_id
@@ -550,3 +572,24 @@ class ViewBuilder(object):
     def _update_compute_link_prefix(self, orig_url):
         return self._update_link_prefix(orig_url,
                                         CONF.osapi_compute_link_prefix)
+
+
+def get_instance(compute_api, context, instance_id, want_objects=False,
+                 expected_attrs=None):
+    """Fetch an instance from the compute API, handling error checking."""
+    try:
+        return compute_api.get(context, instance_id,
+                               want_objects=want_objects,
+                               expected_attrs=expected_attrs)
+    except exception.InstanceNotFound as e:
+        raise exc.HTTPNotFound(explanation=e.format_message())
+
+
+def check_cells_enabled(function):
+    @functools.wraps(function)
+    def inner(*args, **kwargs):
+        if not CONF.cells.enable:
+            msg = _("Cells is not enabled.")
+            raise webob.exc.HTTPNotImplemented(explanation=msg)
+        return function(*args, **kwargs)
+    return inner

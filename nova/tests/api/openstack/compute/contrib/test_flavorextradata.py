@@ -41,14 +41,16 @@ def fake_get_flavor_by_flavor_id(flavorid, ctxt=None):
     }
 
 
-def fake_get_all_flavors(inactive=0, filters=None):
-    return {
-        'fake1': fake_get_flavor_by_flavor_id(1),
-        'fake2': fake_get_flavor_by_flavor_id(2)
-    }
+def fake_get_all_flavors_sorted_list(context=None, inactive=False,
+                                     filters=None, sort_key='flavorid',
+                                     sort_dir='asc', limit=None, marker=None):
+    return [
+        fake_get_flavor_by_flavor_id(1),
+        fake_get_flavor_by_flavor_id(2)
+    ]
 
 
-class FlavorextradataTest(test.TestCase):
+class FlavorextradataTest(test.NoDBTestCase):
     def setUp(self):
         super(FlavorextradataTest, self).setUp()
         ext = ('nova.api.openstack.compute.contrib'
@@ -56,11 +58,12 @@ class FlavorextradataTest(test.TestCase):
         self.flags(osapi_compute_extension=[ext])
         self.stubs.Set(flavors, 'get_flavor_by_flavor_id',
                                         fake_get_flavor_by_flavor_id)
-        self.stubs.Set(flavors, 'get_all_flavors', fake_get_all_flavors)
+        self.stubs.Set(flavors, 'get_all_flavors_sorted_list',
+                       fake_get_all_flavors_sorted_list)
 
     def _verify_flavor_response(self, flavor, expected):
         for key in expected:
-            self.assertEquals(flavor[key], expected[key])
+            self.assertEqual(flavor[key], expected[key])
 
     def test_show(self):
         expected = {

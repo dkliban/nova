@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 VMware, Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -19,9 +17,6 @@ Helper methods for operations related to the management of volumes,
 and storage repositories
 """
 
-import re
-import string
-
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova.virt.vmwareapi import vim_util
@@ -38,9 +33,7 @@ class StorageError(Exception):
 
 
 def get_host_iqn(session, cluster=None):
-    """
-    Return the host iSCSI IQN.
-    """
+    """Return the host iSCSI IQN."""
     host_mor = vm_util.get_host_ref(session, cluster)
     hbas_ret = session._call_method(vim_util, "get_dynamic_property",
                                     host_mor, "HostSystem",
@@ -58,9 +51,7 @@ def get_host_iqn(session, cluster=None):
 
 
 def find_st(session, data, cluster=None):
-    """
-    Return the iSCSI Target given a volume info.
-    """
+    """Return the iSCSI Target given a volume info."""
     target_portal = data['target_portal']
     target_iqn = data['target_iqn']
     host_mor = vm_util.get_host_ref(session, cluster)
@@ -68,21 +59,16 @@ def find_st(session, data, cluster=None):
     lst_properties = ["config.storageDevice.hostBusAdapter",
                       "config.storageDevice.scsiTopology",
                       "config.storageDevice.scsiLun"]
-    props = session._call_method(vim_util, "get_object_properties",
-                       None, host_mor, "HostSystem",
-                       lst_properties)
+    prop_dict = session._call_method(vim_util, "get_dynamic_properties",
+                       host_mor, "HostSystem", lst_properties)
     result = (None, None)
     hbas_ret = None
     scsi_topology = None
     scsi_lun_ret = None
-    for elem in props:
-        for prop in elem.propSet:
-            if prop.name == "config.storageDevice.hostBusAdapter":
-                hbas_ret = prop.val
-            elif prop.name == "config.storageDevice.scsiTopology":
-                scsi_topology = prop.val
-            elif prop.name == "config.storageDevice.scsiLun":
-                scsi_lun_ret = prop.val
+    if prop_dict:
+        hbas_ret = prop_dict.get('config.storageDevice.hostBusAdapter')
+        scsi_topology = prop_dict.get('config.storageDevice.scsiTopology')
+        scsi_lun_ret = prop_dict.get('config.storageDevice.scsiLun')
 
     # Meaning there are no host bus adapters on the host
     if hbas_ret is None:
@@ -135,10 +121,8 @@ def find_st(session, data, cluster=None):
     return result
 
 
-def rescan_iscsi_hba(session, cluster=None):
-    """
-    Rescan the iSCSI HBA to discover iSCSI targets.
-    """
+def rescan_iscsi_hba(session, cluster=None, target_portal=None):
+    """Rescan the iSCSI HBA to discover iSCSI targets."""
     host_mor = vm_util.get_host_ref(session, cluster)
     storage_system_mor = session._call_method(vim_util, "get_dynamic_property",
                                               host_mor, "HostSystem",
@@ -157,24 +141,30 @@ def rescan_iscsi_hba(session, cluster=None):
     for hba in host_hbas:
         if hba.__class__.__name__ == 'HostInternetScsiHba':
             hba_device = hba.device
+            if target_portal:
+                # Check if iscsi host is already in the send target host list
+                send_targets = getattr(hba, 'configuredSendTarget', [])
+                send_tgt_portals = ['%s:%s' % (s.address, s.port) for s in
+                                    send_targets]
+                if target_portal not in send_tgt_portals:
+                    _add_iscsi_send_target_host(session, storage_system_mor,
+                                                hba_device, target_portal)
             break
     else:
         return
-
     LOG.debug(_("Rescanning HBA %s") % hba_device)
     session._call_method(session._get_vim(), "RescanHba", storage_system_mor,
                          hbaDevice=hba_device)
     LOG.debug(_("Rescanned HBA %s ") % hba_device)
 
 
-def mountpoint_to_number(mountpoint):
-    """Translate a mountpoint like /dev/sdc into a numeric."""
-    if mountpoint.startswith('/dev/'):
-        mountpoint = mountpoint[5:]
-    if re.match('^[hsv]d[a-p]$', mountpoint):
-        return (ord(mountpoint[2:3]) - ord('a'))
-    elif re.match('^[0-9]+$', mountpoint):
-        return string.atoi(mountpoint, 10)
-    else:
-        LOG.warn(_("Mountpoint cannot be translated: %s") % mountpoint)
-        return -1
+def _add_iscsi_send_target_host(session, storage_system_mor, hba_device,
+                                target_portal):
+    """Adds the iscsi host to send target host list."""
+    client_factory = session._get_vim().client.factory
+    send_tgt = client_factory.create('ns0:HostInternetScsiHbaSendTarget')
+    (send_tgt.address, send_tgt.port) = target_portal.split(':')
+    LOG.debug(_("Adding iSCSI host %s to send targets"), send_tgt.address)
+    session._call_method(
+        session._get_vim(), "AddInternetScsiSendTargets", storage_system_mor,
+        iScsiHbaDevice=hba_device, targets=[send_tgt])

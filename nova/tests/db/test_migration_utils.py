@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2013 Boris Pavlovic (boris@pavlovic.me).
 # All Rights Reserved.
 #
@@ -14,9 +12,12 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+
+import uuid
 import warnings
 
 from migrate.changeset import UniqueConstraint
+import sqlalchemy
 from sqlalchemy.dialects import mysql
 from sqlalchemy import Boolean, Index, Integer, DateTime, String
 from sqlalchemy import MetaData, Table, Column, ForeignKey
@@ -32,6 +33,9 @@ from nova import exception
 from nova.tests.db import test_migrations
 
 
+SA_VERSION = tuple(map(int, sqlalchemy.__version__.split('.')))
+
+
 class CustomType(UserDefinedType):
     """Dummy column type for testing unsupported types."""
     def get_col_spec(self):
@@ -41,8 +45,90 @@ class CustomType(UserDefinedType):
 class TestMigrationUtils(test_migrations.BaseMigrationTestCase):
     """Class for testing utils that are used in db migrations."""
 
+    def test_delete_from_select(self):
+        table_name = "__test_deletefromselect_table__"
+        uuidstrs = []
+        for unused in range(10):
+            uuidstrs.append(uuid.uuid4().hex)
+        for key, engine in self.engines.items():
+            meta = MetaData()
+            meta.bind = engine
+            conn = engine.connect()
+            test_table = Table(table_name, meta,
+                               Column('id', Integer, primary_key=True,
+                                      nullable=False, autoincrement=True),
+                               Column('uuid', String(36), nullable=False))
+            test_table.create()
+            # Add 10 rows to table
+            for uuidstr in uuidstrs:
+                ins_stmt = test_table.insert().values(uuid=uuidstr)
+                conn.execute(ins_stmt)
+
+            # Delete 4 rows in one chunk
+            column = test_table.c.id
+            query_delete = select([column],
+                                  test_table.c.id < 5).order_by(column)
+            delete_statement = utils.DeleteFromSelect(test_table,
+                                                      query_delete, column)
+            result_delete = conn.execute(delete_statement)
+            # Verify we delete 4 rows
+            self.assertEqual(result_delete.rowcount, 4)
+
+            query_all = select([test_table]).\
+                        where(test_table.c.uuid.in_(uuidstrs))
+            rows = conn.execute(query_all).fetchall()
+            # Verify we still have 6 rows in table
+            self.assertEqual(len(rows), 6)
+
+            test_table.drop()
+
+    def test_insert_from_select(self):
+        insert_table_name = "__test_insert_to_table__"
+        select_table_name = "__test_select_from_table__"
+        uuidstrs = []
+        for unused in range(10):
+            uuidstrs.append(uuid.uuid4().hex)
+        for key, engine in self.engines.items():
+            meta = MetaData()
+            meta.bind = engine
+            conn = engine.connect()
+            insert_table = Table(insert_table_name, meta,
+                               Column('id', Integer, primary_key=True,
+                                      nullable=False, autoincrement=True),
+                               Column('uuid', String(36), nullable=False))
+            select_table = Table(select_table_name, meta,
+                               Column('id', Integer, primary_key=True,
+                                      nullable=False, autoincrement=True),
+                               Column('uuid', String(36), nullable=False))
+
+            insert_table.create()
+            select_table.create()
+            # Add 10 rows to select_table
+            for uuidstr in uuidstrs:
+                ins_stmt = select_table.insert().values(uuid=uuidstr)
+                conn.execute(ins_stmt)
+
+            # Select 4 rows in one chunk from select_table
+            column = select_table.c.id
+            query_insert = select([select_table],
+                                  select_table.c.id < 5).order_by(column)
+            insert_statement = utils.InsertFromSelect(insert_table,
+                                                      query_insert)
+            result_insert = conn.execute(insert_statement)
+            # Verify we insert 4 rows
+            self.assertEqual(result_insert.rowcount, 4)
+
+            query_all = select([insert_table]).\
+                        where(insert_table.c.uuid.in_(uuidstrs))
+            rows = conn.execute(query_all).fetchall()
+            # Verify we really have 4 rows in insert_table
+            self.assertEqual(len(rows), 4)
+
+            insert_table.drop()
+            select_table.drop()
+
     def test_utils_drop_unique_constraint(self):
-        table_name = "__test_tmp_table__"
+        table_name = "test_utils_drop_unique_constraint"
         uc_name = 'uniq_foo'
         values = [
             {'id': 1, 'a': 3, 'foo': 10},
@@ -84,17 +170,19 @@ class TestMigrationUtils(test_migrations.BaseMigrationTestCase):
             test_table.drop()
 
     def test_util_drop_unique_constraint_with_not_supported_sqlite_type(self):
+        if 'sqlite' not in self.engines:
+            self.skipTest('sqlite is not configured')
+        engine = self.engines['sqlite']
+        meta = MetaData(bind=engine)
 
-        table_name = "__test_tmp_table__"
+        table_name = ("test_util_drop_unique_constraint_with_not_supported"
+                      "_sqlite_type")
         uc_name = 'uniq_foo'
         values = [
             {'id': 1, 'a': 3, 'foo': 10},
             {'id': 2, 'a': 2, 'foo': 20},
             {'id': 3, 'a': 1, 'foo': 30}
         ]
-
-        engine = self.engines['sqlite']
-        meta = MetaData(bind=engine)
 
         test_table = Table(table_name, meta,
                             Column('id', Integer, primary_key=True,
@@ -107,17 +195,21 @@ class TestMigrationUtils(test_migrations.BaseMigrationTestCase):
 
         engine.execute(test_table.insert(), values)
         warnings.simplefilter("ignore", SAWarning)
-        # NOTE(boris-42): Missing info about column `foo` that has
-        #                 unsupported type CustomType.
-        self.assertRaises(exception.NovaException,
-                          utils.drop_unique_constraint,
-                          engine, table_name, uc_name, 'foo')
 
-        # NOTE(boris-42): Wrong type of foo instance. it should be
-        #                 instance of sqlalchemy.Column.
-        self.assertRaises(exception.NovaException,
-                          utils.drop_unique_constraint,
-                          engine, table_name, uc_name, 'foo', foo=Integer())
+        # reflection of custom types has been fixed upstream
+        if SA_VERSION < (0, 9, 0):
+            # NOTE(boris-42): Missing info about column `foo` that has
+            #                 unsupported type CustomType.
+            self.assertRaises(exception.NovaException,
+                              utils.drop_unique_constraint,
+                              engine, table_name, uc_name, 'foo')
+
+            # NOTE(boris-42): Wrong type of foo instance. it should be
+            #                 instance of sqlalchemy.Column.
+            self.assertRaises(exception.NovaException,
+                              utils.drop_unique_constraint,
+                              engine, table_name, uc_name, 'foo',
+                              foo=Integer())
 
         foo = Column('foo', CustomType, default=0)
         utils.drop_unique_constraint(engine, table_name, uc_name, 'foo',
@@ -168,7 +260,7 @@ class TestMigrationUtils(test_migrations.BaseMigrationTestCase):
         return test_table, values
 
     def test_drop_old_duplicate_entries_from_table(self):
-        table_name = "__test_tmp_table__"
+        table_name = "test_drop_old_duplicate_entries_from_table"
 
         for key, engine in self.engines.items():
             meta = MetaData()
@@ -194,10 +286,11 @@ class TestMigrationUtils(test_migrations.BaseMigrationTestCase):
 
             self.assertEqual(len(real_ids), len(expected_ids))
             for id_ in expected_ids:
-                self.assertTrue(id_ in real_ids)
+                self.assertIn(id_, real_ids)
+            test_table.drop()
 
     def test_drop_old_duplicate_entries_from_table_soft_delete(self):
-        table_name = "__test_tmp_table__"
+        table_name = "test_drop_old_duplicate_entries_from_table_soft_delete"
 
         for key, engine in self.engines.items():
             meta = MetaData()
@@ -227,7 +320,7 @@ class TestMigrationUtils(test_migrations.BaseMigrationTestCase):
                             engine.execute(rows_select).fetchall()]
             self.assertEqual(len(row_ids), len(expected_values))
             for value in expected_values:
-                self.assertTrue(value['id'] in row_ids)
+                self.assertIn(value['id'], row_ids)
 
             deleted_rows_select = base_select.\
                                     where(table.c.deleted == table.c.id)
@@ -236,10 +329,11 @@ class TestMigrationUtils(test_migrations.BaseMigrationTestCase):
             self.assertEqual(len(deleted_rows_ids),
                              len(values) - len(row_ids))
             for value in soft_deleted_values:
-                self.assertTrue(value['id'] in deleted_rows_ids)
+                self.assertIn(value['id'], deleted_rows_ids)
+            table.drop()
 
     def test_check_shadow_table(self):
-        table_name = 'abc'
+        table_name = 'test_check_shadow_table'
         for key, engine in self.engines.items():
             meta = MetaData()
             meta.bind = engine
@@ -274,8 +368,11 @@ class TestMigrationUtils(test_migrations.BaseMigrationTestCase):
             self.assertRaises(exception.NovaException,
                               utils.check_shadow_table, engine, table_name)
 
+            table.drop()
+            shadow_table.drop()
+
     def test_check_shadow_table_different_types(self):
-        table_name = 'abc'
+        table_name = 'test_check_shadow_table_different_types'
         for key, engine in self.engines.items():
             meta = MetaData()
             meta.bind = engine
@@ -292,8 +389,13 @@ class TestMigrationUtils(test_migrations.BaseMigrationTestCase):
             self.assertRaises(exception.NovaException,
                               utils.check_shadow_table, engine, table_name)
 
-    def test_check_shadow_table_with_unsupported_type(self):
-        table_name = 'abc'
+            table.drop()
+            shadow_table.drop()
+
+    def test_check_shadow_table_with_unsupported_sqlite_type(self):
+        if 'sqlite' not in self.engines:
+            self.skipTest('sqlite is not configured')
+        table_name = 'test_check_shadow_table_with_unsupported_sqlite_type'
         engine = self.engines['sqlite']
         meta = MetaData(bind=engine)
 
@@ -309,9 +411,10 @@ class TestMigrationUtils(test_migrations.BaseMigrationTestCase):
                              Column('c', CustomType))
         shadow_table.create()
         self.assertTrue(utils.check_shadow_table(engine, table_name))
+        shadow_table.drop()
 
     def test_create_shadow_table_by_table_instance(self):
-        table_name = 'abc'
+        table_name = 'test_create_shadow_table_by_table_instance'
         for key, engine in self.engines.items():
             meta = MetaData()
             meta.bind = engine
@@ -320,11 +423,13 @@ class TestMigrationUtils(test_migrations.BaseMigrationTestCase):
                           Column('a', Integer),
                           Column('b', String(256)))
             table.create()
-            utils.create_shadow_table(engine, table=table)
+            shadow_table = utils.create_shadow_table(engine, table=table)
             self.assertTrue(utils.check_shadow_table(engine, table_name))
+            table.drop()
+            shadow_table.drop()
 
     def test_create_shadow_table_by_name(self):
-        table_name = 'abc'
+        table_name = 'test_create_shadow_table_by_name'
         for key, engine in self.engines.items():
             meta = MetaData()
             meta.bind = engine
@@ -334,25 +439,36 @@ class TestMigrationUtils(test_migrations.BaseMigrationTestCase):
                           Column('a', Integer),
                           Column('b', String(256)))
             table.create()
-            utils.create_shadow_table(engine, table_name=table_name)
+            shadow_table = utils.create_shadow_table(engine,
+                                                     table_name=table_name)
             self.assertTrue(utils.check_shadow_table(engine, table_name))
+            table.drop()
+            shadow_table.drop()
 
     def test_create_shadow_table_not_supported_type(self):
-        table_name = 'abc'
-        engine = self.engines['sqlite']
-        meta = MetaData()
-        meta.bind = engine
-        table = Table(table_name, meta,
-                      Column('id', Integer, primary_key=True),
-                      Column('a', CustomType))
-        table.create()
-        self.assertRaises(exception.NovaException,
-                          utils.create_shadow_table,
-                          engine, table_name=table_name)
+        if 'sqlite' in self.engines:
+            table_name = 'test_create_shadow_table_not_supported_type'
+            engine = self.engines['sqlite']
+            meta = MetaData()
+            meta.bind = engine
+            table = Table(table_name, meta,
+                          Column('id', Integer, primary_key=True),
+                          Column('a', CustomType))
+            table.create()
 
-        utils.create_shadow_table(engine, table_name=table_name,
-                                  a=Column('a', CustomType()))
-        self.assertTrue(utils.check_shadow_table(engine, table_name))
+            # reflection of custom types has been fixed upstream
+            if SA_VERSION < (0, 9, 0):
+                self.assertRaises(exception.NovaException,
+                                  utils.create_shadow_table,
+                                  engine, table_name=table_name)
+
+            shadow_table = utils.create_shadow_table(engine,
+                table_name=table_name,
+                a=Column('a', CustomType())
+            )
+            self.assertTrue(utils.check_shadow_table(engine, table_name))
+            table.drop()
+            shadow_table.drop()
 
     def test_create_shadow_both_table_and_table_name_are_none(self):
         for key, engine in self.engines.items():
@@ -362,7 +478,8 @@ class TestMigrationUtils(test_migrations.BaseMigrationTestCase):
                               utils.create_shadow_table, engine)
 
     def test_create_shadow_both_table_and_table_name_are_specified(self):
-        table_name = 'abc'
+        table_name = ('test_create_shadow_both_table_and_table_name_are_'
+                      'specified')
         for key, engine in self.engines.items():
             meta = MetaData()
             meta.bind = engine
@@ -373,9 +490,10 @@ class TestMigrationUtils(test_migrations.BaseMigrationTestCase):
             self.assertRaises(exception.NovaException,
                               utils.create_shadow_table,
                               engine, table=table, table_name=table_name)
+            table.drop()
 
     def test_create_duplicate_shadow_table(self):
-        table_name = 'abc'
+        table_name = 'test_create_duplicate_shadow_table'
         for key, engine in self.engines.items():
             meta = MetaData()
             meta.bind = engine
@@ -383,13 +501,16 @@ class TestMigrationUtils(test_migrations.BaseMigrationTestCase):
                           Column('id', Integer, primary_key=True),
                           Column('a', Integer))
             table.create()
-            utils.create_shadow_table(engine, table_name=table_name)
+            shadow_table = utils.create_shadow_table(engine,
+                                                     table_name=table_name)
             self.assertRaises(exception.ShadowTableExists,
                               utils.create_shadow_table,
                               engine, table_name=table_name)
+            table.drop()
+            shadow_table.drop()
 
     def test_change_deleted_column_type_doesnt_drop_index(self):
-        table_name = 'abc'
+        table_name = 'test_change_deleted_column_type_doesnt_drop_index'
         for key, engine in self.engines.items():
             meta = MetaData(bind=engine)
 
@@ -420,9 +541,10 @@ class TestMigrationUtils(test_migrations.BaseMigrationTestCase):
                 self.assertIn(name, indexes)
                 self.assertEqual(set(index['column_names']),
                                  set(indexes[name]))
+            table.drop()
 
     def test_change_deleted_column_type_to_id_type_integer(self):
-        table_name = 'abc'
+        table_name = 'test_change_deleted_column_type_to_id_type_integer'
         for key, engine in self.engines.items():
             meta = MetaData()
             meta.bind = engine
@@ -433,10 +555,11 @@ class TestMigrationUtils(test_migrations.BaseMigrationTestCase):
             utils.change_deleted_column_type_to_id_type(engine, table_name)
 
             table = utils.get_table(engine, table_name)
-            self.assertTrue(isinstance(table.c.deleted.type, Integer))
+            self.assertIsInstance(table.c.deleted.type, Integer)
+            table.drop()
 
     def test_change_deleted_column_type_to_id_type_string(self):
-        table_name = 'abc'
+        table_name = 'test_change_deleted_column_type_to_id_type_string'
         for key, engine in self.engines.items():
             meta = MetaData()
             meta.bind = engine
@@ -447,35 +570,42 @@ class TestMigrationUtils(test_migrations.BaseMigrationTestCase):
             utils.change_deleted_column_type_to_id_type(engine, table_name)
 
             table = utils.get_table(engine, table_name)
-            self.assertTrue(isinstance(table.c.deleted.type, String))
+            self.assertIsInstance(table.c.deleted.type, String)
+            table.drop()
 
     def test_change_deleted_column_type_to_id_type_custom(self):
-        table_name = 'abc'
-        engine = self.engines['sqlite']
-        meta = MetaData()
-        meta.bind = engine
-        table = Table(table_name, meta,
-                      Column('id', Integer, primary_key=True),
-                      Column('foo', CustomType),
-                      Column('deleted', Boolean))
-        table.create()
+        if 'sqlite' in self.engines:
+            table_name = 'test_change_deleted_column_type_to_id_type_custom'
+            engine = self.engines['sqlite']
+            meta = MetaData()
+            meta.bind = engine
+            table = Table(table_name, meta,
+                          Column('id', Integer, primary_key=True),
+                          Column('foo', CustomType),
+                          Column('deleted', Boolean))
+            table.create()
 
-        self.assertRaises(exception.NovaException,
-                          utils.change_deleted_column_type_to_id_type,
-                          engine, table_name)
+            # reflection of custom types has been fixed upstream
+            if SA_VERSION < (0, 9, 0):
+                self.assertRaises(exception.NovaException,
+                                  utils.change_deleted_column_type_to_id_type,
+                                  engine, table_name)
 
-        fooColumn = Column('foo', CustomType())
-        utils.change_deleted_column_type_to_id_type(engine, table_name,
-                                                    foo=fooColumn)
+            fooColumn = Column('foo', CustomType())
+            utils.change_deleted_column_type_to_id_type(engine, table_name,
+                                                        foo=fooColumn)
 
-        table = utils.get_table(engine, table_name)
-        # NOTE(boris-42): There is no way to check has foo type CustomType.
-        #                 but sqlalchemy will set it to NullType.
-        self.assertTrue(isinstance(table.c.foo.type, NullType))
-        self.assertTrue(isinstance(table.c.deleted.type, Integer))
+            table = utils.get_table(engine, table_name)
+            # NOTE(boris-42): There is no way to check has foo type CustomType.
+            #                 but sqlalchemy will set it to NullType. This has
+            #                 been fixed upstream in recent SA versions
+            if SA_VERSION < (0, 9, 0):
+                self.assertIsInstance(table.c.foo.type, NullType)
+            self.assertIsInstance(table.c.deleted.type, Integer)
+            table.drop()
 
     def test_change_deleted_column_type_to_boolean(self):
-        table_name = 'abc'
+        table_name = 'test_change_deleted_column_type_to_boolean'
         for key, engine in self.engines.items():
             meta = MetaData()
             meta.bind = engine
@@ -488,54 +618,68 @@ class TestMigrationUtils(test_migrations.BaseMigrationTestCase):
 
             table = utils.get_table(engine, table_name)
             expected_type = Boolean if key != "mysql" else mysql.TINYINT
-            self.assertTrue(isinstance(table.c.deleted.type, expected_type))
+            self.assertIsInstance(table.c.deleted.type, expected_type)
+            table.drop()
 
     def test_change_deleted_column_type_to_boolean_type_custom(self):
-        table_name = 'abc'
-        engine = self.engines['sqlite']
-        meta = MetaData()
-        meta.bind = engine
-        table = Table(table_name, meta,
-                      Column('id', Integer, primary_key=True),
-                      Column('foo', CustomType),
-                      Column('deleted', Integer))
-        table.create()
+        if 'sqlite' in self.engines:
+            table_name = \
+                'test_change_deleted_column_type_to_boolean_type_custom'
+            engine = self.engines['sqlite']
+            meta = MetaData()
+            meta.bind = engine
+            table = Table(table_name, meta,
+                          Column('id', Integer, primary_key=True),
+                          Column('foo', CustomType),
+                          Column('deleted', Integer))
+            table.create()
 
-        self.assertRaises(exception.NovaException,
-                          utils.change_deleted_column_type_to_boolean,
-                          engine, table_name)
+            # reflection of custom types has been fixed upstream
+            if SA_VERSION < (0, 9, 0):
+                self.assertRaises(exception.NovaException,
+                                  utils.change_deleted_column_type_to_boolean,
+                                  engine, table_name)
 
-        fooColumn = Column('foo', CustomType())
-        utils.change_deleted_column_type_to_boolean(engine, table_name,
-                                                    foo=fooColumn)
+            fooColumn = Column('foo', CustomType())
+            utils.change_deleted_column_type_to_boolean(engine, table_name,
+                                                        foo=fooColumn)
 
-        table = utils.get_table(engine, table_name)
-        # NOTE(boris-42): There is no way to check has foo type CustomType.
-        #                 but sqlalchemy will set it to NullType.
-        self.assertTrue(isinstance(table.c.foo.type, NullType))
-        self.assertTrue(isinstance(table.c.deleted.type, Boolean))
+            table = utils.get_table(engine, table_name)
+            # NOTE(boris-42): There is no way to check has foo type CustomType.
+            #                 but sqlalchemy will set it to NullType. This has
+            #                 been fixed upstream in recent SA versions.
+            if SA_VERSION < (0, 9, 0):
+                self.assertIsInstance(table.c.foo.type, NullType)
+            self.assertIsInstance(table.c.deleted.type, Boolean)
+            table.drop()
 
     def test_drop_unique_constraint_in_sqlite_fk_recreate(self):
-        engine = self.engines['sqlite']
-        meta = MetaData()
-        meta.bind = engine
-        parent_table = Table('table0', meta,
-                       Column('id', Integer, primary_key=True),
-                       Column('foo', Integer))
-        parent_table.create()
-        table_name = 'table1'
-        table = Table(table_name, meta,
-                      Column('id', Integer, primary_key=True),
-                      Column('baz', Integer),
-                      Column('bar', Integer, ForeignKey("table0.id")),
-                      UniqueConstraint('baz', name='constr1'))
-        table.create()
-        utils.drop_unique_constraint(engine, table_name, 'constr1', 'baz')
+        if 'sqlite' in self.engines:
+            engine = self.engines['sqlite']
+            meta = MetaData()
+            meta.bind = engine
+            parent_table_name = ('test_drop_unique_constraint_in_sqlite_fk_'
+                                 'recreate_parent_table')
+            parent_table = Table(parent_table_name, meta,
+                           Column('id', Integer, primary_key=True),
+                           Column('foo', Integer))
+            parent_table.create()
+            table_name = 'test_drop_unique_constraint_in_sqlite_fk_recreate'
+            table = Table(table_name, meta,
+                          Column('id', Integer, primary_key=True),
+                          Column('baz', Integer),
+                          Column('bar', Integer,
+                                 ForeignKey(parent_table_name + ".id")),
+                          UniqueConstraint('baz', name='constr1'))
+            table.create()
+            utils.drop_unique_constraint(engine, table_name, 'constr1', 'baz')
 
-        insp = reflection.Inspector.from_engine(engine)
-        f_keys = insp.get_foreign_keys(table_name)
-        self.assertEqual(len(f_keys), 1)
-        f_key = f_keys[0]
-        self.assertEqual(f_key['referred_table'], 'table0')
-        self.assertEqual(f_key['referred_columns'], ['id'])
-        self.assertEqual(f_key['constrained_columns'], ['bar'])
+            insp = reflection.Inspector.from_engine(engine)
+            f_keys = insp.get_foreign_keys(table_name)
+            self.assertEqual(len(f_keys), 1)
+            f_key = f_keys[0]
+            self.assertEqual(f_key['referred_table'], parent_table_name)
+            self.assertEqual(f_key['referred_columns'], ['id'])
+            self.assertEqual(f_key['constrained_columns'], ['bar'])
+            table.drop()
+            parent_table.drop()

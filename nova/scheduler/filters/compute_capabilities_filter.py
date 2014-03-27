@@ -46,8 +46,12 @@ class ComputeCapabilitiesFilter(filters.BaseHostFilter):
             cap = host_state
             for index in range(0, len(scope)):
                 try:
-                    if type(cap) != dict:
-                        cap = getattr(cap, scope[index], None)
+                    if not isinstance(cap, dict):
+                        if getattr(cap, scope[index], None) is None:
+                            # If can't find, check stats dict
+                            cap = cap.stats.get(scope[index], None)
+                        else:
+                            cap = getattr(cap, scope[index], None)
                     else:
                         cap = cap.get(scope[index], None)
                 except AttributeError:
@@ -55,6 +59,8 @@ class ComputeCapabilitiesFilter(filters.BaseHostFilter):
                 if cap is None:
                     return False
             if not extra_specs_ops.match(str(cap), req):
+                LOG.debug(_("extra_spec requirement '%(req)s' does not match "
+                    "'%(cap)s'"), {'req': req, 'cap': cap})
                 return False
         return True
 

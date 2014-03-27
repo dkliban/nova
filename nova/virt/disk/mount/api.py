@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 Red Hat, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -205,9 +203,13 @@ class Mount(object):
         """Unmount the device from the file system."""
         if not self.mounted:
             return
+        self.flush_dev()
         LOG.debug(_("Umount %s") % self.mapped_device)
         utils.execute('umount', self.mapped_device, run_as_root=True)
         self.mounted = False
+
+    def flush_dev(self):
+        pass
 
     def do_mount(self):
         """Call the get, map and mnt operations."""

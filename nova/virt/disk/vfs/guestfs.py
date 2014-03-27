@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 Red Hat, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -15,13 +13,11 @@
 # under the License.
 
 from eventlet import tpool
-import guestfs
 
 from nova import exception
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova.virt.disk.vfs import api as vfs
-from nova.virt.libvirt import driver as libvirt_driver
 
 
 LOG = logging.getLogger(__name__)
@@ -31,8 +27,7 @@ guestfs = None
 
 class VFSGuestFS(vfs.VFS):
 
-    """
-    This class implements a VFS module that uses the libguestfs APIs
+    """This class implements a VFS module that uses the libguestfs APIs
     to access the disk image. The disk image is never mapped into
     the host filesystem, thus avoiding any potential for symlink
     attacks from the guest filesystem.
@@ -86,35 +81,60 @@ class VFSGuestFS(vfs.VFS):
                 _("No mount points found in %(root)s of %(imgfile)s") %
                 {'root': root, 'imgfile': self.imgfile})
 
-        mounts.sort(key=lambda mount: mount[1])
+        # the root directory must be mounted first
+        mounts.sort(key=lambda mount: mount[0])
+
+        root_mounted = False
         for mount in mounts:
             LOG.debug(_("Mounting %(dev)s at %(dir)s") %
                       {'dev': mount[1], 'dir': mount[0]})
-            self.handle.mount_options("", mount[1], mount[0])
+            try:
+                self.handle.mount_options("", mount[1], mount[0])
+                root_mounted = True
+            except RuntimeError as e:
+                msg = _("Error mounting %(device)s to %(dir)s in image"
+                        " %(imgfile)s with libguestfs (%(e)s)") % \
+                      {'imgfile': self.imgfile, 'device': mount[1],
+                       'dir': mount[0], 'e': e}
+                if root_mounted:
+                    LOG.debug(msg)
+                else:
+                    raise exception.NovaException(msg)
 
     def setup(self):
         LOG.debug(_("Setting up appliance for %(imgfile)s %(imgfmt)s") %
                   {'imgfile': self.imgfile, 'imgfmt': self.imgfmt})
-        self.handle = tpool.Proxy(guestfs.GuestFS())
+        try:
+            self.handle = tpool.Proxy(guestfs.GuestFS(close_on_exit=False))
+        except TypeError as e:
+            if 'close_on_exit' in str(e):
+                # NOTE(russellb) In case we're not using a version of
+                # libguestfs new enough to support the close_on_exit paramater,
+                # which was added in libguestfs 1.20.
+                self.handle = tpool.Proxy(guestfs.GuestFS())
+            else:
+                raise
 
         try:
             self.handle.add_drive_opts(self.imgfile, format=self.imgfmt)
-            if self.handle.get_attach_method() == 'libvirt':
-                libvirt_url = 'libvirt:' + libvirt_driver.LibvirtDriver.uri()
-                self.handle.set_attach_method(libvirt_url)
             self.handle.launch()
 
             self.setup_os()
 
             self.handle.aug_init("/", 0)
         except RuntimeError as e:
-            # dereference object and implicitly close()
-            self.handle = None
+            # explicitly teardown instead of implicit close()
+            # to prevent orphaned VMs in cases when an implicit
+            # close() is not enough
+            self.teardown()
             raise exception.NovaException(
                 _("Error mounting %(imgfile)s with libguestfs (%(e)s)") %
                 {'imgfile': self.imgfile, 'e': e})
         except Exception:
-            self.handle = None
+            # explicitly teardown instead of implicit close()
+            # to prevent orphaned VMs in cases when an implicit
+            # close() is not enough
+            self.teardown()
             raise
 
     def teardown(self):

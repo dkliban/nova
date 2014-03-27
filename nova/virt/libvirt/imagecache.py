@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 Michael Still and Canonical Inc
 # All Rights Reserved.
 #
@@ -30,56 +28,50 @@ import time
 
 from oslo.config import cfg
 
-from nova.compute import task_states
-from nova.compute import vm_states
 from nova.openstack.common import fileutils
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
+from nova.openstack.common import processutils
 from nova import utils
+from nova.virt import imagecache
 from nova.virt.libvirt import utils as virtutils
 
 LOG = logging.getLogger(__name__)
 
 imagecache_opts = [
-    cfg.StrOpt('base_dir_name',
-               default='_base',
-               help="Where cached images are stored under $instances_path."
-                    "This is NOT the full path - just a folder name."
-                    "For per-compute-host cached images, set to _base_$my_ip"),
     cfg.StrOpt('image_info_filename_pattern',
-               default='$instances_path/$base_dir_name/%(image)s.info',
+               default='$instances_path/$image_cache_subdirectory_name/'
+                       '%(image)s.info',
                help='Allows image information files to be stored in '
-                    'non-standard locations'),
-    cfg.BoolOpt('remove_unused_base_images',
-                default=True,
-                help='Should unused base images be removed?'),
+                    'non-standard locations',
+               deprecated_group='DEFAULT'),
     cfg.BoolOpt('remove_unused_kernels',
                 default=False,
                 help='Should unused kernel images be removed? This is only '
                      'safe to enable if all compute nodes have been updated '
-                     'to support this option. This will enabled by default '
-                     'in future.'),
+                     'to support this option. This will be enabled by default '
+                     'in future.',
+                deprecated_group='DEFAULT'),
     cfg.IntOpt('remove_unused_resized_minimum_age_seconds',
                default=3600,
                help='Unused resized base images younger than this will not be '
-                    'removed'),
-    cfg.IntOpt('remove_unused_original_minimum_age_seconds',
-               default=(24 * 3600),
-               help='Unused unresized base images younger than this will not '
-                    'be removed'),
+                    'removed',
+               deprecated_group='DEFAULT'),
     cfg.BoolOpt('checksum_base_images',
                 default=False,
-                help='Write a checksum for files in _base to disk'),
+                help='Write a checksum for files in _base to disk',
+               deprecated_group='DEFAULT'),
     cfg.IntOpt('checksum_interval_seconds',
                default=3600,
-               help='How frequently to checksum base images'),
+               help='How frequently to checksum base images',
+               deprecated_group='DEFAULT'),
     ]
 
 CONF = cfg.CONF
-CONF.register_opts(imagecache_opts)
-CONF.import_opt('host', 'nova.netconf')
+CONF.register_opts(imagecache_opts, 'libvirt')
 CONF.import_opt('instances_path', 'nova.compute.manager')
+CONF.import_opt('image_cache_subdirectory_name', 'nova.virt.imagecache')
 
 
 def get_cache_fname(images, key):
@@ -99,7 +91,8 @@ def get_cache_fname(images, key):
     assume this.
     """
     image_id = str(images[key])
-    if not CONF.remove_unused_kernels and key in ['kernel_id', 'ramdisk_id']:
+    if ((not CONF.libvirt.remove_unused_kernels and
+         key in ['kernel_id', 'ramdisk_id'])):
         return image_id
     else:
         return hashlib.sha1(image_id).hexdigest()
@@ -113,7 +106,7 @@ def get_info_filename(base_path):
     """
 
     base_file = os.path.basename(base_path)
-    return (CONF.image_info_filename_pattern
+    return (CONF.libvirt.image_info_filename_pattern
             % {'image': base_file})
 
 
@@ -121,7 +114,7 @@ def is_valid_info_file(path):
     """Test if a given path matches the pattern for info files."""
 
     digest_size = hashlib.sha1().digestsize * 2
-    regexp = (CONF.image_info_filename_pattern
+    regexp = (CONF.libvirt.image_info_filename_pattern
               % {'image': ('([0-9a-f]{%(digest_size)d}|'
                            '[0-9a-f]{%(digest_size)d}_sm|'
                            '[0-9a-f]{%(digest_size)d}_[0-9]+)'
@@ -221,6 +214,15 @@ def write_stored_info(target, field=None, value=None):
     write_file(info_file, field, value)
 
 
+def _hash_file(filename):
+    """Generate a hash for the contents of a file."""
+    checksum = hashlib.sha1()
+    with open(filename) as f:
+        for chunk in iter(lambda: f.read(32768), b''):
+            checksum.update(chunk)
+    return checksum.hexdigest()
+
+
 def read_stored_checksum(target, timestamped=True):
     """Read the checksum.
 
@@ -231,14 +233,12 @@ def read_stored_checksum(target, timestamped=True):
 
 def write_stored_checksum(target):
     """Write a checksum to disk for a file in _base."""
-
-    with open(target, 'r') as img_file:
-        checksum = utils.hash_file(img_file)
-    write_stored_info(target, field='sha1', value=checksum)
+    write_stored_info(target, field='sha1', value=_hash_file(target))
 
 
-class ImageCacheManager(object):
+class ImageCacheManager(imagecache.ImageCacheManager):
     def __init__(self):
+        super(ImageCacheManager, self).__init__()
         self.lock_path = os.path.join(CONF.instances_path, 'locks')
         self._reset_state()
 
@@ -269,10 +269,8 @@ class ImageCacheManager(object):
         Determine what images we have on disk. There will be other files in
         this directory so we only grab the ones which are the right length
         to be disk images.
-
-        Note that this does not return a value. It instead populates a class
-        variable with a list of images that we need to try and explain.
         """
+
         digest_size = hashlib.sha1().digestsize * 2
         for ent in os.listdir(base_dir):
             if len(ent) == digest_size:
@@ -283,44 +281,8 @@ class ImageCacheManager(object):
                   not is_valid_info_file(os.path.join(base_dir, ent))):
                 self._store_image(base_dir, ent, original=False)
 
-    def _list_running_instances(self, context, all_instances):
-        """List running instances (on all compute nodes)."""
-        self.used_images = {}
-        self.image_popularity = {}
-        self.instance_names = set()
-
-        for instance in all_instances:
-            # NOTE(mikal): "instance name" here means "the name of a directory
-            # which might contain an instance" and therefore needs to include
-            # historical permutations as well as the current one.
-            self.instance_names.add(instance['name'])
-            self.instance_names.add(instance['uuid'])
-
-            resize_states = [task_states.RESIZE_PREP,
-                             task_states.RESIZE_MIGRATING,
-                             task_states.RESIZE_MIGRATED,
-                             task_states.RESIZE_FINISH]
-            if instance['task_state'] in resize_states or \
-                    instance['vm_state'] == vm_states.RESIZED:
-                self.instance_names.add(instance['name'] + '_resize')
-                self.instance_names.add(instance['uuid'] + '_resize')
-
-            for image_key in ['image_ref', 'kernel_id', 'ramdisk_id']:
-                try:
-                    image_ref_str = str(instance[image_key])
-                except KeyError:
-                    continue
-                local, remote, insts = self.used_images.get(image_ref_str,
-                                                            (0, 0, []))
-                if instance['host'] == CONF.host:
-                    local += 1
-                else:
-                    remote += 1
-                insts.append(instance['name'])
-                self.used_images[image_ref_str] = (local, remote, insts)
-
-                self.image_popularity.setdefault(image_ref_str, 0)
-                self.image_popularity[image_ref_str] += 1
+        return {'unexplained_images': self.unexplained_images,
+                'originals': self.originals}
 
     def _list_backing_images(self):
         """List the backing images currently in use."""
@@ -331,16 +293,27 @@ class ImageCacheManager(object):
                 disk_path = os.path.join(CONF.instances_path, ent, 'disk')
                 if os.path.exists(disk_path):
                     LOG.debug(_('%s has a disk file'), ent)
-                    backing_file = virtutils.get_disk_backing_file(disk_path)
+                    try:
+                        backing_file = virtutils.get_disk_backing_file(
+                            disk_path)
+                    except processutils.ProcessExecutionError:
+                        # (for bug 1261442)
+                        if not os.path.exists(disk_path):
+                            LOG.debug(_('Failed to get disk backing file: %s'),
+                                      disk_path)
+                            continue
+                        else:
+                            raise
                     LOG.debug(_('Instance %(instance)s is backed by '
                                 '%(backing)s'),
                               {'instance': ent,
                                'backing': backing_file})
 
                     if backing_file:
-                        backing_path = os.path.join(CONF.instances_path,
-                                                    CONF.base_dir_name,
-                                                    backing_file)
+                        backing_path = os.path.join(
+                            CONF.instances_path,
+                            CONF.image_cache_subdirectory_name,
+                            backing_file)
                         if backing_path not in inuse_images:
                             inuse_images.append(backing_path)
 
@@ -352,7 +325,6 @@ class ImageCacheManager(object):
                                         {'instance': ent,
                                          'backing': backing_file})
                             self.unexplained_images.remove(backing_path)
-
         return inuse_images
 
     def _find_base_file(self, base_dir, fingerprint):
@@ -390,7 +362,7 @@ class ImageCacheManager(object):
         handle manually when it occurs.
         """
 
-        if not CONF.checksum_base_images:
+        if not CONF.libvirt.checksum_base_images:
             return None
 
         lock_name = 'hash-%s' % os.path.split(base_file)[-1]
@@ -407,7 +379,7 @@ class ImageCacheManager(object):
                 # shared storage), then we don't need to checksum again.
                 if (stored_timestamp and
                     time.time() - stored_timestamp <
-                        CONF.checksum_interval_seconds):
+                        CONF.libvirt.checksum_interval_seconds):
                     return True
 
                 # NOTE(mikal): If there is no timestamp, then the checksum was
@@ -416,8 +388,7 @@ class ImageCacheManager(object):
                     write_stored_info(base_file, field='sha1',
                                       value=stored_checksum)
 
-                with open(base_file, 'r') as f:
-                    current_checksum = utils.hash_file(f)
+                current_checksum = _hash_file(base_file)
 
                 if current_checksum != stored_checksum:
                     LOG.error(_('image %(id)s at (%(base_file)s): image '
@@ -438,7 +409,7 @@ class ImageCacheManager(object):
                 # NOTE(mikal): If the checksum file is missing, then we should
                 # create one. We don't create checksums when we download images
                 # from glance because that would delay VM startup.
-                if CONF.checksum_base_images and create_if_missing:
+                if CONF.libvirt.checksum_base_images and create_if_missing:
                     LOG.info(_('%(id)s (%(base_file)s): generating checksum'),
                              {'id': img_id,
                               'base_file': base_file})
@@ -454,14 +425,14 @@ class ImageCacheManager(object):
         Returns nothing.
         """
         if not os.path.exists(base_file):
-            LOG.debug(_('Cannot remove %(base_file)s, it does not exist'),
-                      base_file)
+            LOG.debug(_('Cannot remove %s, it does not exist'),
+                    base_file)
             return
 
         mtime = os.path.getmtime(base_file)
         age = time.time() - mtime
 
-        maxage = CONF.remove_unused_resized_minimum_age_seconds
+        maxage = CONF.libvirt.remove_unused_resized_minimum_age_seconds
         if base_file in self.originals:
             maxage = CONF.remove_unused_original_minimum_age_seconds
 
@@ -550,30 +521,8 @@ class ImageCacheManager(object):
                     virtutils.chown(base_file, os.getuid())
                     os.utime(base_file, None)
 
-    def verify_base_images(self, context, all_instances):
-        """Verify that base images are in a reasonable state."""
-
-        # NOTE(mikal): The new scheme for base images is as follows -- an
-        # image is streamed from the image service to _base (filename is the
-        # sha1 hash of the image id). If CoW is enabled, that file is then
-        # resized to be the correct size for the instance (filename is the
-        # same as the original, but with an underscore and the resized size
-        # in bytes). This second file is then CoW'd to the instance disk. If
-        # CoW is disabled, the resize occurs as part of the copy from the
-        # cache to the instance directory. Files ending in _sm are no longer
-        # created, but may remain from previous versions.
-        self._reset_state()
-
-        base_dir = os.path.join(CONF.instances_path, CONF.base_dir_name)
-        if not os.path.exists(base_dir):
-            LOG.debug(_('Skipping verification, no base directory at %s'),
-                      base_dir)
-            return
-
+    def _age_and_verify_cached_images(self, context, all_instances, base_dir):
         LOG.debug(_('Verify base images'))
-        self._list_base_images(base_dir)
-        self._list_running_instances(context, all_instances)
-
         # Determine what images are on disk because they're in use
         for img in self.used_images:
             fingerprint = hashlib.sha1(img).hexdigest()
@@ -610,9 +559,45 @@ class ImageCacheManager(object):
             LOG.info(_('Removable base files: %s'),
                      ' '.join(self.removable_base_files))
 
-            if CONF.remove_unused_base_images:
+            if self.remove_unused_base_images:
                 for base_file in self.removable_base_files:
                     self._remove_base_file(base_file)
 
         # That's it
         LOG.debug(_('Verification complete'))
+
+    def _get_base(self):
+
+        # NOTE(mikal): The new scheme for base images is as follows -- an
+        # image is streamed from the image service to _base (filename is the
+        # sha1 hash of the image id). If CoW is enabled, that file is then
+        # resized to be the correct size for the instance (filename is the
+        # same as the original, but with an underscore and the resized size
+        # in bytes). This second file is then CoW'd to the instance disk. If
+        # CoW is disabled, the resize occurs as part of the copy from the
+        # cache to the instance directory. Files ending in _sm are no longer
+        # created, but may remain from previous versions.
+
+        base_dir = os.path.join(CONF.instances_path,
+                                CONF.image_cache_subdirectory_name)
+        if not os.path.exists(base_dir):
+            LOG.debug(_('Skipping verification, no base directory at %s'),
+                      base_dir)
+            return
+        return base_dir
+
+    def update(self, context, all_instances):
+        base_dir = self._get_base()
+        if not base_dir:
+            return
+        # reset the local statistics
+        self._reset_state()
+        # read the cached images
+        self._list_base_images(base_dir)
+        # read running instances data
+        running = self._list_running_instances(context, all_instances)
+        self.used_images = running['used_images']
+        self.image_popularity = running['image_popularity']
+        self.instance_names = running['instance_names']
+        # perform the aging and image verification
+        self._age_and_verify_cached_images(context, all_instances, base_dir)

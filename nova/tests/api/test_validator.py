@@ -1,7 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 Cloudscaling, Inc.
-# Author: Matthew Hooker <matt@cloudscaling.com>
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -22,7 +19,7 @@ from nova.api import validator
 from nova import test
 
 
-class ValidatorTestCase(test.TestCase):
+class ValidatorTestCase(test.NoDBTestCase):
 
     def test_validate(self):
         fixture = {

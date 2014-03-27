@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011 X.commerce, a business unit of eBay Inc.
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
@@ -57,6 +55,7 @@ import os
 import sys
 
 from oslo.config import cfg
+import six
 
 from nova import config
 from nova.openstack.common import cliutils
@@ -186,7 +185,7 @@ def main():
         v = getattr(CONF.category, 'action_kwarg_' + k)
         if v is None:
             continue
-        if isinstance(v, basestring):
+        if isinstance(v, six.string_types):
             v = v.decode('utf-8')
         fn_kwargs[k] = v
 

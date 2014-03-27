@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -20,10 +18,13 @@ import datetime
 import filecmp
 import os
 import random
-import shutil
 import tempfile
 import time
 
+import sys
+import testtools
+
+import mock
 import mox
 
 import glanceclient.exc
@@ -36,6 +37,9 @@ from nova import test
 from nova.tests.api.openstack import fakes
 from nova.tests.glance import stubs as glance_stubs
 from nova.tests import matchers
+from nova import utils
+
+import nova.virt.libvirt.utils as lv_utils
 
 CONF = cfg.CONF
 
@@ -47,7 +51,7 @@ class NullWriter(object):
         pass
 
 
-class TestGlanceSerializer(test.TestCase):
+class TestGlanceSerializer(test.NoDBTestCase):
     def test_serialize(self):
         metadata = {'name': 'image1',
                     'is_public': True,
@@ -83,9 +87,8 @@ class TestGlanceSerializer(test.TestCase):
         self.assertEqual(glance._convert_from_string(converted), metadata)
 
 
-class TestGlanceImageService(test.TestCase):
-    """
-    Tests the Glance image service.
+class TestGlanceImageService(test.NoDBTestCase):
+    """Tests the Glance image service.
 
     At a high level, the translations involved are:
 
@@ -110,8 +113,8 @@ class TestGlanceImageService(test.TestCase):
         super(TestGlanceImageService, self).setUp()
         fakes.stub_out_compute_api_snapshot(self.stubs)
 
-        client = glance_stubs.StubGlanceClient()
-        self.service = self._create_image_service(client)
+        self.client = glance_stubs.StubGlanceClient()
+        self.service = self._create_image_service(self.client)
         self.context = context.RequestContext('fake', 'fake', auth_token=True)
         self.mox = mox.Mox()
         self.files_to_clean = []
@@ -122,7 +125,7 @@ class TestGlanceImageService(test.TestCase):
         for f in self.files_to_clean:
             try:
                 os.unlink(f)
-            except Exception:
+            except os.error:
                 pass
 
     def _get_tempfile(self):
@@ -187,8 +190,7 @@ class TestGlanceImageService(test.TestCase):
         self.assertThat(image_metas[0], matchers.DictMatches(expected))
 
     def test_create_without_instance_id(self):
-        """
-        Ensure we can create an image without having to specify an
+        """Ensure we can create an image without having to specify an
         instance_id. Public images are an example of an image not tied to an
         instance.
         """
@@ -221,15 +223,15 @@ class TestGlanceImageService(test.TestCase):
         num_images = len(self.service.detail(self.context))
         image_id = self.service.create(self.context, fixture)['id']
 
-        self.assertNotEquals(None, image_id)
-        self.assertEquals(num_images + 1,
-                          len(self.service.detail(self.context)))
+        self.assertIsNotNone(image_id)
+        self.assertEqual(num_images + 1,
+                         len(self.service.detail(self.context)))
 
     def test_create_and_show_non_existing_image(self):
         fixture = self._make_fixture(name='test image')
         image_id = self.service.create(self.context, fixture)['id']
 
-        self.assertNotEquals(None, image_id)
+        self.assertIsNotNone(image_id)
         self.assertRaises(exception.ImageNotFound,
                           self.service.show,
                           self.context,
@@ -263,7 +265,7 @@ class TestGlanceImageService(test.TestCase):
             ids.append(self.service.create(self.context, fixture)['id'])
 
         image_metas = self.service.detail(self.context, marker=ids[1])
-        self.assertEquals(len(image_metas), 8)
+        self.assertEqual(len(image_metas), 8)
         i = 2
         for meta in image_metas:
             expected = {
@@ -297,7 +299,15 @@ class TestGlanceImageService(test.TestCase):
             ids.append(self.service.create(self.context, fixture)['id'])
 
         image_metas = self.service.detail(self.context, limit=5)
-        self.assertEquals(len(image_metas), 5)
+        self.assertEqual(len(image_metas), 5)
+
+    def test_page_size(self):
+        with mock.patch.object(glance.GlanceClientWrapper, 'call') as a_mock:
+            self.service.detail(self.context, page_size=5)
+            self.assertEqual(a_mock.called, True)
+            a_mock.assert_called_with(self.context, 1, 'list',
+                                      filters={'is_public': 'none'},
+                                      page_size=5)
 
     def test_detail_default_limit(self):
         fixtures = []
@@ -320,7 +330,7 @@ class TestGlanceImageService(test.TestCase):
             ids.append(self.service.create(self.context, fixture)['id'])
 
         image_metas = self.service.detail(self.context, marker=ids[3], limit=5)
-        self.assertEquals(len(image_metas), 5)
+        self.assertEqual(len(image_metas), 5)
         i = 4
         for meta in image_metas:
             expected = {
@@ -363,7 +373,7 @@ class TestGlanceImageService(test.TestCase):
         self.service.update(self.context, image_id, fixture)
 
         new_image_data = self.service.show(self.context, image_id)
-        self.assertEquals('new image name', new_image_data['name'])
+        self.assertEqual('new image name', new_image_data['name'])
 
     def test_delete(self):
         fixture1 = self._make_fixture(name='test image 1')
@@ -371,7 +381,7 @@ class TestGlanceImageService(test.TestCase):
         fixtures = [fixture1, fixture2]
 
         num_images = len(self.service.detail(self.context))
-        self.assertEquals(0, num_images)
+        self.assertEqual(0, num_images)
 
         ids = []
         for fixture in fixtures:
@@ -379,7 +389,7 @@ class TestGlanceImageService(test.TestCase):
             ids.append(new_id)
 
         num_images = len(self.service.detail(self.context))
-        self.assertEquals(2, num_images)
+        self.assertEqual(2, num_images)
 
         self.service.delete(self.context, ids[0])
         # When you delete an image from glance, it sets the status to DELETED
@@ -387,12 +397,12 @@ class TestGlanceImageService(test.TestCase):
 
         # Check the image is still there.
         num_images = len(self.service.detail(self.context))
-        self.assertEquals(2, num_images)
+        self.assertEqual(2, num_images)
 
         # Check the image is marked as deleted.
         num_images = reduce(lambda x, y: x + (0 if y['deleted'] else 1),
                             self.service.detail(self.context), 0)
-        self.assertEquals(1, num_images)
+        self.assertEqual(1, num_images)
 
     def test_show_passes_through_to_client(self):
         fixture = self._make_fixture(name='image1', is_public=True)
@@ -490,12 +500,12 @@ class TestGlanceImageService(test.TestCase):
         # When retries are disabled, we should get an exception
         self.flags(glance_num_retries=0)
         self.assertRaises(exception.GlanceConnectionFailed,
-                service.download, self.context, image_id, writer)
+                service.download, self.context, image_id, data=writer)
 
         # Now lets enable retries. No exception should happen now.
         tries = [0]
         self.flags(glance_num_retries=1)
-        service.download(self.context, image_id, writer)
+        service.download(self.context, image_id, data=writer)
 
     def test_download_file_url(self):
         self.flags(allowed_direct_url_schemes=['file'])
@@ -517,13 +527,12 @@ class TestGlanceImageService(test.TestCase):
 
         client = MyGlanceStubClient()
         (outfd, tmpfname) = tempfile.mkstemp(prefix='directURLdst')
-        writer = os.fdopen(outfd, 'w')
+        os.close(outfd)
 
         service = self._create_image_service(client)
         image_id = 1  # doesn't matter
 
-        service.download(self.context, image_id, writer)
-        writer.close()
+        service.download(self.context, image_id, dst_path=tmpfname)
 
         # compare the two files
         rc = filecmp.cmp(tmpfname, client.s_tmpfname)
@@ -552,7 +561,7 @@ class TestGlanceImageService(test.TestCase):
                                      'transfer module should have intercepted '
                                      'it.')
 
-        self.mox.StubOutWithMock(shutil, 'copyfileobj')
+        self.mox.StubOutWithMock(lv_utils, 'copy_image')
 
         image_id = 1  # doesn't matter
         client = MyGlanceStubClient()
@@ -564,10 +573,11 @@ class TestGlanceImageService(test.TestCase):
         self.flags(group='image_file_url:gluster', id=fs_id)
         self.flags(group='image_file_url:gluster', mountpoint=mountpoint)
 
-        shutil.copyfileobj(mox.IgnoreArg(), mox.IgnoreArg())
+        dest_file = os.devnull
+        lv_utils.copy_image(mox.IgnoreArg(), dest_file)
 
         self.mox.ReplayAll()
-        service.download(self.context, image_id)
+        service.download(self.context, image_id, dst_path=dest_file)
         self.mox.VerifyAll()
 
     def test_download_module_no_filesystem_match(self):
@@ -588,10 +598,10 @@ class TestGlanceImageService(test.TestCase):
             def data(self, image_id):
                 return some_data
 
-        def _fake_copyfileobj(source, dest):
+        def _fake_copyfile(source, dest):
             self.fail('This should not be called because a match should not '
                       'have been found.')
-        self.stubs.Set(shutil, 'copyfileobj', _fake_copyfileobj)
+        self.stubs.Set(lv_utils, 'copy_image', _fake_copyfile)
 
         image_id = 1  # doesn't matter
         client = MyGlanceStubClient()
@@ -603,8 +613,9 @@ class TestGlanceImageService(test.TestCase):
         self.flags(group='image_file_url:gluster', id='someotherid')
         self.flags(group='image_file_url:gluster', mountpoint=mountpoint)
 
-        rc = service.download(self.context, image_id)
-        self.assertEqual(some_data, rc)
+        service.download(self.context, image_id,
+                         dst_path=os.devnull,
+                         data=None)
 
     def test_download_module_mountpoints(self):
         glance_mount = '/glance/mount/point'
@@ -630,10 +641,10 @@ class TestGlanceImageService(test.TestCase):
 
         self.copy_called = False
 
-        def _fake_copyfileobj(source, dest):
-            self.assertEqual(source.name, data_filename)
+        def _fake_copyfile(source, dest):
+            self.assertEqual(source, data_filename)
             self.copy_called = True
-        self.stubs.Set(shutil, 'copyfileobj', _fake_copyfileobj)
+        self.stubs.Set(lv_utils, 'copy_image', _fake_copyfile)
 
         self.flags(allowed_direct_url_schemes=['file'])
         self.flags(group='image_file_url', filesystems=['gluster'])
@@ -643,26 +654,29 @@ class TestGlanceImageService(test.TestCase):
         self.flags(group='image_file_url:gluster', id=file_system_id)
         self.flags(group='image_file_url:gluster', mountpoint=nova_mount)
 
-        service.download(self.context, image_id)
+        service.download(self.context, image_id, dst_path=os.devnull)
         self.assertTrue(self.copy_called)
 
     def test_download_module_file_bad_module(self):
         _, data_filename = self._get_tempfile()
         file_url = 'applesauce://%s' % data_filename
-        data_from_client = "someData"
+        data_called = False
 
         class MyGlanceStubClient(glance_stubs.StubGlanceClient):
+            data_called = False
+
             def get(self, image_id):
                 return type('GlanceLocations', (object,),
                             {'locations': [{'url': file_url,
                                             'metadata': {}}]})
 
             def data(self, image_id):
-                return data_from_client
+                self.data_called = True
+                return "someData"
 
         self.flags(allowed_direct_url_schemes=['applesauce'])
 
-        self.mox.StubOutWithMock(shutil, 'copyfileobj')
+        self.mox.StubOutWithMock(lv_utils, 'copy_image')
         self.flags(allowed_direct_url_schemes=['file'])
         image_id = 1  # doesn't matter
         client = MyGlanceStubClient()
@@ -671,9 +685,10 @@ class TestGlanceImageService(test.TestCase):
         # by not calling copyfileobj in the file download module we verify
         # that the requirements were not met for its use
         self.mox.ReplayAll()
-        new_data = service.download(self.context, image_id)
+        service.download(self.context, image_id, dst_path=os.devnull)
         self.mox.VerifyAll()
-        self.assertEqual(data_from_client, new_data)
+
+        self.assertTrue(client.data_called)
 
     def test_client_forbidden_converts_to_imagenotauthed(self):
         class MyGlanceStubClient(glance_stubs.StubGlanceClient):
@@ -684,9 +699,8 @@ class TestGlanceImageService(test.TestCase):
         client = MyGlanceStubClient()
         service = self._create_image_service(client)
         image_id = 1  # doesn't matter
-        writer = NullWriter()
         self.assertRaises(exception.ImageNotAuthorized, service.download,
-                          self.context, image_id, writer)
+                          self.context, image_id, dst_path=os.devnull)
 
     def test_client_httpforbidden_converts_to_imagenotauthed(self):
         class MyGlanceStubClient(glance_stubs.StubGlanceClient):
@@ -697,9 +711,8 @@ class TestGlanceImageService(test.TestCase):
         client = MyGlanceStubClient()
         service = self._create_image_service(client)
         image_id = 1  # doesn't matter
-        writer = NullWriter()
         self.assertRaises(exception.ImageNotAuthorized, service.download,
-                          self.context, image_id, writer)
+                          self.context, image_id, dst_path=os.devnull)
 
     def test_client_notfound_converts_to_imagenotfound(self):
         class MyGlanceStubClient(glance_stubs.StubGlanceClient):
@@ -710,9 +723,8 @@ class TestGlanceImageService(test.TestCase):
         client = MyGlanceStubClient()
         service = self._create_image_service(client)
         image_id = 1  # doesn't matter
-        writer = NullWriter()
         self.assertRaises(exception.ImageNotFound, service.download,
-                          self.context, image_id, writer)
+                          self.context, image_id, dst_path=os.devnull)
 
     def test_client_httpnotfound_converts_to_imagenotfound(self):
         class MyGlanceStubClient(glance_stubs.StubGlanceClient):
@@ -723,16 +735,15 @@ class TestGlanceImageService(test.TestCase):
         client = MyGlanceStubClient()
         service = self._create_image_service(client)
         image_id = 1  # doesn't matter
-        writer = NullWriter()
         self.assertRaises(exception.ImageNotFound, service.download,
-                          self.context, image_id, writer)
+                          self.context, image_id, dst_path=os.devnull)
 
     def test_glance_client_image_id(self):
         fixture = self._make_fixture(name='test image')
         image_id = self.service.create(self.context, fixture)['id']
         (service, same_id) = glance.get_remote_image_service(
                 self.context, image_id)
-        self.assertEquals(same_id, image_id)
+        self.assertEqual(same_id, image_id)
 
     def test_glance_client_image_ref(self):
         fixture = self._make_fixture(name='test image')
@@ -740,9 +751,8 @@ class TestGlanceImageService(test.TestCase):
         image_url = 'http://something-less-likely/%s' % image_id
         (service, same_id) = glance.get_remote_image_service(
                 self.context, image_url)
-        self.assertEquals(same_id, image_id)
-        self.assertEquals(service._client.host,
-                'something-less-likely')
+        self.assertEqual(same_id, image_id)
+        self.assertEqual(service._client.host, 'something-less-likely')
 
 
 def _create_failing_glance_client(info):
@@ -757,7 +767,130 @@ def _create_failing_glance_client(info):
     return MyGlanceStubClient()
 
 
-class TestGlanceClientWrapper(test.TestCase):
+class TestIsImageAvailable(test.NoDBTestCase):
+    """Tests the internal _is_image_available method on the Glance service."""
+
+    class ImageSpecV2(object):
+        visibility = None
+        properties = None
+
+    class ImageSpecV1(object):
+        is_public = None
+        properties = None
+
+    def test_auth_token_override(self):
+        ctx = mock.MagicMock(auth_token=True)
+        img = mock.MagicMock()
+
+        res = glance._is_image_available(ctx, img)
+        self.assertTrue(res)
+        img.assert_not_called()
+
+    def test_admin_override(self):
+        ctx = mock.MagicMock(auth_token=False, is_admin=True)
+        img = mock.MagicMock()
+
+        res = glance._is_image_available(ctx, img)
+        self.assertTrue(res)
+        img.assert_not_called()
+
+    def test_v2_visibility(self):
+        ctx = mock.MagicMock(auth_token=False, is_admin=False)
+        # We emulate warlock validation that throws an AttributeError
+        # if you try to call is_public on an image model returned by
+        # a call to V2 image.get(). Here, the ImageSpecV2 does not have
+        # an is_public attribute and MagicMock will throw an AttributeError.
+        img = mock.MagicMock(visibility='PUBLIC',
+                             spec=TestIsImageAvailable.ImageSpecV2)
+
+        res = glance._is_image_available(ctx, img)
+        self.assertTrue(res)
+
+    def test_v1_is_public(self):
+        ctx = mock.MagicMock(auth_token=False, is_admin=False)
+        img = mock.MagicMock(is_public=True,
+                             spec=TestIsImageAvailable.ImageSpecV1)
+
+        res = glance._is_image_available(ctx, img)
+        self.assertTrue(res)
+
+    def test_project_is_owner(self):
+        ctx = mock.MagicMock(auth_token=False, is_admin=False,
+                             project_id='123')
+        props = {
+            'owner_id': '123'
+        }
+        img = mock.MagicMock(visibility='private', properties=props,
+                             spec=TestIsImageAvailable.ImageSpecV2)
+
+        res = glance._is_image_available(ctx, img)
+        self.assertTrue(res)
+
+        ctx.reset_mock()
+        img = mock.MagicMock(is_public=False, properties=props,
+                             spec=TestIsImageAvailable.ImageSpecV1)
+
+        res = glance._is_image_available(ctx, img)
+        self.assertTrue(res)
+
+    def test_project_context_matches_project_prop(self):
+        ctx = mock.MagicMock(auth_token=False, is_admin=False,
+                             project_id='123')
+        props = {
+            'project_id': '123'
+        }
+        img = mock.MagicMock(visibility='private', properties=props,
+                             spec=TestIsImageAvailable.ImageSpecV2)
+
+        res = glance._is_image_available(ctx, img)
+        self.assertTrue(res)
+
+        ctx.reset_mock()
+        img = mock.MagicMock(is_public=False, properties=props,
+                             spec=TestIsImageAvailable.ImageSpecV1)
+
+        res = glance._is_image_available(ctx, img)
+        self.assertTrue(res)
+
+    def test_no_user_in_props(self):
+        ctx = mock.MagicMock(auth_token=False, is_admin=False,
+                             project_id='123')
+        props = {
+        }
+        img = mock.MagicMock(visibility='private', properties=props,
+                             spec=TestIsImageAvailable.ImageSpecV2)
+
+        res = glance._is_image_available(ctx, img)
+        self.assertFalse(res)
+
+        ctx.reset_mock()
+        img = mock.MagicMock(is_public=False, properties=props,
+                             spec=TestIsImageAvailable.ImageSpecV1)
+
+        res = glance._is_image_available(ctx, img)
+        self.assertFalse(res)
+
+    def test_user_matches_context(self):
+        ctx = mock.MagicMock(auth_token=False, is_admin=False,
+                             user_id='123')
+        props = {
+            'user_id': '123'
+        }
+        img = mock.MagicMock(visibility='private', properties=props,
+                             spec=TestIsImageAvailable.ImageSpecV2)
+
+        res = glance._is_image_available(ctx, img)
+        self.assertTrue(res)
+
+        ctx.reset_mock()
+        img = mock.MagicMock(is_public=False, properties=props,
+                             spec=TestIsImageAvailable.ImageSpecV1)
+
+        res = glance._is_image_available(ctx, img)
+        self.assertTrue(res)
+
+
+class TestGlanceClientWrapper(test.NoDBTestCase):
 
     def setUp(self):
         super(TestGlanceClientWrapper, self).setUp()
@@ -780,18 +913,17 @@ class TestGlanceClientWrapper(test.TestCase):
         def _get_fake_glanceclient(version, endpoint, **params):
             fake_client = glance_stubs.StubGlanceClient(version,
                                        endpoint, **params)
-            self.assertTrue(fake_client.auth_token is not None)
-            self.assertTrue(fake_client.identity_headers is not None)
-            self.assertEquals(fake_client.identity_header['X-Auth_Token'],
-                              auth_token)
-            self.assertEquals(fake_client.identity_header['X-User-Id'], 'fake')
-            self.assertEquals(fake_client.identity_header['X-Roles'], None)
-            self.assertEquals(fake_client.identity_header['X-Tenant-Id'], None)
-            self.assertEquals(fake_client.
-                              identity_header['X-Service-Catalog'], None)
-            self.assertEquals(fake_client.
-                              identity_header['X-Identity-Status'],
-                              'Confirmed')
+            self.assertIsNotNone(fake_client.auth_token)
+            self.assertIsNotNone(fake_client.identity_headers)
+            self.assertEqual(fake_client.identity_header['X-Auth_Token'],
+                             auth_token)
+            self.assertEqual(fake_client.identity_header['X-User-Id'], 'fake')
+            self.assertIsNone(fake_client.identity_header['X-Roles'])
+            self.assertIsNone(fake_client.identity_header['X-Tenant-Id'])
+            self.assertIsNone(fake_client.identity_header['X-Service-Catalog'])
+            self.assertEqual(fake_client.
+                             identity_header['X-Identity-Status'],
+                             'Confirmed')
 
         self.stubs.Set(glanceclient.Client, '__init__',
                        _get_fake_glanceclient)
@@ -943,15 +1075,74 @@ class TestGlanceClientWrapper(test.TestCase):
         self.assertEqual(info['num_calls'], 2)
 
 
-class TestGlanceUrl(test.TestCase):
+class TestGlanceUrl(test.NoDBTestCase):
 
     def test_generate_glance_http_url(self):
         generated_url = glance.generate_glance_url()
-        http_url = "http://%s:%d" % (CONF.glance_host, CONF.glance_port)
+        glance_host = CONF.glance_host
+        # ipv6 address, need to wrap it with '[]'
+        if utils.is_valid_ipv6(glance_host):
+            glance_host = '[%s]' % glance_host
+        http_url = "http://%s:%d" % (glance_host, CONF.glance_port)
         self.assertEqual(generated_url, http_url)
 
     def test_generate_glance_https_url(self):
         self.flags(glance_protocol="https")
         generated_url = glance.generate_glance_url()
-        https_url = "https://%s:%d" % (CONF.glance_host, CONF.glance_port)
+        glance_host = CONF.glance_host
+        # ipv6 address, need to wrap it with '[]'
+        if utils.is_valid_ipv6(glance_host):
+            glance_host = '[%s]' % glance_host
+        https_url = "https://%s:%d" % (glance_host, CONF.glance_port)
         self.assertEqual(generated_url, https_url)
+
+
+class TestGlanceApiServers(test.TestCase):
+
+    def test_get_ipv4_api_servers(self):
+        self.flags(glance_api_servers=['10.0.1.1:9292',
+                              'https://10.0.0.1:9293',
+                              'http://10.0.2.2:9294'])
+        glance_host = ['10.0.1.1', '10.0.0.1',
+                        '10.0.2.2']
+        api_servers = glance.get_api_servers()
+        i = 0
+        for server in api_servers:
+            i += 1
+            self.assertIn(server[0], glance_host)
+            if i > 2:
+                break
+
+    # Python 2.6 can not parse ipv6 address correctly
+    @testtools.skipIf(sys.version_info < (2, 7), "py27 or greater only")
+    def test_get_ipv6_api_servers(self):
+        self.flags(glance_api_servers=['[2001:2012:1:f101::1]:9292',
+                              'https://[2010:2013:1:f122::1]:9293',
+                              'http://[2001:2011:1:f111::1]:9294'])
+        glance_host = ['2001:2012:1:f101::1', '2010:2013:1:f122::1',
+                        '2001:2011:1:f111::1']
+        api_servers = glance.get_api_servers()
+        i = 0
+        for server in api_servers:
+            i += 1
+            self.assertIn(server[0], glance_host)
+            if i > 2:
+                break
+
+
+class TestUpdateGlanceImage(test.NoDBTestCase):
+    def test_start(self):
+        consumer = glance.UpdateGlanceImage(
+            'context', 'id', 'metadata', 'stream')
+        image_service = self.mox.CreateMock(glance.GlanceImageService)
+
+        self.mox.StubOutWithMock(glance, 'get_remote_image_service')
+
+        glance.get_remote_image_service(
+            'context', 'id').AndReturn((image_service, 'image_id'))
+        image_service.update(
+            'context', 'image_id', 'metadata', 'stream', purge_props=False)
+
+        self.mox.ReplayAll()
+
+        consumer.start()

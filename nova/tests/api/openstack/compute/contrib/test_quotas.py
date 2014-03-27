@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # Copyright 2013 IBM Corp.
 # All Rights Reserved.
@@ -135,6 +133,26 @@ class QuotaSetsTest(test.TestCase):
 
         self.assertEqual(res_dict, body)
 
+    def test_quotas_update_zero_value_as_admin(self):
+        self.ext_mgr.is_loaded('os-extended-quotas').AndReturn(True)
+        self.ext_mgr.is_loaded('os-user-quotas').AndReturn(True)
+        self.mox.ReplayAll()
+        body = {'quota_set': {'instances': 0, 'cores': 0,
+                              'ram': 0, 'floating_ips': 0,
+                              'fixed_ips': 0, 'metadata_items': 0,
+                              'injected_files': 0,
+                              'injected_file_content_bytes': 0,
+                              'injected_file_path_bytes': 0,
+                              'security_groups': 0,
+                              'security_group_rules': 0,
+                              'key_pairs': 100, 'fixed_ips': -1}}
+
+        req = fakes.HTTPRequest.blank('/v2/fake4/os-quota-sets/update_me',
+                                      use_admin_context=True)
+        res_dict = self.controller.update(req, 'update_me', body)
+
+        self.assertEqual(res_dict, body)
+
     def test_quotas_update_as_user(self):
         self.ext_mgr.is_loaded('os-extended-quotas').AndReturn(True)
         self.ext_mgr.is_loaded('os-user-quotas').AndReturn(True)
@@ -175,6 +193,16 @@ class QuotaSetsTest(test.TestCase):
                               'metadata_items': -2, 'injected_files': -2,
                               'injected_file_content_bytes': -2}}
 
+        req = fakes.HTTPRequest.blank('/v2/fake4/os-quota-sets/update_me',
+                                      use_admin_context=True)
+        self.assertRaises(webob.exc.HTTPBadRequest, self.controller.update,
+                          req, 'update_me', body)
+
+    def test_quotas_update_empty_body(self):
+        self.ext_mgr.is_loaded('os-extended-quotas').AndReturn(True)
+        self.ext_mgr.is_loaded('os-user-quotas').AndReturn(True)
+        self.mox.ReplayAll()
+        body = {}
         req = fakes.HTTPRequest.blank('/v2/fake4/os-quota-sets/update_me',
                                       use_admin_context=True)
         self.assertRaises(webob.exc.HTTPBadRequest, self.controller.update,
@@ -258,6 +286,45 @@ class QuotaSetsTest(test.TestCase):
         self.assertRaises(webob.exc.HTTPBadRequest, self.controller.update,
                           req, 'update_me', body)
 
+    def test_quotas_update_invalid_value_with_float(self):
+        # when PUT non integer value
+        body = {'quota_set': {'instances': 50.5, 'cores': 50,
+                              'ram': {}, 'floating_ips': 10,
+                              'fixed_ips': -1, 'metadata_items': 128,
+                              'injected_files': 5,
+                              'injected_file_content_bytes': 10240,
+                              'injected_file_path_bytes': 255,
+                              'security_groups': 10,
+                              'security_group_rules': 20,
+                              'key_pairs': 100}}
+        req = fakes.HTTPRequest.blank('/v2/fake4/os-quota-sets/update_me',
+                                      use_admin_context=True)
+        self.ext_mgr.is_loaded('os-extended-quotas').AndReturn(True)
+        self.ext_mgr.is_loaded('os-user-quotas').AndReturn(True)
+        self.mox.ReplayAll()
+        self.assertRaises(webob.exc.HTTPBadRequest, self.controller.update,
+                          req, 'update_me', body)
+
+    def test_quotas_update_invalid_value_with_unicode(self):
+        # when PUT non integer value
+        body = {'quota_set': {'instances': u'\u30aa\u30fc\u30d7\u30f3',
+                              'cores': 50,
+                              'ram': {}, 'floating_ips': 10,
+                              'fixed_ips': -1, 'metadata_items': 128,
+                              'injected_files': 5,
+                              'injected_file_content_bytes': 10240,
+                              'injected_file_path_bytes': 255,
+                              'security_groups': 10,
+                              'security_group_rules': 20,
+                              'key_pairs': 100}}
+        req = fakes.HTTPRequest.blank('/v2/fake4/os-quota-sets/update_me',
+                                      use_admin_context=True)
+        self.ext_mgr.is_loaded('os-extended-quotas').AndReturn(True)
+        self.ext_mgr.is_loaded('os-user-quotas').AndReturn(True)
+        self.mox.ReplayAll()
+        self.assertRaises(webob.exc.HTTPBadRequest, self.controller.update,
+                          req, 'update_me', body)
+
     def test_delete_quotas_when_extension_not_loaded(self):
         self.ext_mgr.is_loaded('os-extended-quotas').AndReturn(False)
         self.mox.ReplayAll()
@@ -315,7 +382,7 @@ class QuotaXMLSerializerTest(test.TestCase):
         self.assertEqual('project_id', tree.get('id'))
         self.assertEqual(len(exemplar['quota_set']) - 1, len(tree))
         for child in tree:
-            self.assertTrue(child.tag in exemplar['quota_set'])
+            self.assertIn(child.tag, exemplar['quota_set'])
             self.assertEqual(int(child.text), exemplar['quota_set'][child.tag])
 
     def test_deserializer(self):

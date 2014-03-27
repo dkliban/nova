@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2010 Cloud.com, Inc
 # Copyright (c) 2012 Cloudbase Solutions Srl
 #
@@ -25,6 +23,7 @@ from nova.virt import driver
 from nova.virt.hyperv import hostops
 from nova.virt.hyperv import livemigrationops
 from nova.virt.hyperv import migrationops
+from nova.virt.hyperv import rdpconsoleops
 from nova.virt.hyperv import snapshotops
 from nova.virt.hyperv import vmops
 from nova.virt.hyperv import volumeops
@@ -42,6 +41,7 @@ class HyperVDriver(driver.ComputeDriver):
         self._snapshotops = snapshotops.SnapshotOps()
         self._livemigrationops = livemigrationops.LiveMigrationOps()
         self._migrationops = migrationops.MigrationOps()
+        self._rdpconsoleops = rdpconsoleops.RDPConsoleOps()
 
     def init_host(self, host):
         pass
@@ -58,19 +58,26 @@ class HyperVDriver(driver.ComputeDriver):
                block_device_info=None, bad_volumes_callback=None):
         self._vmops.reboot(instance, network_info, reboot_type)
 
-    def destroy(self, instance, network_info, block_device_info=None,
+    def destroy(self, context, instance, network_info, block_device_info=None,
                 destroy_disks=True):
         self._vmops.destroy(instance, network_info, block_device_info,
                             destroy_disks)
 
+    def cleanup(self, context, instance, network_info, block_device_info=None,
+                destroy_disks=True):
+        """Cleanup after instance being destroyed by Hypervisor."""
+        pass
+
     def get_info(self, instance):
         return self._vmops.get_info(instance)
 
-    def attach_volume(self, connection_info, instance, mountpoint):
+    def attach_volume(self, context, connection_info, instance, mountpoint,
+                      disk_bus=None, device_type=None, encryption=None):
         return self._volumeops.attach_volume(connection_info,
                                              instance['name'])
 
-    def detach_volume(self, connection_info, instance, mountpoint):
+    def detach_volume(self, connection_info, instance, mountpoint,
+                      encryption=None):
         return self._volumeops.detach_volume(connection_info,
                                              instance['name'])
 
@@ -98,7 +105,7 @@ class HyperVDriver(driver.ComputeDriver):
     def suspend(self, instance):
         self._vmops.suspend(instance)
 
-    def resume(self, instance, network_info, block_device_info=None):
+    def resume(self, context, instance, network_info, block_device_info=None):
         self._vmops.resume(instance)
 
     def power_off(self, instance):
@@ -114,6 +121,11 @@ class HyperVDriver(driver.ComputeDriver):
         self._livemigrationops.live_migration(context, instance_ref, dest,
                                               post_method, recover_method,
                                               block_migration, migrate_data)
+
+    def rollback_live_migration_at_destination(self, context, instance,
+                                               network_info,
+                                               block_device_info):
+        self.destroy(context, instance, network_info, block_device_info)
 
     def pre_live_migration(self, context, instance, block_device_info,
                            network_info, disk, migrate_data=None):
@@ -149,10 +161,14 @@ class HyperVDriver(driver.ComputeDriver):
             ctxt, instance_ref, dest_check_data)
 
     def plug_vifs(self, instance, network_info):
-        LOG.debug(_("plug_vifs called"), instance=instance)
+        """Plug VIFs into networks."""
+        msg = _("VIF plugging is not supported by the Hyper-V driver.")
+        raise NotImplementedError(msg)
 
     def unplug_vifs(self, instance, network_info):
-        LOG.debug(_("unplug_vifs called"), instance=instance)
+        """Unplug VIFs from networks."""
+        msg = _("VIF unplugging is not supported by the Hyper-V driver.")
+        raise NotImplementedError(msg)
 
     def ensure_filtering_rules_for_instance(self, instance_ref, network_info):
         LOG.debug(_("ensure_filtering_rules_for_instance called"),
@@ -162,20 +178,21 @@ class HyperVDriver(driver.ComputeDriver):
         LOG.debug(_("unfilter_instance called"), instance=instance)
 
     def migrate_disk_and_power_off(self, context, instance, dest,
-                                   instance_type, network_info,
+                                   flavor, network_info,
                                    block_device_info=None):
         return self._migrationops.migrate_disk_and_power_off(context,
                                                              instance, dest,
-                                                             instance_type,
+                                                             flavor,
                                                              network_info,
                                                              block_device_info)
 
     def confirm_migration(self, migration, instance, network_info):
         self._migrationops.confirm_migration(migration, instance, network_info)
 
-    def finish_revert_migration(self, instance, network_info,
+    def finish_revert_migration(self, context, instance, network_info,
                                 block_device_info=None, power_on=True):
-        self._migrationops.finish_revert_migration(instance, network_info,
+        self._migrationops.finish_revert_migration(context, instance,
+                                                   network_info,
                                                    block_device_info, power_on)
 
     def finish_migration(self, context, migration, instance, disk_info,
@@ -189,9 +206,5 @@ class HyperVDriver(driver.ComputeDriver):
     def get_host_ip_addr(self):
         return self._hostops.get_host_ip_addr()
 
-    def get_console_output(self, instance):
-        LOG.debug(_("get_console_output called"), instance=instance)
-        return ''
-
-    def legacy_nwinfo(self):
-        return False
+    def get_rdp_console(self, context, instance):
+        return self._rdpconsoleops.get_rdp_console(instance)

@@ -1,4 +1,6 @@
-# Copyright (c) 2012 Rackspace Hosting # All Rights Reserved.
+# Copyright (c) 2012 Rackspace Hosting
+# All Rights Reserved.
+# Copyright 2013 Red Hat, Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -15,28 +17,31 @@
 Tests For Cells Messaging module
 """
 
+import mox
 from oslo.config import cfg
+from oslo import messaging as oslo_messaging
 
 from nova.cells import messaging
 from nova.cells import utils as cells_utils
+from nova.compute import task_states
 from nova.compute import vm_states
 from nova import context
 from nova import db
 from nova import exception
+from nova.network import model as network_model
 from nova.objects import base as objects_base
+from nova.objects import fields as objects_fields
 from nova.objects import instance as instance_obj
 from nova.openstack.common import jsonutils
-from nova.openstack.common import rpc
 from nova.openstack.common import timeutils
 from nova.openstack.common import uuidutils
+from nova import rpc
 from nova import test
 from nova.tests.cells import fakes
 from nova.tests import fake_instance_actions
 
 CONF = cfg.CONF
 CONF.import_opt('name', 'nova.cells.opts', group='cells')
-CONF.import_opt('allowed_rpc_exception_modules',
-                'nova.openstack.common.rpc')
 
 
 class CellsMessageClassesTestCase(test.TestCase):
@@ -45,10 +50,6 @@ class CellsMessageClassesTestCase(test.TestCase):
         super(CellsMessageClassesTestCase, self).setUp()
         fakes.init(self)
         self.ctxt = context.RequestContext('fake', 'fake')
-        # Need to be able to deserialize test.TestingException.
-        allowed_modules = CONF.allowed_rpc_exception_modules
-        allowed_modules.append('nova.test')
-        self.flags(allowed_rpc_exception_modules=allowed_modules)
         self.our_name = 'api-cell'
         self.msg_runner = fakes.get_message_runner(self.our_name)
         self.state_manager = self.msg_runner.state_manager
@@ -274,7 +275,7 @@ class CellsMessageClassesTestCase(test.TestCase):
             """Test object.  We just need 1 field in order to test
             that this gets serialized properly.
             """
-            fields = {'test': str}
+            fields = {'test': objects_fields.StringField()}
 
         test_obj = CellsMsgingTestObject()
         test_obj.test = 'meow'
@@ -302,7 +303,7 @@ class CellsMessageClassesTestCase(test.TestCase):
         self.assertEqual(2, call_info['kwargs']['arg2'])
         # Verify we get a new object with what we expect.
         obj = call_info['kwargs']['obj']
-        self.assertTrue(isinstance(obj, CellsMsgingTestObject))
+        self.assertIsInstance(obj, CellsMsgingTestObject)
         self.assertNotEqual(id(test_obj), id(obj))
         self.assertEqual(test_obj.test, obj.test)
 
@@ -360,7 +361,7 @@ class CellsMessageClassesTestCase(test.TestCase):
         self.assertEqual(method_kwargs, call_info['kwargs'])
         self.assertEqual(target_cell, call_info['routing_path'])
         self.assertFalse(response.failure)
-        self.assertTrue(response.value_or_raise(), 'our_fake_response')
+        self.assertEqual(response.value_or_raise(), 'our_fake_response')
 
     def test_grandchild_targeted_message_with_error(self):
         target_cell = 'api-cell!child-cell2!grandchild-cell1'
@@ -897,19 +898,36 @@ class CellsTargetedMethodsTestCase(test.TestCase):
             topic='compute')
         self.assertEqual(expected_result, result)
 
+    def test_service_delete(self):
+        fake_service = dict(id=42, host='fake_host', binary='nova-compute',
+                            topic='compute')
+
+        ctxt = self.ctxt.elevated()
+        db.service_create(ctxt, fake_service)
+
+        self.src_msg_runner.service_delete(
+            ctxt, self.tgt_cell_name, fake_service['id'])
+        self.assertRaises(exception.ServiceNotFound,
+                          db.service_get, ctxt, fake_service['id'])
+
     def test_proxy_rpc_to_manager_call(self):
         fake_topic = 'fake-topic'
-        fake_rpc_message = 'fake-rpc-message'
+        fake_rpc_message = {'method': 'fake_rpc_method', 'args': {}}
         fake_host_name = 'fake-host-name'
 
         self.mox.StubOutWithMock(self.tgt_db_inst,
                                  'service_get_by_compute_host')
-        self.mox.StubOutWithMock(rpc, 'call')
-
         self.tgt_db_inst.service_get_by_compute_host(self.ctxt,
                                                      fake_host_name)
-        rpc.call(self.ctxt, fake_topic,
-                 fake_rpc_message, timeout=5).AndReturn('fake_result')
+
+        target = oslo_messaging.Target(topic='fake-topic')
+        rpcclient = self.mox.CreateMockAnything()
+
+        self.mox.StubOutWithMock(rpc, 'get_client')
+        rpc.get_client(target).AndReturn(rpcclient)
+        rpcclient.prepare(timeout=5).AndReturn(rpcclient)
+        rpcclient.call(mox.IgnoreArg(),
+                       'fake_rpc_method').AndReturn('fake_result')
 
         self.mox.ReplayAll()
 
@@ -924,16 +942,20 @@ class CellsTargetedMethodsTestCase(test.TestCase):
 
     def test_proxy_rpc_to_manager_cast(self):
         fake_topic = 'fake-topic'
-        fake_rpc_message = 'fake-rpc-message'
+        fake_rpc_message = {'method': 'fake_rpc_method', 'args': {}}
         fake_host_name = 'fake-host-name'
 
         self.mox.StubOutWithMock(self.tgt_db_inst,
                                  'service_get_by_compute_host')
-        self.mox.StubOutWithMock(rpc, 'cast')
-
         self.tgt_db_inst.service_get_by_compute_host(self.ctxt,
                                                      fake_host_name)
-        rpc.cast(self.ctxt, fake_topic, fake_rpc_message)
+
+        target = oslo_messaging.Target(topic='fake-topic')
+        rpcclient = self.mox.CreateMockAnything()
+
+        self.mox.StubOutWithMock(rpc, 'get_client')
+        rpc.get_client(target).AndReturn(rpcclient)
+        rpcclient.cast(mox.IgnoreArg(), 'fake_rpc_method')
 
         self.mox.ReplayAll()
 
@@ -961,7 +983,7 @@ class CellsTargetedMethodsTestCase(test.TestCase):
         response = self.src_msg_runner.task_log_get_all(self.ctxt,
                 self.tgt_cell_name, task_name, begin, end, host=host,
                 state=state)
-        self.assertTrue(isinstance(response, list))
+        self.assertIsInstance(response, list)
         self.assertEqual(1, len(response))
         result = response[0].value_or_raise()
         self.assertEqual(['fake_result'], result)
@@ -1123,7 +1145,10 @@ class CellsTargetedMethodsTestCase(test.TestCase):
         instance.task_state = 'meow'
         instance.vm_state = 'wuff'
         instance.user_data = 'foo'
-        self.assertEqual(set(['user_data', 'vm_state', 'task_state']),
+        instance.metadata = {'meta': 'data'}
+        instance.system_metadata = {'system': 'metadata'}
+        self.assertEqual(set(['user_data', 'vm_state', 'task_state',
+                              'metadata', 'system_metadata']),
                          instance.obj_what_changed())
 
         self.mox.StubOutWithMock(instance, 'save')
@@ -1182,7 +1207,14 @@ class CellsTargetedMethodsTestCase(test.TestCase):
 
         self.mox.ReplayAll()
 
-        result = getattr(meth_cls, '%s_instance' % method)(
+        method_translations = {'revert_resize': 'revert_resize',
+                               'confirm_resize': 'confirm_resize',
+                               'reset_network': 'reset_network',
+                               'inject_network_info': 'inject_network_info',
+                              }
+        tgt_method = method_translations.get(method,
+                                             '%s_instance' % method)
+        result = getattr(meth_cls, tgt_method)(
                 message, 'fake-instance', *args, **kwargs)
         if expect_result:
             self.assertEqual('meow', result)
@@ -1236,6 +1268,101 @@ class CellsTargetedMethodsTestCase(test.TestCase):
 
     def test_unpause_instance(self):
         self._test_instance_action_method('unpause', (), {}, (), {}, False)
+
+    def test_resize_instance(self):
+        kwargs = dict(flavor=dict(id=42, flavorid='orangemocchafrappuccino'),
+                      extra_instance_updates=dict(cow='moo'))
+        expected_kwargs = dict(flavor_id='orangemocchafrappuccino', cow='moo')
+        self._test_instance_action_method('resize', (), kwargs,
+                                          (), expected_kwargs,
+                                          False)
+
+    def test_live_migrate_instance(self):
+        kwargs = dict(block_migration='fake-block-mig',
+                      disk_over_commit='fake-commit',
+                      host_name='fake-host')
+        expected_args = ('fake-block-mig', 'fake-commit', 'fake-host')
+        self._test_instance_action_method('live_migrate', (), kwargs,
+                                          expected_args, {}, False)
+
+    def test_revert_resize(self):
+        self._test_instance_action_method('revert_resize',
+                                          (), {}, (), {}, False)
+
+    def test_confirm_resize(self):
+        self._test_instance_action_method('confirm_resize',
+                                          (), {}, (), {}, False)
+
+    def test_reset_network(self):
+        self._test_instance_action_method('reset_network',
+                                          (), {}, (), {}, False)
+
+    def test_inject_network_info(self):
+        self._test_instance_action_method('inject_network_info',
+                                          (), {}, (), {}, False)
+
+    def test_snapshot_instance(self):
+        inst = instance_obj.Instance()
+        meth_cls = self.tgt_methods_cls
+
+        self.mox.StubOutWithMock(inst, 'refresh')
+        self.mox.StubOutWithMock(inst, 'save')
+        self.mox.StubOutWithMock(meth_cls.compute_rpcapi, 'snapshot_instance')
+
+        def check_state(expected_task_state=None):
+            self.assertEqual(task_states.IMAGE_SNAPSHOT_PENDING,
+                             inst.task_state)
+
+        inst.refresh()
+        inst.save(expected_task_state=[None]).WithSideEffects(check_state)
+
+        meth_cls.compute_rpcapi.snapshot_instance(self.ctxt,
+                                                  inst, 'image-id')
+
+        self.mox.ReplayAll()
+
+        class FakeMessage(object):
+            pass
+
+        message = FakeMessage()
+        message.ctxt = self.ctxt
+        message.need_response = False
+
+        meth_cls.snapshot_instance(message, inst, image_id='image-id')
+
+    def test_backup_instance(self):
+        inst = instance_obj.Instance()
+        meth_cls = self.tgt_methods_cls
+
+        self.mox.StubOutWithMock(inst, 'refresh')
+        self.mox.StubOutWithMock(inst, 'save')
+        self.mox.StubOutWithMock(meth_cls.compute_rpcapi, 'backup_instance')
+
+        def check_state(expected_task_state=None):
+            self.assertEqual(task_states.IMAGE_BACKUP, inst.task_state)
+
+        inst.refresh()
+        inst.save(expected_task_state=[None]).WithSideEffects(check_state)
+
+        meth_cls.compute_rpcapi.backup_instance(self.ctxt,
+                                                inst,
+                                                'image-id',
+                                                'backup-type',
+                                                'rotation')
+
+        self.mox.ReplayAll()
+
+        class FakeMessage(object):
+            pass
+
+        message = FakeMessage()
+        message.ctxt = self.ctxt
+        message.need_response = False
+
+        meth_cls.backup_instance(message, inst,
+                                 image_id='image-id',
+                                 backup_type='backup-type',
+                                 rotation='rotation')
 
 
 class CellsBroadcastMethodsTestCase(test.TestCase):
@@ -1293,10 +1420,27 @@ class CellsBroadcastMethodsTestCase(test.TestCase):
         self.assertFalse(self.mid_methods_cls._at_the_top())
         self.assertFalse(self.src_methods_cls._at_the_top())
 
-    def test_instance_update_at_top(self):
+    def test_apply_expected_states_building(self):
+        instance_info = {'vm_state': vm_states.BUILDING}
+        expected = dict(instance_info,
+                        expected_vm_state=[vm_states.BUILDING, None])
+        self.src_methods_cls._apply_expected_states(instance_info)
+        self.assertEqual(expected, instance_info)
+
+    def test_apply_expected_states_resize_finish(self):
+        instance_info = {'task_state': task_states.RESIZE_FINISH}
+        exp_states = [task_states.RESIZE_FINISH,
+                      task_states.RESIZE_MIGRATED,
+                      task_states.RESIZE_MIGRATING,
+                      task_states.RESIZE_PREP]
+        expected = dict(instance_info, expected_task_state=exp_states)
+        self.src_methods_cls._apply_expected_states(instance_info)
+        self.assertEqual(expected, instance_info)
+
+    def _test_instance_update_at_top(self, net_info, exists=True):
         fake_info_cache = {'id': 1,
                            'instance': 'fake_instance',
-                           'other': 'moo'}
+                           'network_info': net_info}
         fake_sys_metadata = [{'id': 1,
                               'key': 'key1',
                               'value': 'value1'},
@@ -1315,7 +1459,7 @@ class CellsBroadcastMethodsTestCase(test.TestCase):
                          'other': 'meow'}
         expected_sys_metadata = {'key1': 'value1',
                                  'key2': 'value2'}
-        expected_info_cache = {'other': 'moo'}
+        expected_info_cache = {'network_info': "[]"}
         expected_cell_name = 'api-cell!child-cell2!grandchild-cell1'
         expected_instance = {'system_metadata': expected_sys_metadata,
                              'cell_name': expected_cell_name,
@@ -1331,16 +1475,33 @@ class CellsBroadcastMethodsTestCase(test.TestCase):
                                  'instance_info_cache_update')
 
         self.mox.StubOutWithMock(self.tgt_db_inst, 'instance_update')
+        self.mox.StubOutWithMock(self.tgt_db_inst, 'instance_create')
         self.mox.StubOutWithMock(self.tgt_db_inst,
                                  'instance_info_cache_update')
-        self.tgt_db_inst.instance_update(self.ctxt, 'fake_uuid',
-                                         expected_instance,
-                                         update_cells=False)
+        mock = self.tgt_db_inst.instance_update(self.ctxt, 'fake_uuid',
+                                                expected_instance,
+                                                update_cells=False)
+        if not exists:
+            mock.AndRaise(exception.InstanceNotFound(instance_id='fake_uuid'))
+            self.tgt_db_inst.instance_create(self.ctxt,
+                                             expected_instance)
         self.tgt_db_inst.instance_info_cache_update(self.ctxt, 'fake_uuid',
                                                     expected_info_cache)
         self.mox.ReplayAll()
 
         self.src_msg_runner.instance_update_at_top(self.ctxt, fake_instance)
+
+    def test_instance_update_at_top(self):
+        self._test_instance_update_at_top("[]")
+
+    def test_instance_update_at_top_netinfo_list(self):
+        self._test_instance_update_at_top([])
+
+    def test_instance_update_at_top_netinfo_model(self):
+        self._test_instance_update_at_top(network_model.NetworkInfo())
+
+    def test_instance_update_at_top_doesnt_already_exist(self):
+        self._test_instance_update_at_top([], exists=False)
 
     def test_instance_update_at_top_with_building_state(self):
         fake_info_cache = {'id': 1,
@@ -1912,7 +2073,7 @@ class CellsBroadcastMethodsTestCase(test.TestCase):
         responses = self.src_msg_runner.get_migrations(
                 self.ctxt,
                 None, False, filters)
-        self.assertEquals(2, len(responses))
+        self.assertEqual(2, len(responses))
         for response in responses:
             self.assertIn(response.value_or_raise(), [migrations_from_cell1,
                                                       migrations_from_cell2])

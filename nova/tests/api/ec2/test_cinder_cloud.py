@@ -1,9 +1,8 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011 X.commerce, a business unit of eBay Inc.
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
+# Copyright 2013 Red Hat, Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -31,8 +30,9 @@ from nova.compute import utils as compute_utils
 from nova import context
 from nova import db
 from nova import exception
-from nova.openstack.common import rpc
+from nova.objects import instance as instance_obj
 from nova import test
+from nova.tests import cast_as_call
 from nova.tests import fake_network
 from nova.tests import fake_utils
 from nova.tests.image import fake
@@ -132,6 +132,7 @@ class CinderCloudTestCase(test.TestCase):
         self.compute = self.start_service('compute')
         self.scheduler = self.start_service('scheduler')
         self.network = self.start_service('network')
+        self.consoleauth = self.start_service('consoleauth')
 
         self.user_id = 'fake'
         self.project_id = 'fake'
@@ -141,9 +142,7 @@ class CinderCloudTestCase(test.TestCase):
         self.volume_api = volume.API()
         self.volume_api.reset_fake_api(self.context)
 
-        # NOTE(comstud): Make 'cast' behave like a 'call' which will
-        # ensure that operations complete
-        self.stubs.Set(rpc, 'cast', rpc.call)
+        self.useFixture(cast_as_call.CastAsCall(self.stubs))
 
         # make sure we can map ami-00000001/2 to a uuid in FakeImageService
         db.s3_image_create(self.context,
@@ -328,8 +327,8 @@ class CinderCloudTestCase(test.TestCase):
                          'pending')
 
         fake_snapshot['status'] = 'deleted'
-        self.assertEqual(self.cloud._format_snapshot(self.context,
-                                                     fake_snapshot), None)
+        self.assertIsNone(self.cloud._format_snapshot(self.context,
+                                                      fake_snapshot))
 
         fake_snapshot['status'] = 'error'
         self.assertEqual(self.cloud._format_snapshot(self.context,
@@ -586,6 +585,7 @@ class CinderCloudTestCase(test.TestCase):
         self._tearDownBlockDeviceMapping(inst1, inst2, volumes)
 
     def _setUpImageSet(self, create_volumes_and_snapshots=False):
+        self.flags(max_local_block_devices=-1)
         mappings1 = [
             {'device': '/dev/sda1', 'virtual': 'root'},
 
@@ -672,11 +672,11 @@ class CinderCloudTestCase(test.TestCase):
     def _assertImageSet(self, result, root_device_type, root_device_name):
         self.assertEqual(1, len(result['imagesSet']))
         result = result['imagesSet'][0]
-        self.assertTrue('rootDeviceType' in result)
+        self.assertIn('rootDeviceType', result)
         self.assertEqual(result['rootDeviceType'], root_device_type)
-        self.assertTrue('rootDeviceName' in result)
+        self.assertIn('rootDeviceName', result)
         self.assertEqual(result['rootDeviceName'], root_device_name)
-        self.assertTrue('blockDeviceMapping' in result)
+        self.assertIn('blockDeviceMapping', result)
 
         return result
 
@@ -691,7 +691,6 @@ class CinderCloudTestCase(test.TestCase):
         {'deviceName': '/dev/sdb2', 'ebs': {'snapshotId':
                                             'vol-00053977'}},
         {'deviceName': '/dev/sdb3', 'virtualName': 'ephemeral5'},
-        # {'deviceName': '/dev/sdb4', 'noDevice': True},
 
         {'deviceName': '/dev/sdc0', 'virtualName': 'swap'},
         {'deviceName': '/dev/sdc1', 'ebs': {'snapshotId':
@@ -699,7 +698,6 @@ class CinderCloudTestCase(test.TestCase):
         {'deviceName': '/dev/sdc2', 'ebs': {'snapshotId':
                                             'vol-00bc614e'}},
         {'deviceName': '/dev/sdc3', 'virtualName': 'ephemeral6'},
-        # {'deviceName': '/dev/sdc4', 'noDevice': True}
         ]
 
     _expected_root_device_name2 = '/dev/sdb1'
@@ -738,8 +736,8 @@ class CinderCloudTestCase(test.TestCase):
         self.assertEqual(vol['attach_status'], "attached")
 
     def _assert_volume_detached(self, vol):
-        self.assertEqual(vol['instance_uuid'], None)
-        self.assertEqual(vol['mountpoint'], None)
+        self.assertIsNone(vol['instance_uuid'])
+        self.assertIsNone(vol['mountpoint'])
         self.assertEqual(vol['status'], "available")
         self.assertEqual(vol['attach_status'], "detached")
 
@@ -858,9 +856,11 @@ class CinderCloudTestCase(test.TestCase):
         vol = self.volume_api.get(self.context, vol2_uuid)
         self._assert_volume_detached(vol)
 
+        inst_obj = instance_obj.Instance.get_by_uuid(self.context,
+                                                         instance_uuid)
         instance = db.instance_get_by_uuid(self.context, instance_uuid)
         self.cloud.compute_api.attach_volume(self.context,
-                                             instance,
+                                             inst_obj,
                                              volume_id=vol2_uuid,
                                              device='/dev/sdc')
 
@@ -963,14 +963,6 @@ class CinderCloudTestCase(test.TestCase):
         vol = self.volume_api.get(admin_ctxt, vol1_id)
         self._assert_volume_detached(vol)
         self.assertFalse(vol['deleted'])
-        #db.volume_destroy(self.context, vol1_id)
-
-        ##admin_ctxt = context.get_admin_context(read_deleted="only")
-        ##vol = db.volume_get(admin_ctxt, vol2_id)
-        ##self.assertTrue(vol['deleted'])
-
-        #for snapshot_id in (ec2_snapshot1_id, ec2_snapshot2_id):
-        #    self.cloud.delete_snapshot(self.context, snapshot_id)
 
     def test_create_image(self):
         # Make sure that CreateImage works.

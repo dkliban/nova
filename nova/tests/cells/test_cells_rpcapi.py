@@ -17,17 +17,18 @@ Tests For Cells RPCAPI
 """
 
 from oslo.config import cfg
+import six
 
 from nova.cells import rpcapi as cells_rpcapi
 from nova import exception
-from nova.openstack.common import rpc
 from nova import test
+from nova.tests import fake_instance
 
 CONF = cfg.CONF
 CONF.import_opt('topic', 'nova.cells.opts', group='cells')
 
 
-class CellsAPITestCase(test.TestCase):
+class CellsAPITestCase(test.NoDBTestCase):
     """Test case for cells.api interfaces."""
 
     def setUp(self):
@@ -40,26 +41,42 @@ class CellsAPITestCase(test.TestCase):
     def _stub_rpc_method(self, rpc_method, result):
         call_info = {}
 
-        def fake_rpc_method(ctxt, topic, msg, *args, **kwargs):
+        orig_prepare = self.cells_rpcapi.client.prepare
+
+        def fake_rpc_prepare(**kwargs):
+            if 'version' in kwargs:
+                call_info['version'] = kwargs.pop('version')
+            return self.cells_rpcapi.client
+
+        def fake_csv(version):
+            return orig_prepare(version).can_send_version()
+
+        def fake_rpc_method(ctxt, method, **kwargs):
             call_info['context'] = ctxt
-            call_info['topic'] = topic
-            call_info['msg'] = msg
+            call_info['method'] = method
+            call_info['args'] = kwargs
             return result
 
-        self.stubs.Set(rpc, rpc_method, fake_rpc_method)
+        self.stubs.Set(self.cells_rpcapi.client, 'prepare', fake_rpc_prepare)
+        self.stubs.Set(self.cells_rpcapi.client, 'can_send_version', fake_csv)
+        self.stubs.Set(self.cells_rpcapi.client, rpc_method, fake_rpc_method)
+
         return call_info
 
     def _check_result(self, call_info, method, args, version=None):
-        if version is None:
-            version = self.cells_rpcapi.BASE_RPC_API_VERSION
+        self.assertEqual(self.cells_rpcapi.client.target.topic,
+                         self.fake_topic)
         self.assertEqual(self.fake_context, call_info['context'])
-        self.assertEqual(self.fake_topic, call_info['topic'])
-        self.assertEqual(method, call_info['msg']['method'])
-        msg_version = call_info['msg']['version']
-        self.assertTrue(isinstance(msg_version, basestring),
-                        "Message version %s is not a string" % msg_version)
-        self.assertEqual(version, call_info['msg']['version'])
-        self.assertEqual(args, call_info['msg']['args'])
+        self.assertEqual(method, call_info['method'])
+        self.assertEqual(args, call_info['args'])
+        if version is not None:
+            self.assertIn('version', call_info)
+            self.assertIsInstance(call_info['version'], six.string_types,
+                                  msg="Message version %s is not a string" %
+                                  call_info['version'])
+            self.assertEqual(version, call_info['version'])
+        else:
+            self.assertNotIn('version', call_info)
 
     def test_cast_compute_api_method(self):
         fake_cell_name = 'fake_cell_name'
@@ -185,18 +202,18 @@ class CellsAPITestCase(test.TestCase):
                 expected_args)
 
     def test_instance_delete_everywhere(self):
-        fake_instance = {'uuid': 'fake-uuid'}
+        instance = fake_instance.fake_instance_obj(self.fake_context)
 
         call_info = self._stub_rpc_method('cast', None)
 
         self.cells_rpcapi.instance_delete_everywhere(
-                self.fake_context, fake_instance,
+                self.fake_context, instance,
                 'fake-type')
 
-        expected_args = {'instance': fake_instance,
+        expected_args = {'instance': instance,
                          'delete_type': 'fake-type'}
         self._check_result(call_info, 'instance_delete_everywhere',
-                expected_args)
+                expected_args, version='1.27')
 
     def test_instance_fault_create_at_top(self):
         fake_instance_fault = {'id': 2,
@@ -299,6 +316,16 @@ class CellsAPITestCase(test.TestCase):
                            expected_args,
                            version='1.7')
         self.assertEqual(result, 'fake_response')
+
+    def test_service_delete(self):
+        call_info = self._stub_rpc_method('call', None)
+        cell_service_id = 'cell@id'
+        result = self.cells_rpcapi.service_delete(
+            self.fake_context, cell_service_id=cell_service_id)
+        expected_args = {'cell_service_id': cell_service_id}
+        self._check_result(call_info, 'service_delete',
+                           expected_args, version='1.26')
+        self.assertIsNone(result)
 
     def test_proxy_rpc_to_manager(self):
         call_info = self._stub_rpc_method('call', 'fake_response')
@@ -634,3 +661,101 @@ class CellsAPITestCase(test.TestCase):
         expected_args = {'instance': 'fake-instance'}
         self._check_result(call_info, 'soft_delete_instance',
                            expected_args, version='1.18')
+
+    def test_resize_instance(self):
+        call_info = self._stub_rpc_method('cast', None)
+
+        self.cells_rpcapi.resize_instance(self.fake_context,
+                                          'fake-instance',
+                                          dict(cow='moo'),
+                                          'fake-hint',
+                                          'fake-flavor',
+                                          'fake-reservations')
+        expected_args = {'instance': 'fake-instance',
+                         'flavor': 'fake-flavor',
+                         'extra_instance_updates': dict(cow='moo')}
+        self._check_result(call_info, 'resize_instance',
+                           expected_args, version='1.20')
+
+    def test_live_migrate_instance(self):
+        call_info = self._stub_rpc_method('cast', None)
+
+        self.cells_rpcapi.live_migrate_instance(self.fake_context,
+                                                'fake-instance',
+                                                'fake-host',
+                                                'fake-block',
+                                                'fake-commit')
+        expected_args = {'instance': 'fake-instance',
+                         'block_migration': 'fake-block',
+                         'disk_over_commit': 'fake-commit',
+                         'host_name': 'fake-host'}
+        self._check_result(call_info, 'live_migrate_instance',
+                           expected_args, version='1.20')
+
+    def test_revert_resize(self):
+        call_info = self._stub_rpc_method('cast', None)
+
+        self.cells_rpcapi.revert_resize(self.fake_context,
+                                        'fake-instance',
+                                        'fake-migration',
+                                        'fake-dest',
+                                        'resvs')
+        expected_args = {'instance': 'fake-instance'}
+        self._check_result(call_info, 'revert_resize',
+                           expected_args, version='1.21')
+
+    def test_confirm_resize(self):
+        call_info = self._stub_rpc_method('cast', None)
+
+        self.cells_rpcapi.confirm_resize(self.fake_context,
+                                         'fake-instance',
+                                         'fake-migration',
+                                         'fake-source',
+                                         'resvs')
+        expected_args = {'instance': 'fake-instance'}
+        self._check_result(call_info, 'confirm_resize',
+                           expected_args, version='1.21')
+
+    def test_reset_network(self):
+        call_info = self._stub_rpc_method('cast', None)
+
+        self.cells_rpcapi.reset_network(self.fake_context,
+                                        'fake-instance')
+        expected_args = {'instance': 'fake-instance'}
+        self._check_result(call_info, 'reset_network',
+                           expected_args, version='1.22')
+
+    def test_inject_network_info(self):
+        call_info = self._stub_rpc_method('cast', None)
+
+        self.cells_rpcapi.inject_network_info(self.fake_context,
+                                             'fake-instance')
+        expected_args = {'instance': 'fake-instance'}
+        self._check_result(call_info, 'inject_network_info',
+                           expected_args, version='1.23')
+
+    def test_snapshot_instance(self):
+        call_info = self._stub_rpc_method('cast', None)
+
+        self.cells_rpcapi.snapshot_instance(self.fake_context,
+                                            'fake-instance',
+                                            'image-id')
+        expected_args = {'instance': 'fake-instance',
+                         'image_id': 'image-id'}
+        self._check_result(call_info, 'snapshot_instance',
+                           expected_args, version='1.24')
+
+    def test_backup_instance(self):
+        call_info = self._stub_rpc_method('cast', None)
+
+        self.cells_rpcapi.backup_instance(self.fake_context,
+                                          'fake-instance',
+                                          'image-id',
+                                          'backup-type',
+                                          'rotation')
+        expected_args = {'instance': 'fake-instance',
+                         'image_id': 'image-id',
+                         'backup_type': 'backup-type',
+                         'rotation': 'rotation'}
+        self._check_result(call_info, 'backup_instance',
+                           expected_args, version='1.24')

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011 Citrix Systems, Inc.
 # Copyright 2011 OpenStack Foundation
 #
@@ -21,6 +19,8 @@ The VMware API utility module.
 
 from oslo.config import cfg
 
+from nova.openstack.common.gettextutils import _
+from nova.openstack.common import log as logging
 
 vmware_opts = cfg.IntOpt('maximum_objects', default=100,
                          help='The maximum number of ObjectContent data '
@@ -34,6 +34,7 @@ vmware_opts = cfg.IntOpt('maximum_objects', default=100,
                               'additional requests.')
 CONF = cfg.CONF
 CONF.register_opt(vmware_opts, 'vmware')
+LOG = logging.getLogger(__name__)
 
 
 def build_selection_spec(client_factory, name):
@@ -56,8 +57,7 @@ def build_traversal_spec(client_factory, name, spec_type, path, skip,
 
 
 def build_recursive_traversal_spec(client_factory):
-    """
-    Builds the Recursive Traversal Spec to traverse the object managed
+    """Builds the Recursive Traversal Spec to traverse the object managed
     object hierarchy.
     """
     visit_folders_select_spec = build_selection_spec(client_factory,
@@ -167,15 +167,32 @@ def get_object_properties(vim, collector, mobj, type, properties):
 
 def get_dynamic_property(vim, mobj, type, property_name):
     """Gets a particular property of the Managed Object."""
-    obj_content = get_object_properties(vim, None, mobj, type, [property_name])
+    property_dict = get_dynamic_properties(vim, mobj, type, [property_name])
+    return property_dict.get(property_name)
+
+
+def get_dynamic_properties(vim, mobj, type, property_names):
+    """Gets the specified properties of the Managed Object."""
+    obj_content = get_object_properties(vim, None, mobj, type, property_names)
+    if obj_content is None:
+        return {}
     if hasattr(obj_content, 'token'):
-        vim.CancelRetrievePropertiesEx(token=obj_content.token)
-    property_value = None
+        cancel_retrieve(vim, obj_content.token)
+    property_dict = {}
     if obj_content.objects:
-        dynamic_property = obj_content.objects[0].propSet
-        if dynamic_property:
-            property_value = dynamic_property[0].val
-    return property_value
+        if hasattr(obj_content.objects[0], 'propSet'):
+            dynamic_properties = obj_content.objects[0].propSet
+            if dynamic_properties:
+                for prop in dynamic_properties:
+                    property_dict[prop.name] = prop.val
+        # The object may have information useful for logging
+        if hasattr(obj_content.objects[0], 'missingSet'):
+            for m in obj_content.objects[0].missingSet:
+                LOG.warning(_("Unable to retrieve value for %(path)s "
+                              "Reason: %(reason)s"),
+                            {'path': m.path,
+                             'reason': m.fault.localizedMessage})
+    return property_dict
 
 
 def get_objects(vim, type, properties_to_collect=None, all=False):
@@ -193,6 +210,26 @@ def get_objects(vim, type, properties_to_collect=None, all=False):
     property_filter_spec = build_property_filter_spec(client_factory,
                                 [property_spec],
                                 [object_spec])
+    options = client_factory.create('ns0:RetrieveOptions')
+    options.maxObjects = CONF.vmware.maximum_objects
+    return vim.RetrievePropertiesEx(
+            vim.get_service_content().propertyCollector,
+            specSet=[property_filter_spec], options=options)
+
+
+def get_inner_objects(vim, base_obj, path, inner_type,
+                      properties_to_collect=None, all=False):
+    """Gets the list of inner objects of the type specified."""
+    client_factory = vim.client.factory
+    base_type = base_obj._type
+    traversal_spec = build_traversal_spec(client_factory, 'inner', base_type,
+                                          path, False, [])
+    object_spec = build_object_spec(client_factory, base_obj, [traversal_spec])
+    property_spec = build_property_spec(client_factory, type=inner_type,
+                                properties_to_collect=properties_to_collect,
+                                all_properties=all)
+    property_filter_spec = build_property_filter_spec(client_factory,
+                                [property_spec], [object_spec])
     options = client_factory.create('ns0:RetrieveOptions')
     options.maxObjects = CONF.vmware.maximum_objects
     return vim.RetrievePropertiesEx(
@@ -242,8 +279,7 @@ def get_prop_filter_spec(client_factory, obj_spec, prop_spec):
 
 def get_properties_for_a_collection_of_objects(vim, type,
                                                obj_list, properties):
-    """
-    Gets the list of properties for the collection of
+    """Gets the list of properties for the collection of
     objects of the type specified.
     """
     client_factory = vim.client.factory
@@ -260,3 +296,8 @@ def get_properties_for_a_collection_of_objects(vim, type,
     return vim.RetrievePropertiesEx(
             vim.get_service_content().propertyCollector,
             specSet=[prop_filter_spec], options=options)
+
+
+def get_about_info(vim):
+    """Get the About Info from the service content."""
+    return vim.get_service_content().about

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -25,6 +23,8 @@ semantics of real hypervisor connections.
 
 """
 
+import contextlib
+
 from oslo.config import cfg
 
 from nova.compute import power_state
@@ -32,7 +32,9 @@ from nova.compute import task_states
 from nova import db
 from nova import exception
 from nova.openstack.common.gettextutils import _
+from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
+from nova import utils
 from nova.virt import driver
 from nova.virt import virtapi
 
@@ -97,10 +99,11 @@ class FakeDriver(driver.ComputeDriver):
           'memory_mb_used': 0,
           'local_gb_used': 100000000000,
           'hypervisor_type': 'fake',
-          'hypervisor_version': '1.0',
+          'hypervisor_version': utils.convert_version_to_int('1.0'),
           'hypervisor_hostname': CONF.host,
           'cpu_info': {},
           'disk_available_least': 500000000000,
+          'supported_instances': [(None, 'fake', None)],
           }
         self._mounts = {}
         self._interfaces = {}
@@ -127,11 +130,6 @@ class FakeDriver(driver.ComputeDriver):
         state = power_state.RUNNING
         fake_instance = FakeInstance(name, state)
         self.instances[name] = fake_instance
-
-    def live_snapshot(self, context, instance, name, update_task_state):
-        if instance['name'] not in self.instances:
-            raise exception.InstanceNotRunning(instance_id=instance['uuid'])
-        update_task_state(task_state=task_states.IMAGE_UPLOADING)
 
     def snapshot(self, context, instance, name, update_task_state):
         if instance['name'] not in self.instances:
@@ -167,11 +165,11 @@ class FakeDriver(driver.ComputeDriver):
         pass
 
     def migrate_disk_and_power_off(self, context, instance, dest,
-                                   instance_type, network_info,
+                                   flavor, network_info,
                                    block_device_info=None):
         pass
 
-    def finish_revert_migration(self, instance, network_info,
+    def finish_revert_migration(self, context, instance, network_info,
                                 block_device_info=None, power_on=True):
         pass
 
@@ -202,10 +200,10 @@ class FakeDriver(driver.ComputeDriver):
     def suspend(self, instance):
         pass
 
-    def resume(self, instance, network_info, block_device_info=None):
+    def resume(self, context, instance, network_info, block_device_info=None):
         pass
 
-    def destroy(self, instance, network_info, block_device_info=None,
+    def destroy(self, context, instance, network_info, block_device_info=None,
                 destroy_disks=True):
         key = instance['name']
         if key in self.instances:
@@ -215,7 +213,12 @@ class FakeDriver(driver.ComputeDriver):
                         {'key': key,
                          'inst': self.instances}, instance=instance)
 
-    def attach_volume(self, connection_info, instance, mountpoint):
+    def cleanup(self, context, instance, network_info, block_device_info=None,
+                destroy_disks=True):
+        pass
+
+    def attach_volume(self, context, connection_info, instance, mountpoint,
+                      disk_bus=None, device_type=None, encryption=None):
         """Attach the disk to the instance at mountpoint using info."""
         instance_name = instance['name']
         if instance_name not in self._mounts:
@@ -223,7 +226,8 @@ class FakeDriver(driver.ComputeDriver):
         self._mounts[instance_name][mountpoint] = connection_info
         return True
 
-    def detach_volume(self, connection_info, instance, mountpoint):
+    def detach_volume(self, connection_info, instance, mountpoint,
+                      encryption=None):
         """Detach the disk attached to the instance."""
         try:
             del self._mounts[instance['name']][mountpoint]
@@ -240,18 +244,16 @@ class FakeDriver(driver.ComputeDriver):
         self._mounts[instance_name][mountpoint] = new_connection_info
         return True
 
-    def attach_interface(self, instance, image_meta, network_info):
-        for (network, mapping) in network_info:
-            if mapping['vif_uuid'] in self._interfaces:
-                raise exception.InterfaceAttachFailed('duplicate')
-            self._interfaces[mapping['vif_uuid']] = mapping
+    def attach_interface(self, instance, image_meta, vif):
+        if vif['id'] in self._interfaces:
+            raise exception.InterfaceAttachFailed('duplicate')
+        self._interfaces[vif['id']] = vif
 
-    def detach_interface(self, instance, network_info):
-        for (network, mapping) in network_info:
-            try:
-                del self._interfaces[mapping['vif_uuid']]
-            except KeyError:
-                raise exception.InterfaceDetachFailed('not attached')
+    def detach_interface(self, instance, vif):
+        try:
+            del self._interfaces[vif['id']]
+        except KeyError:
+            raise exception.InterfaceDetachFailed('not attached')
 
     def get_info(self, instance):
         if instance['name'] not in self.instances:
@@ -295,25 +297,38 @@ class FakeDriver(driver.ComputeDriver):
         volusage = []
         return volusage
 
+    def get_host_cpu_stats(self):
+        stats = {'kernel': 5664160000000L,
+                'idle': 1592705190000000L,
+                'user': 26728850000000L,
+                'iowait': 6121490000000L}
+        stats['frequency'] = 800
+        return stats
+
     def block_stats(self, instance_name, disk_id):
         return [0L, 0L, 0L, 0L, None]
 
     def interface_stats(self, instance_name, iface_id):
         return [0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L]
 
-    def get_console_output(self, instance):
+    def get_console_output(self, context, instance):
         return 'FAKE CONSOLE OUTPUT\nANOTHER\nLAST LINE'
 
-    def get_vnc_console(self, instance):
+    def get_vnc_console(self, context, instance):
         return {'internal_access_path': 'FAKE',
                 'host': 'fakevncconsole.com',
                 'port': 6969}
 
-    def get_spice_console(self, instance):
+    def get_spice_console(self, context, instance):
         return {'internal_access_path': 'FAKE',
                 'host': 'fakespiceconsole.com',
                 'port': 6969,
                 'tlsPort': 6970}
+
+    def get_rdp_console(self, context, instance):
+        return {'internal_access_path': 'FAKE',
+                'host': 'fakerdpconsole.com',
+                'port': 6969}
 
     def get_console_pool_info(self, console_type):
         return {'address': '127.0.0.1',
@@ -351,12 +366,13 @@ class FakeDriver(driver.ComputeDriver):
                'hypervisor_version': '1.0',
                'hypervisor_hostname': nodename,
                'disk_available_least': 0,
-               'cpu_info': '?'}
+               'cpu_info': '?',
+               'supported_instances': jsonutils.dumps([(None, 'fake', None)])
+              }
         return dic
 
     def ensure_filtering_rules_for_instance(self, instance_ref, network_info):
-        """This method is supported only by libvirt."""
-        raise NotImplementedError('This method is supported only by libvirt.')
+        return
 
     def get_instance_disk_info(self, instance_name):
         return
@@ -364,6 +380,8 @@ class FakeDriver(driver.ComputeDriver):
     def live_migration(self, context, instance_ref, dest,
                        post_method, recover_method, block_migration=False,
                        migrate_data=None):
+        post_method(context, instance_ref, dest, block_migration,
+                            migrate_data)
         return
 
     def check_can_live_migrate_destination_cleanup(self, ctxt,
@@ -393,8 +411,7 @@ class FakeDriver(driver.ComputeDriver):
         return
 
     def unfilter_instance(self, instance_ref, network_info):
-        """This method is supported only by libvirt."""
-        raise NotImplementedError('This method is supported only by libvirt.')
+        return
 
     def test_remove_vm(self, instance_name):
         """Removes the named VM, as if it crashed. For testing."""
@@ -449,34 +466,12 @@ class FakeDriver(driver.ComputeDriver):
     def list_instance_uuids(self):
         return []
 
-    def legacy_nwinfo(self):
-        return True
-
 
 class FakeVirtAPI(virtapi.VirtAPI):
     def instance_update(self, context, instance_uuid, updates):
         return db.instance_update_and_get_original(context,
                                                    instance_uuid,
                                                    updates)
-
-    def aggregate_get_by_host(self, context, host, key=None):
-        return db.aggregate_get_by_host(context, host, key=key)
-
-    def aggregate_metadata_add(self, context, aggregate, metadata,
-                               set_delete=False):
-        return db.aggregate_metadata_add(context, aggregate['id'], metadata,
-                                         set_delete=set_delete)
-
-    def aggregate_metadata_delete(self, context, aggregate, key):
-        return db.aggregate_metadata_delete(context, aggregate['id'], key)
-
-    def security_group_get_by_instance(self, context, instance):
-        return db.security_group_get_by_instance(context, instance['uuid'])
-
-    def security_group_rule_get_by_security_group(self, context,
-                                                  security_group):
-        return db.security_group_rule_get_by_security_group(
-            context, security_group['id'])
 
     def provider_fw_rule_get_all(self, context):
         return db.provider_fw_rule_get_all(context)
@@ -485,5 +480,9 @@ class FakeVirtAPI(virtapi.VirtAPI):
         return db.agent_build_get_by_triple(context,
                                             hypervisor, os, architecture)
 
-    def instance_type_get(self, context, instance_type_id):
-        return db.instance_type_get(context, instance_type_id)
+    @contextlib.contextmanager
+    def wait_for_instance_event(self, instance, event_names, deadline=300,
+                                error_callback=None):
+        # NOTE(danms): Don't actually wait for any events, just
+        # fall through
+        yield

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from oslo.config import cfg
+import six
 
 from nova import conductor
 from nova import context
@@ -21,7 +22,6 @@ from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova.openstack.common import timeutils
 from nova.servicegroup import api
-from nova import utils
 
 
 CONF = cfg.CONF
@@ -49,27 +49,30 @@ class DbDriver(api.ServiceGroupDriver):
         report_interval = service.report_interval
         if report_interval:
             service.tg.add_timer(report_interval, self._report_state,
-                                 report_interval, service)
+                                 api.INITIAL_REPORTING_DELAY, service)
 
     def is_up(self, service_ref):
         """Moved from nova.utils
         Check whether a service is up based on last heartbeat.
         """
         last_heartbeat = service_ref['updated_at'] or service_ref['created_at']
-        if isinstance(last_heartbeat, basestring):
+        if isinstance(last_heartbeat, six.string_types):
             # NOTE(russellb) If this service_ref came in over rpc via
             # conductor, then the timestamp will be a string and needs to be
             # converted back to a datetime.
             last_heartbeat = timeutils.parse_strtime(last_heartbeat)
+        else:
+            # Objects have proper UTC timezones, but the timeutils comparison
+            # below does not (and will fail)
+            last_heartbeat = last_heartbeat.replace(tzinfo=None)
         # Timestamps in DB are UTC.
-        elapsed = utils.total_seconds(timeutils.utcnow() - last_heartbeat)
+        elapsed = timeutils.delta_seconds(last_heartbeat, timeutils.utcnow())
         LOG.debug('DB_Driver.is_up last_heartbeat = %(lhb)s elapsed = %(el)s',
                   {'lhb': str(last_heartbeat), 'el': str(elapsed)})
         return abs(elapsed) <= CONF.service_down_time
 
     def get_all(self, group_id):
-        """
-        Returns ALL members of the given group
+        """Returns ALL members of the given group
         """
         LOG.debug(_('DB_Driver: get_all members of the %s group') % group_id)
         rs = []

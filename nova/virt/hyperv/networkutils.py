@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-#
 # Copyright 2013 Cloudbase Solutions Srl
 # All Rights Reserved.
 #
@@ -63,3 +61,8 @@ class NetworkUtils(object):
                                           {'port_name': port_name,
                                            'vswitch_path': vswitch_path})
         return new_port
+
+    def vswitch_port_needed(self):
+        # NOTE(alexpilotti): In WMI V2 the vswitch_path is set in the VM
+        # setting data without the need for a vswitch port.
+        return True

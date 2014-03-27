@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 Cloudbase Solutions Srl
 # All Rights Reserved.
 #
@@ -24,7 +22,6 @@ from nova.compute import power_state
 HYPERV_VM_STATE_ENABLED = 2
 HYPERV_VM_STATE_DISABLED = 3
 HYPERV_VM_STATE_REBOOT = 10
-HYPERV_VM_STATE_RESET = 11
 HYPERV_VM_STATE_PAUSED = 32768
 HYPERV_VM_STATE_SUSPENDED = 32769
 
@@ -70,3 +67,9 @@ VM_SUMMARY_UPTIME = 105
 
 IDE_DISK = "VHD"
 IDE_DVD = "DVD"
+
+DISK_FORMAT_VHD = "VHD"
+DISK_FORMAT_VHDX = "VHDX"
+
+VHD_TYPE_FIXED = 2
+VHD_TYPE_DYNAMIC = 3

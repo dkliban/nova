@@ -25,15 +25,21 @@ from nova.openstack.common import policy
 from nova import quota
 from nova import test
 from nova.tests.api.openstack import fakes
+from nova.tests.objects import test_keypair
 
 
 QUOTAS = quota.QUOTAS
 
 
+keypair_data = {
+    'public_key': 'FAKE_KEY',
+    'fingerprint': 'FAKE_FINGERPRINT',
+}
+
+
 def fake_keypair(name):
-    return {'public_key': 'FAKE_KEY',
-            'fingerprint': 'FAKE_FINGERPRINT',
-            'name': name}
+    return dict(test_keypair.fake_keypair,
+                name=name, **keypair_data)
 
 
 def db_key_pair_get_all_by_user(self, user_id):
@@ -41,7 +47,7 @@ def db_key_pair_get_all_by_user(self, user_id):
 
 
 def db_key_pair_create(self, keypair):
-    return keypair
+    return fake_keypair(name=keypair['name'])
 
 
 def db_key_pair_destroy(context, user_id, name):
@@ -78,7 +84,7 @@ class KeypairsTest(test.TestCase):
         res = req.get_response(self.app)
         self.assertEqual(res.status_int, 200)
         res_dict = jsonutils.loads(res.body)
-        response = {'keypairs': [{'keypair': fake_keypair('FAKE')}]}
+        response = {'keypairs': [{'keypair': dict(keypair_data, name='FAKE')}]}
         self.assertEqual(res_dict, response)
 
     def test_keypair_create(self):
@@ -103,6 +109,7 @@ class KeypairsTest(test.TestCase):
         self.assertEqual(res.status_int, 400)
         res_dict = jsonutils.loads(res.body)
         self.assertEqual(
+            'Keypair data is invalid: '
             'Keypair name must be between 1 and 255 characters long',
             res_dict['badRequest']['message'])
 
@@ -120,6 +127,7 @@ class KeypairsTest(test.TestCase):
         self.assertEqual(res.status_int, 400)
         res_dict = jsonutils.loads(res.body)
         self.assertEqual(
+            'Keypair data is invalid: '
             'Keypair name must be between 1 and 255 characters long',
             res_dict['badRequest']['message'])
 
@@ -138,6 +146,7 @@ class KeypairsTest(test.TestCase):
         self.assertEqual(res.status_int, 400)
         res_dict = jsonutils.loads(res.body)
         self.assertEqual(
+            "Keypair data is invalid: "
             "Keypair name contains unsafe characters",
             res_dict['badRequest']['message'])
 
@@ -166,7 +175,7 @@ class KeypairsTest(test.TestCase):
         # FIXME(ja): sholud we check that public_key was sent to create?
         res_dict = jsonutils.loads(res.body)
         self.assertTrue(len(res_dict['keypair']['fingerprint']) > 0)
-        self.assertFalse('private_key' in res_dict['keypair'])
+        self.assertNotIn('private_key', res_dict['keypair'])
 
     def test_keypair_import_quota_limit(self):
 
@@ -255,8 +264,9 @@ class KeypairsTest(test.TestCase):
         self.assertEqual(res.status_int, 400)
 
         res_dict = jsonutils.loads(res.body)
-        self.assertEqual("Keypair data is invalid",
-                         res_dict['badRequest']['message'])
+        self.assertEqual(
+            'Keypair data is invalid: failed to generate fingerprint',
+            res_dict['badRequest']['message'])
 
     def test_keypair_delete(self):
         req = webob.Request.blank('/v2/fake/os-keypairs/FAKE')
@@ -284,7 +294,8 @@ class KeypairsTest(test.TestCase):
     def test_keypair_show(self):
 
         def _db_key_pair_get(context, user_id, name):
-            return {'name': 'foo', 'public_key': 'XXX', 'fingerprint': 'YYY'}
+            return dict(test_keypair.fake_keypair,
+                        name='foo', public_key='XXX', fingerprint='YYY')
 
         self.stubs.Set(db, "key_pair_get", _db_key_pair_get)
 
@@ -319,10 +330,10 @@ class KeypairsTest(test.TestCase):
         req = webob.Request.blank('/v2/fake/servers/1')
         req.headers['Content-Type'] = 'application/json'
         response = req.get_response(fakes.wsgi_app(init_only=('servers',)))
-        self.assertEquals(response.status_int, 200)
+        self.assertEqual(response.status_int, 200)
         res_dict = jsonutils.loads(response.body)
-        self.assertTrue('key_name' in res_dict['server'])
-        self.assertEquals(res_dict['server']['key_name'], '')
+        self.assertIn('key_name', res_dict['server'])
+        self.assertEqual(res_dict['server']['key_name'], '')
 
     def test_detail_servers(self):
         self.stubs.Set(db, 'instance_get_all_by_filters',
@@ -330,11 +341,11 @@ class KeypairsTest(test.TestCase):
         req = fakes.HTTPRequest.blank('/v2/fake/servers/detail')
         res = req.get_response(fakes.wsgi_app(init_only=('servers',)))
         server_dicts = jsonutils.loads(res.body)['servers']
-        self.assertEquals(len(server_dicts), 5)
+        self.assertEqual(len(server_dicts), 5)
 
         for server_dict in server_dicts:
-            self.assertTrue('key_name' in server_dict)
-            self.assertEquals(server_dict['key_name'], '')
+            self.assertIn('key_name', server_dict)
+            self.assertEqual(server_dict['key_name'], '')
 
     def test_keypair_create_with_invalid_keypair_body(self):
         body = {'alpha': {'name': 'create_test'}}
@@ -356,7 +367,8 @@ class KeypairPolicyTest(test.TestCase):
         self.KeyPairController = keypairs.KeypairController()
 
         def _db_key_pair_get(context, user_id, name):
-            return {'name': 'foo', 'public_key': 'XXX', 'fingerprint': 'YYY'}
+            return dict(test_keypair.fake_keypair,
+                        name='foo', public_key='XXX', fingerprint='YYY')
 
         self.stubs.Set(db, "key_pair_get",
                        _db_key_pair_get)
@@ -382,7 +394,7 @@ class KeypairPolicyTest(test.TestCase):
         policy.set_rules(rules)
         req = fakes.HTTPRequest.blank('/v2/fake/os-keypairs')
         res = self.KeyPairController.index(req)
-        self.assertTrue('keypairs' in res)
+        self.assertIn('keypairs', res)
 
     def test_keypair_show_fail_policy(self):
         rules = policy.Rules({'compute_extension:keypairs:show':
@@ -399,7 +411,7 @@ class KeypairPolicyTest(test.TestCase):
         policy.set_rules(rules)
         req = fakes.HTTPRequest.blank('/v2/fake/os-keypairs/FAKE')
         res = self.KeyPairController.show(req, 'FAKE')
-        self.assertTrue('keypair' in res)
+        self.assertIn('keypair', res)
 
     def test_keypair_create_fail_policy(self):
         rules = policy.Rules({'compute_extension:keypairs:create':
@@ -419,7 +431,7 @@ class KeypairPolicyTest(test.TestCase):
         req = fakes.HTTPRequest.blank('/v2/fake/os-keypairs')
         req.method = 'POST'
         res = self.KeyPairController.create(req, body)
-        self.assertTrue('keypair' in res)
+        self.assertIn('keypair', res)
 
     def test_keypair_delete_fail_policy(self):
         rules = policy.Rules({'compute_extension:keypairs:delete':
@@ -460,7 +472,7 @@ class KeypairsXMLSerializerTest(test.TestCase):
 
         self.assertEqual('keypair', tree.tag)
         for child in tree:
-            self.assertTrue(child.tag in exemplar['keypair'])
+            self.assertIn(child.tag, exemplar['keypair'])
             self.assertEqual(child.text, exemplar['keypair'][child.tag])
 
     def test_index_serializer(self):
@@ -484,7 +496,7 @@ class KeypairsXMLSerializerTest(test.TestCase):
             self.assertEqual('keypair', keypair.tag)
             kp_data = exemplar['keypairs'][idx]['keypair']
             for child in keypair:
-                self.assertTrue(child.tag in kp_data)
+                self.assertIn(child.tag, kp_data)
                 self.assertEqual(child.text, kp_data[child.tag])
 
     def test_deserializer(self):

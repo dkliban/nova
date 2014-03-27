@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -16,57 +14,19 @@
 
 from oslo.config import cfg
 
-from nova.api.openstack import common
 from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
-from nova.api.openstack import xmlutil
 from nova import availability_zones
 from nova import db
 from nova import servicegroup
 
 CONF = cfg.CONF
 ALIAS = "os-availability-zone"
+ATTRIBUTE_NAME = "%s:availability_zone" % ALIAS
 authorize_list = extensions.extension_authorizer('compute',
                                                  'v3:' + ALIAS + ':list')
 authorize_detail = extensions.extension_authorizer('compute',
                                                    'v3:' + ALIAS + ':detail')
-
-
-def make_availability_zone(elem):
-    elem.set('name', 'zone_name')
-
-    zoneStateElem = xmlutil.SubTemplateElement(elem, 'zone_state',
-                                               selector='zone_state')
-    zoneStateElem.set('available')
-
-    hostsElem = xmlutil.SubTemplateElement(elem, 'hosts', selector='hosts')
-    hostElem = xmlutil.SubTemplateElement(hostsElem, 'host',
-                                          selector=xmlutil.get_items)
-    hostElem.set('name', 0)
-
-    svcsElem = xmlutil.SubTemplateElement(hostElem, 'services', selector=1)
-    svcElem = xmlutil.SubTemplateElement(svcsElem, 'service',
-                                         selector=xmlutil.get_items)
-    svcElem.set('name', 0)
-
-    svcStateElem = xmlutil.SubTemplateElement(svcElem, 'service_state',
-                                              selector=1)
-    svcStateElem.set('available')
-    svcStateElem.set('active')
-    svcStateElem.set('updated_at')
-
-    # Attach metadata node
-    elem.append(common.MetadataTemplate())
-
-
-class AvailabilityZonesTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('availability_zones')
-        zoneElem = xmlutil.SubTemplateElement(root, 'availability_zone',
-            selector='availability_zone_info')
-        make_availability_zone(zoneElem)
-        return xmlutil.MasterTemplate(root, 1, nsmap={
-            AvailabilityZone.alias: AvailabilityZone.namespace})
 
 
 class AvailabilityZoneController(wsgi.Controller):
@@ -124,7 +84,7 @@ class AvailabilityZoneController(wsgi.Controller):
         result = []
         for zone in available_zones:
             hosts = {}
-            for host in zone_hosts[zone]:
+            for host in zone_hosts.get(zone, []):
                 hosts[host] = {}
                 for service in host_services[zone + host]:
                     alive = self.servicegroup_api.service_is_up(service)
@@ -142,7 +102,6 @@ class AvailabilityZoneController(wsgi.Controller):
         return {'availability_zone_info': result}
 
     @extensions.expected_errors(())
-    @wsgi.serializers(xml=AvailabilityZonesTemplate)
     def index(self, req):
         """Returns a summary list of availability zone."""
         context = req.environ['nova.context']
@@ -151,7 +110,6 @@ class AvailabilityZoneController(wsgi.Controller):
         return self._describe_availability_zones(context)
 
     @extensions.expected_errors(())
-    @wsgi.serializers(xml=AvailabilityZonesTemplate)
     def detail(self, req):
         """Returns a detailed list of availability zone."""
         context = req.environ['nova.context']
@@ -167,8 +125,6 @@ class AvailabilityZone(extensions.V3APIExtensionBase):
 
     name = "AvailabilityZone"
     alias = ALIAS
-    namespace = ("http://docs.openstack.org/compute/ext/"
-                 "availabilityzone/api/v3")
     version = 1
 
     def get_resources(self):
@@ -184,10 +140,4 @@ class AvailabilityZone(extensions.V3APIExtensionBase):
         return []
 
     def server_create(self, server_dict, create_kwargs):
-        create_kwargs['availability_zone'] = server_dict.get(
-            'availability_zone')
-
-    def server_xml_extract_server_deserialize(self, server_node, server_dict):
-        availability_zone = server_node.getAttribute('availability_zone')
-        if availability_zone:
-            server_dict['availability_zone'] = availability_zone
+        create_kwargs['availability_zone'] = server_dict.get(ATTRIBUTE_NAME)

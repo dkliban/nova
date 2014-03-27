@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2013 The Johns Hopkins University/Applied Physics Laboratory
 # All Rights Reserved.
 #
@@ -25,7 +23,7 @@ from nova.keymgr import key
 from nova import test
 
 
-class KeyTestCase(test.TestCase):
+class KeyTestCase(test.NoDBTestCase):
 
     def _create_key(self):
         raise NotImplementedError()
@@ -48,10 +46,22 @@ class SymmetricKeyTestCase(KeyTestCase):
         super(SymmetricKeyTestCase, self).setUp()
 
     def test_get_algorithm(self):
-        self.assertEquals(self.key.get_algorithm(), self.algorithm)
+        self.assertEqual(self.key.get_algorithm(), self.algorithm)
 
     def test_get_format(self):
-        self.assertEquals(self.key.get_format(), 'RAW')
+        self.assertEqual(self.key.get_format(), 'RAW')
 
     def test_get_encoded(self):
-        self.assertEquals(self.key.get_encoded(), self.encoded)
+        self.assertEqual(self.key.get_encoded(), self.encoded)
+
+    def test___eq__(self):
+        self.assertTrue(self.key == self.key)
+
+        self.assertFalse(self.key == None)
+        self.assertFalse(None == self.key)
+
+    def test___ne__(self):
+        self.assertFalse(self.key != self.key)
+
+        self.assertTrue(self.key != None)
+        self.assertTrue(None != self.key)

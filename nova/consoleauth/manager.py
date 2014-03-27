@@ -1,6 +1,4 @@
 #!/usr/bin/env python
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -21,10 +19,12 @@
 import time
 
 from oslo.config import cfg
+from oslo import messaging
 
 from nova.cells import rpcapi as cells_rpcapi
 from nova.compute import rpcapi as compute_rpcapi
 from nova import manager
+from nova.objects import instance as instance_obj
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
@@ -36,10 +36,7 @@ LOG = logging.getLogger(__name__)
 consoleauth_opts = [
     cfg.IntOpt('console_token_ttl',
                default=600,
-               help='How many seconds before deleting tokens'),
-    cfg.StrOpt('consoleauth_manager',
-               default='nova.consoleauth.manager.ConsoleAuthManager',
-               help='Manager for console auth'),
+               help='How many seconds before deleting tokens')
     ]
 
 CONF = cfg.CONF
@@ -50,7 +47,7 @@ CONF.import_opt('enable', 'nova.cells.opts', group='cells')
 class ConsoleAuthManager(manager.Manager):
     """Manages token based authentication."""
 
-    RPC_API_VERSION = '1.2'
+    target = messaging.Target(version='2.0')
 
     def __init__(self, scheduler_driver=None, *args, **kwargs):
         super(ConsoleAuthManager, self).__init__(service_name='consoleauth',
@@ -68,7 +65,7 @@ class ConsoleAuthManager(manager.Manager):
         return tokens
 
     def authorize_console(self, context, token, console_type, host, port,
-                          internal_access_path, instance_uuid=None):
+                          internal_access_path, instance_uuid):
 
         token_dict = {'token': token,
                       'instance_uuid': instance_uuid,
@@ -79,11 +76,15 @@ class ConsoleAuthManager(manager.Manager):
                       'last_activity_at': time.time()}
         data = jsonutils.dumps(token_dict)
         self.mc.set(token.encode('UTF-8'), data, CONF.console_token_ttl)
-        if instance_uuid is not None:
-            tokens = self._get_tokens_for_instance(instance_uuid)
-            tokens.append(token)
-            self.mc.set(instance_uuid.encode('UTF-8'),
-                        jsonutils.dumps(tokens))
+        tokens = self._get_tokens_for_instance(instance_uuid)
+        # Remove the expired tokens from cache.
+        for tok in tokens:
+            token_str = self.mc.get(tok.encode('UTF-8'))
+            if not token_str:
+                tokens.remove(tok)
+        tokens.append(token)
+        self.mc.set(instance_uuid.encode('UTF-8'),
+                    jsonutils.dumps(tokens))
 
         LOG.audit(_("Received Token: %(token)s, %(token_dict)s"),
                   {'token': token, 'token_dict': token_dict})
@@ -100,7 +101,7 @@ class ConsoleAuthManager(manager.Manager):
             return self.cells_rpcapi.validate_console_port(context,
                     instance_uuid, token['port'], token['console_type'])
 
-        instance = self.db.instance_get_by_uuid(context, instance_uuid)
+        instance = instance_obj.Instance.get_by_uuid(context, instance_uuid)
 
         return self.compute_rpcapi.validate_console_port(context,
                                             instance,
@@ -122,8 +123,3 @@ class ConsoleAuthManager(manager.Manager):
         for token in tokens:
             self.mc.delete(token.encode('UTF-8'))
         self.mc.delete(instance_uuid.encode('UTF-8'))
-
-    # NOTE(russellb) This method can be removed in 2.0 of this API.  It is
-    # deprecated in favor of the method in the base API.
-    def get_backdoor_port(self, context):
-        return self.backdoor_port

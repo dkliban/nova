@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 Nicira, Inc.
 # All Rights Reserved
 #
@@ -14,14 +12,13 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-#
-# @author: Aaron Rosen, Nicira Networks, Inc.
 
 import sys
 
 from neutronclient.common import exceptions as n_exc
 from neutronclient.neutron import v2_0 as neutronv20
 from oslo.config import cfg
+import six
 from webob import exc
 
 from nova.compute import api as compute_api
@@ -41,6 +38,11 @@ wrap_check_security_groups_policy = compute_api.policy_decorator(
 
 CONF = cfg.CONF
 LOG = logging.getLogger(__name__)
+
+# NOTE: Neutron client has a max URL length of 8192, so we have
+# to limit the number of IDs we include in any single search.  Really
+# doesn't seem to be any point in making this a config value.
+MAX_SEARCH_IDS = 150
 
 
 class SecurityGroupAPI(security_group_base.SecurityGroupBase):
@@ -62,6 +64,8 @@ class SecurityGroupAPI(security_group_base.SecurityGroupBase):
                 # as this error code could be related to bad input or over
                 # quota
                 raise exc.HTTPBadRequest()
+            elif e.status_code == 409:
+                self.raise_over_quota(unicode(e))
             raise exc_info[0], exc_info[1], exc_info[2]
         return self._convert_to_nova_security_group_format(security_group)
 
@@ -105,12 +109,12 @@ class SecurityGroupAPI(security_group_base.SecurityGroupBase):
         nova_rule['protocol'] = rule['protocol']
         if (nova_rule['protocol'] and rule.get('port_range_min') is None and
                 rule.get('port_range_max') is None):
-            if nova_rule['protocol'].upper() == 'ICMP':
-                nova_rule['from_port'] = -1
-                nova_rule['to_port'] = -1
-            elif rule['protocol'].upper() in ['TCP', 'UDP']:
+            if rule['protocol'].upper() in ['TCP', 'UDP']:
                 nova_rule['from_port'] = 1
                 nova_rule['to_port'] = 65535
+            else:
+                nova_rule['from_port'] = -1
+                nova_rule['to_port'] = -1
         else:
             nova_rule['from_port'] = rule.get('port_range_min')
             nova_rule['to_port'] = rule.get('port_range_max')
@@ -125,11 +129,13 @@ class SecurityGroupAPI(security_group_base.SecurityGroupBase):
                 id = neutronv20.find_resourceid_by_name_or_id(
                     neutron, 'security_group', name)
             group = neutron.show_security_group(id).get('security_group')
+        except n_exc.NeutronClientNoUniqueMatch as e:
+            raise exception.NoUniqueMatch(six.text_type(e))
         except n_exc.NeutronClientException as e:
             exc_info = sys.exc_info()
             if e.status_code == 404:
                 LOG.debug(_("Neutron security group %s not found"), name)
-                self.raise_not_found(e.message)
+                self.raise_not_found(unicode(e))
             else:
                 LOG.error(_("Neutron Error: %s"), e)
                 raise exc_info[0], exc_info[1], exc_info[2]
@@ -174,9 +180,9 @@ class SecurityGroupAPI(security_group_base.SecurityGroupBase):
         except n_exc.NeutronClientException as e:
             exc_info = sys.exc_info()
             if e.status_code == 404:
-                self.raise_not_found(e.message)
+                self.raise_not_found(unicode(e))
             elif e.status_code == 409:
-                self.raise_invalid_property(e.message)
+                self.raise_invalid_property(unicode(e))
             else:
                 LOG.error(_("Neutron Error: %s"), e)
                 raise exc_info[0], exc_info[1], exc_info[2]
@@ -186,7 +192,7 @@ class SecurityGroupAPI(security_group_base.SecurityGroupBase):
 
         Note: the Nova security group API doesn't support adding muliple
         security group rules at once but the EC2 one does. Therefore,
-        this function is writen to support both. Multiple rules are
+        this function is written to support both. Multiple rules are
         installed to a security group in neutron using bulk support.
         """
 
@@ -197,10 +203,14 @@ class SecurityGroupAPI(security_group_base.SecurityGroupBase):
                 body).get('security_group_rules')
         except n_exc.NeutronClientException as e:
             exc_info = sys.exc_info()
-            if e.status_code == 409:
+            if e.status_code == 404:
                 LOG.exception(_("Neutron Error getting security group %s"),
                               name)
-                self.raise_not_found(e.message)
+                self.raise_not_found(unicode(e))
+            elif e.status_code == 409:
+                LOG.exception(_("Neutron Error adding rules to security "
+                                "group %s"), name)
+                self.raise_over_quota(unicode(e))
             else:
                 LOG.exception(_("Neutron Error:"))
                 raise exc_info[0], exc_info[1], exc_info[2]
@@ -267,41 +277,98 @@ class SecurityGroupAPI(security_group_base.SecurityGroupBase):
             exc_info = sys.exc_info()
             if e.status_code == 404:
                 LOG.debug(_("Neutron security group rule %s not found"), id)
-                self.raise_not_found(e.message)
+                self.raise_not_found(unicode(e))
             else:
                 LOG.error(_("Neutron Error: %s"), e)
                 raise exc_info[0], exc_info[1], exc_info[2]
         return self._convert_to_nova_security_group_rule_format(rule)
 
-    def get_instances_security_groups_bindings(self, context):
+    def _get_ports_from_server_list(self, servers, neutron):
+        """Returns a list of ports used by the servers."""
+
+        def _chunk_by_ids(servers, limit):
+            ids = []
+            for server in servers:
+                ids.append(server['id'])
+                if len(ids) >= limit:
+                    yield ids
+                    ids = []
+            if ids:
+                yield ids
+
+        # Note: Have to split the query up as the search criteria
+        # form part of the URL, which has a fixed max size
+        ports = []
+        for ids in _chunk_by_ids(servers, MAX_SEARCH_IDS):
+            search_opts = {'device_id': ids}
+            ports.extend(neutron.list_ports(**search_opts).get('ports'))
+
+        return ports
+
+    def _get_secgroups_from_port_list(self, ports, neutron):
+        """Returns a dict of security groups keyed by their ids."""
+
+        def _chunk_by_ids(sg_ids, limit):
+            sg_id_list = []
+            for sg_id in sg_ids:
+                sg_id_list.append(sg_id)
+                if len(sg_id_list) >= limit:
+                    yield sg_id_list
+                    sg_id_list = []
+            if sg_id_list:
+                yield sg_id_list
+
+        # Find the set of unique SecGroup IDs to search for
+        sg_ids = set()
+        for port in ports:
+            sg_ids.update(port.get('security_groups', []))
+
+        # Note: Have to split the query up as the search criteria
+        # form part of the URL, which has a fixed max size
+        security_groups = {}
+        for sg_id_list in _chunk_by_ids(sg_ids, MAX_SEARCH_IDS):
+            sg_search_opts = {'id': sg_id_list}
+            search_results = neutron.list_security_groups(**sg_search_opts)
+            for sg in search_results.get('security_groups'):
+                security_groups[sg['id']] = sg
+
+        return security_groups
+
+    def get_instances_security_groups_bindings(self, context, servers,
+                                               detailed=False):
         """Returns a dict(instance_id, [security_groups]) to allow obtaining
         all of the instances and their security groups in one shot.
         """
-        neutron = neutronv2.get_client(context)
-        ports = neutron.list_ports().get('ports')
-        security_groups = neutron.list_security_groups().get('security_groups')
-        security_group_lookup = {}
-        instances_security_group_bindings = {}
-        for security_group in security_groups:
-            security_group_lookup[security_group['id']] = security_group
 
+        neutron = neutronv2.get_client(context)
+
+        ports = self._get_ports_from_server_list(servers, neutron)
+
+        security_groups = self._get_secgroups_from_port_list(ports, neutron)
+
+        instances_security_group_bindings = {}
         for port in ports:
-            for port_security_group in port.get('security_groups', []):
-                try:
-                    sg = security_group_lookup[port_security_group]
-                    # name is optional in neutron so if not specified return id
-                    if sg.get('name'):
-                        sg_entry = {'name': sg['name']}
+            for port_sg_id in port.get('security_groups', []):
+
+                # Note:  have to check we found port_sg as its possible
+                # the port has an SG that this user doesn't have access to
+                port_sg = security_groups.get(port_sg_id)
+                if port_sg:
+                    if detailed:
+                        sg_entry = self._convert_to_nova_security_group_format(
+                                 port_sg)
+                        instances_security_group_bindings.setdefault(
+                            port['device_id'], []).append(sg_entry)
                     else:
-                        sg_entry = {'name': sg['id']}
-                    instances_security_group_bindings.setdefault(
-                        port['device_id'], []).append(sg_entry)
-                except KeyError:
-                    # This should only happen due to a race condition
-                    # if the security group on a port was deleted after the
-                    # ports were returned. We pass since this security
-                    # group is no longer on the port.
-                    pass
+                        # name is optional in neutron so if not specified
+                        # return id
+                        name = port_sg.get('name')
+                        if not name:
+                            name = port_sg.get('id')
+                        sg_entry = {'name': name}
+                        instances_security_group_bindings.setdefault(
+                            port['device_id'], []).append(sg_entry)
+
         return instances_security_group_bindings
 
     def get_instance_security_groups(self, context, instance_uuid,
@@ -310,38 +377,10 @@ class SecurityGroupAPI(security_group_base.SecurityGroupBase):
         If detailed is True then it also returns the full details of the
         security groups associated with an instance.
         """
-        neutron = neutronv2.get_client(context)
-        params = {'device_id': instance_uuid}
-        ports = neutron.list_ports(**params)
-        security_groups = neutron.list_security_groups().get('security_groups')
-
-        security_group_lookup = {}
-        for security_group in security_groups:
-            security_group_lookup[security_group['id']] = security_group
-
-        ret = []
-        for port in ports['ports']:
-            for security_group in port.get('security_groups', []):
-                try:
-                    if detailed:
-                        ret.append(self._convert_to_nova_security_group_format(
-                            security_group_lookup[security_group]))
-                    else:
-                        name = security_group_lookup[security_group].get(
-                            'name')
-                        # Since the name is optional for
-                        # neutron security groups
-                        if not name:
-                            name = security_group
-                        ret.append({'name': name})
-                except KeyError:
-                    # This should only happen due to a race condition
-                    # if the security group on a port was deleted after the
-                    # ports were returned. We pass since this security
-                    # group is no longer on the port.
-                    pass
-
-        return ret
+        servers = [{'id': instance_uuid}]
+        sg_bindings = self.get_instances_security_groups_bindings(
+                                  context, servers, detailed)
+        return sg_bindings.get(instance_uuid)
 
     def _has_security_group_requirements(self, port):
         port_security_enabled = port.get('port_security_enabled', True)
@@ -358,11 +397,15 @@ class SecurityGroupAPI(security_group_base.SecurityGroupBase):
         try:
             security_group_id = neutronv20.find_resourceid_by_name_or_id(
                 neutron, 'security_group', security_group_name)
+        except n_exc.NeutronClientNoUniqueMatch as e:
+            raise exception.NoUniqueMatch(six.text_type(e))
         except n_exc.NeutronClientException as e:
             exc_info = sys.exc_info()
             if e.status_code == 404:
-                msg = ("Security group %s is not found for project %s" %
-                       (security_group_name, context.project_id))
+                msg = (_("Security group %(name)s is not found for "
+                         "project %(project)s") %
+                       {'name': security_group_name,
+                        'project': context.project_id})
                 self.raise_not_found(msg)
             else:
                 LOG.exception(_("Neutron Error:"))
@@ -375,8 +418,8 @@ class SecurityGroupAPI(security_group_base.SecurityGroupBase):
                 LOG.exception(_("Neutron Error:"))
 
         if not ports:
-            msg = ("instance_id %s could not be found as device id on"
-                   " any ports" % instance['uuid'])
+            msg = (_("instance_id %s could not be found as device id on"
+                   " any ports") % instance['uuid'])
             self.raise_not_found(msg)
 
         for port in ports:
@@ -410,8 +453,10 @@ class SecurityGroupAPI(security_group_base.SecurityGroupBase):
         except n_exc.NeutronClientException as e:
             exc_info = sys.exc_info()
             if e.status_code == 404:
-                msg = ("Security group %s is not found for project %s" %
-                       (security_group_name, context.project_id))
+                msg = (_("Security group %(name)s is not found for "
+                         "project %(project)s") %
+                       {'name': security_group_name,
+                        'project': context.project_id})
                 self.raise_not_found(msg)
             else:
                 LOG.exception(_("Neutron Error:"))
@@ -424,8 +469,8 @@ class SecurityGroupAPI(security_group_base.SecurityGroupBase):
                 LOG.exception(_("Neutron Error:"))
 
         if not ports:
-            msg = ("instance_id %s could not be found as device id on"
-                   " any ports" % instance['uuid'])
+            msg = (_("instance_id %s could not be found as device id on"
+                   " any ports") % instance['uuid'])
             self.raise_not_found(msg)
 
         found_security_group = False
@@ -452,8 +497,8 @@ class SecurityGroupAPI(security_group_base.SecurityGroupBase):
                 with excutils.save_and_reraise_exception():
                     LOG.exception(_("Neutron Error:"))
         if not found_security_group:
-            msg = (_("Security group %(security_group_name)s not assocaited "
-                     "with the instance %(instance)s"),
+            msg = (_("Security group %(security_group_name)s not associated "
+                     "with the instance %(instance)s") %
                    {'security_group_name': security_group_name,
                     'instance': instance['uuid']})
             self.raise_not_found(msg)

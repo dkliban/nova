@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # Copyright 2011 Justin Santa Barbara
 # All Rights Reserved.
@@ -20,6 +18,7 @@ import abc
 import functools
 import os
 
+import six
 import webob.dec
 import webob.exc
 
@@ -132,11 +131,11 @@ class ExtensionsTemplate(xmlutil.TemplateBuilder):
         return xmlutil.MasterTemplate(root, 1, nsmap=ext_nsmap)
 
 
-class ExtensionsResource(wsgi.Resource):
+class ExtensionsController(wsgi.Resource):
 
     def __init__(self, extension_manager):
         self.extension_manager = extension_manager
-        super(ExtensionsResource, self).__init__(None)
+        super(ExtensionsController, self).__init__(None)
 
     def _translate(self, ext):
         ext_data = {}
@@ -168,7 +167,7 @@ class ExtensionsResource(wsgi.Resource):
     def delete(self, req, id):
         raise webob.exc.HTTPNotFound()
 
-    def create(self, req):
+    def create(self, req, body):
         raise webob.exc.HTTPNotFound()
 
 
@@ -208,7 +207,7 @@ class ExtensionManager(object):
 
         resources = []
         resources.append(ResourceExtension('extensions',
-                                           ExtensionsResource(self)))
+                                           ExtensionsController(self)))
         for ext in self.sorted_extensions():
             try:
                 resources.extend(ext.get_resources())
@@ -257,7 +256,7 @@ class ExtensionManager(object):
 
         LOG.debug(_("Loading extension %s"), ext_factory)
 
-        if isinstance(ext_factory, basestring):
+        if isinstance(ext_factory, six.string_types):
             # Load the factory
             factory = importutils.import_class(ext_factory)
         else:
@@ -378,17 +377,21 @@ def load_standard_extensions(ext_mgr, logger, path, package, ext_list=None):
         dirnames[:] = subdirs
 
 
-def extension_authorizer(api_name, extension_name):
+def core_authorizer(api_name, extension_name):
     def authorize(context, target=None, action=None):
         if target is None:
             target = {'project_id': context.project_id,
                       'user_id': context.user_id}
         if action is None:
-            act = '%s_extension:%s' % (api_name, extension_name)
+            act = '%s:%s' % (api_name, extension_name)
         else:
-            act = '%s_extension:%s:%s' % (api_name, extension_name, action)
+            act = '%s:%s:%s' % (api_name, extension_name, action)
         nova.policy.enforce(context, act, target)
     return authorize
+
+
+def extension_authorizer(api_name, extension_name):
+    return core_authorizer('%s_extension' % api_name, extension_name)
 
 
 def soft_extension_authorizer(api_name, extension_name):
@@ -403,6 +406,12 @@ def soft_extension_authorizer(api_name, extension_name):
     return authorize
 
 
+def check_compute_policy(context, action, target, scope='compute'):
+    _action = '%s:%s' % (scope, action)
+    nova.policy.enforce(context, _action, target)
+
+
+@six.add_metaclass(abc.ABCMeta)
 class V3APIExtensionBase(object):
     """Abstract base class for all V3 API extensions.
 
@@ -411,7 +420,6 @@ class V3APIExtensionBase(object):
     even if they just return an empty list. The extensions must also
     define the abstract properties.
     """
-    __metaclass__ = abc.ABCMeta
 
     def __init__(self, extension_info):
         self.extension_info = extension_info
@@ -442,11 +450,6 @@ class V3APIExtensionBase(object):
     @abc.abstractproperty
     def alias(self):
         """Alias for the extension."""
-        pass
-
-    @abc.abstractproperty
-    def namespace(self):
-        """Namespace for the extension."""
         pass
 
     @abc.abstractproperty
@@ -481,6 +484,11 @@ def expected_errors(errors):
                     # extension method does not need to wrap authorize
                     # calls. ResourceExceptionHandler silently
                     # converts NotAuthorized to HTTPForbidden
+                    raise
+                elif isinstance(exc, exception.ValidationError):
+                    # Note(oomichi): Handle a validation error, which
+                    # happens due to invalid API parameters, as an
+                    # expected error.
                     raise
 
                 LOG.exception(_("Unexpected exception in API method"))

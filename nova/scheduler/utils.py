@@ -20,29 +20,34 @@ from nova.compute import flavors
 from nova.compute import utils as compute_utils
 from nova import db
 from nova import notifications
+from nova.objects import base as obj_base
+from nova.objects import instance as instance_obj
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
-from nova.openstack.common.notifier import api as notifier
+from nova import rpc
 
 LOG = logging.getLogger(__name__)
 
 
-def build_request_spec(ctxt, image, instances):
+def build_request_spec(ctxt, image, instances, instance_type=None):
     """Build a request_spec for the scheduler.
 
     The request_spec assumes that all instances to be scheduled are the same
     type.
     """
     instance = instances[0]
-    instance_type = flavors.extract_flavor(instance)
+    if isinstance(instance, instance_obj.Instance):
+        instance = obj_base.obj_to_primitive(instance)
+
+    if instance_type is None:
+        instance_type = flavors.extract_flavor(instance)
     # NOTE(comstud): This is a bit ugly, but will get cleaned up when
     # we're passing an InstanceType internal object.
-    extra_specs = db.flavor_extra_specs_get(ctxt,
-                                                   instance_type['flavorid'])
+    extra_specs = db.flavor_extra_specs_get(ctxt, instance_type['flavorid'])
     instance_type['extra_specs'] = extra_specs
     request_spec = {
-            'image': image,
+            'image': image or {},
             'instance_properties': instance,
             'instance_type': instance_type,
             'num_instances': len(instances),
@@ -68,6 +73,8 @@ def set_vm_state_and_notify(context, service, method, updates, ex,
     #             verify that uuid is always set.
     uuids = [properties.get('uuid')]
     from nova.conductor import api as conductor_api
+    conductor = conductor_api.LocalAPI()
+    notifier = rpc.get_notifier(service)
     for instance_uuid in request_spec.get('instance_uuids') or uuids:
         if instance_uuid:
             state = vm_state.upper()
@@ -80,7 +87,7 @@ def set_vm_state_and_notify(context, service, method, updates, ex,
             notifications.send_update(context, old_ref, new_ref,
                     service=service)
             compute_utils.add_instance_fault_from_exc(context,
-                    conductor_api.LocalAPI(),
+                    conductor,
                     new_ref, ex, sys.exc_info())
 
         payload = dict(request_spec=request_spec,
@@ -91,8 +98,7 @@ def set_vm_state_and_notify(context, service, method, updates, ex,
                         reason=ex)
 
         event_type = '%s.%s' % (service, method)
-        notifier.notify(context, notifier.publisher_id(service),
-                        event_type, notifier.ERROR, payload)
+        notifier.error(context, event_type, payload)
 
 
 def populate_filter_properties(filter_properties, host_state):
@@ -112,7 +118,8 @@ def populate_filter_properties(filter_properties, host_state):
     _add_retry_host(filter_properties, host, nodename)
 
     # Adds oversubscription policy
-    filter_properties['limits'] = limits
+    if not filter_properties.get('force_hosts'):
+        filter_properties['limits'] = limits
 
 
 def _add_retry_host(filter_properties, host, node):
@@ -121,7 +128,42 @@ def _add_retry_host(filter_properties, host, node):
     node has already been tried.
     """
     retry = filter_properties.get('retry', None)
-    if not retry:
+    force_hosts = filter_properties.get('force_hosts', [])
+    force_nodes = filter_properties.get('force_nodes', [])
+    if not retry or force_hosts or force_nodes:
         return
     hosts = retry['hosts']
     hosts.append([host, node])
+
+
+def parse_options(opts, sep='=', converter=str, name=""):
+    """Parse a list of options, each in the format of <key><sep><value>. Also
+    use the converter to convert the value into desired type.
+
+    :params opts: list of options, e.g. from oslo.config.cfg.ListOpt
+    :params sep: the separator
+    :params converter: callable object to convert the value, should raise
+                       ValueError for conversion failure
+    :params name: name of the option
+
+    :returns: a lists of tuple of values (key, converted_value)
+    """
+    good = []
+    bad = []
+    for opt in opts:
+        try:
+            key, seen_sep, value = opt.partition(sep)
+            value = converter(value)
+        except ValueError:
+            key = None
+            value = None
+        if key and seen_sep and value is not None:
+            good.append((key, value))
+        else:
+            bad.append(opt)
+    if bad:
+        LOG.warn(_("Ignoring the invalid elements of the option "
+                   "%(name)s: %(options)s"),
+                {'name': name,
+                 'options': ", ".join(bad)})
+    return good

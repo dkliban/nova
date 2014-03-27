@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # Copyright 2010 OpenStack Foundation
@@ -29,7 +27,7 @@ import webob
 from nova import wsgi
 
 
-class Test(test.TestCase):
+class Test(test.NoDBTestCase):
 
     def test_debug(self):
 

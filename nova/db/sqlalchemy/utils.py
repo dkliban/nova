@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2013 Boris Pavlovic (boris@pavlovic.me).
 # All Rights Reserved.
 #
@@ -68,6 +66,24 @@ class InsertFromSelect(UpdateBase):
 def visit_insert_from_select(element, compiler, **kw):
     return "INSERT INTO %s %s" % (
         compiler.process(element.table, asfrom=True),
+        compiler.process(element.select))
+
+
+class DeleteFromSelect(UpdateBase):
+    def __init__(self, table, select, column):
+        self.table = table
+        self.select = select
+        self.column = column
+
+
+# NOTE(guochbo): some verions of MySQL doesn't yet support subquery with
+# 'LIMIT & IN/ALL/ANY/SOME' We need work around this with nesting select .
+@compiles(DeleteFromSelect)
+def visit_delete_from_select(element, compiler, **kw):
+    return "DELETE FROM %s WHERE %s in (SELECT T1.%s FROM (%s) as T1)" % (
+        compiler.process(element.table, asfrom=True),
+        compiler.process(element.column),
+        element.column.name,
         compiler.process(element.select))
 
 
@@ -167,10 +183,9 @@ def _drop_unique_constraint_in_sqlite(migrate_engine, table_name, uc_name,
 
 def drop_unique_constraint(migrate_engine, table_name, uc_name, *columns,
                            **col_name_col_instance):
-    """
-    This method drops UC from table and works for mysql, postgresql and sqlite.
-    In mysql and postgresql we are able to use "alter table" constuction. In
-    sqlite is only one way to drop UC:
+    """This method drops UC from table and works for mysql, postgresql and
+    sqlite. In mysql and postgresql we are able to use "alter table"
+    construction. In sqlite is only one way to drop UC:
         1) Create new table with same columns, indexes and constraints
            (except one that we want to drop).
         2) Copy data from old table to new.
@@ -178,9 +193,9 @@ def drop_unique_constraint(migrate_engine, table_name, uc_name, *columns,
         4) Rename new table to the name of old table.
 
     :param migrate_engine: sqlalchemy engine
-    :param table_name:     name of table that contains uniq constarint.
+    :param table_name:     name of table that contains uniq constraint.
     :param uc_name:        name of uniq constraint that will be dropped.
-    :param columns:        columns that are in uniq constarint.
+    :param columns:        columns that are in uniq constraint.
     :param col_name_col_instance:   contains pair column_name=column_instance.
                             column_instance is instance of Column. These params
                             are required only for columns that have unsupported
@@ -199,8 +214,7 @@ def drop_unique_constraint(migrate_engine, table_name, uc_name, *columns,
 
 def drop_old_duplicate_entries_from_table(migrate_engine, table_name,
                                           use_soft_delete, *uc_column_names):
-    """
-    This method is used to drop all old rows that have the same values for
+    """This method is used to drop all old rows that have the same values for
     columns in uc_columns.
     """
     meta = MetaData()
@@ -241,9 +255,8 @@ def drop_old_duplicate_entries_from_table(migrate_engine, table_name,
 
 
 def check_shadow_table(migrate_engine, table_name):
-    """
-    This method checks that table with ``table_name`` and corresponding shadow
-    table have same columns.
+    """This method checks that table with ``table_name`` and
+    corresponding shadow table have same columns.
     """
     meta = MetaData()
     meta.bind = migrate_engine
@@ -280,15 +293,16 @@ def check_shadow_table(migrate_engine, table_name):
 
 def create_shadow_table(migrate_engine, table_name=None, table=None,
                         **col_name_col_instance):
-    """
-    This method create shadow table for table with name ``table_name`` or table
-    instance ``table``.
+    """This method create shadow table for table with name ``table_name``
+    or table instance ``table``.
     :param table_name: Autoload table with this name and create shadow table
     :param table: Autoloaded table, so just create corresponding shadow table.
     :param col_name_col_instance:   contains pair column_name=column_instance.
                             column_instance is instance of Column. These params
                             are required only for columns that have unsupported
                             types by sqlite. For example BigInteger.
+
+    :returns: The created shadow_table object.
     """
     meta = MetaData(bind=migrate_engine)
 
@@ -316,6 +330,7 @@ def create_shadow_table(migrate_engine, table_name=None, table=None,
                          mysql_engine='InnoDB')
     try:
         shadow_table.create()
+        return shadow_table
     except (OperationalError, ProgrammingError):
         LOG.info(repr(shadow_table))
         LOG.exception(_('Exception while creating table.'))
@@ -493,8 +508,17 @@ def _change_deleted_column_type_to_id_type_sqlite(migrate_engine, table_name,
         if not isinstance(constraint, CheckConstraint):
             return False
         sqltext = str(constraint.sqltext)
-        return (sqltext.endswith("deleted in (0, 1)") or
-                sqltext.endswith("deleted IN (:deleted_1, :deleted_2)"))
+        # NOTE(I159): when the type of column `deleted` is changed from boolean
+        # to int, the corresponding CHECK constraint is dropped too. But
+        # starting from SQLAlchemy version 0.8.3, those CHECK constraints
+        # aren't dropped anymore. So despite the fact that column deleted is
+        # of type int now, we still restrict its values to be either 0 or 1.
+        constraint_markers = (
+            "deleted in (0, 1)",
+            "deleted IN (:deleted_1, :deleted_2)",
+            "deleted IN (:param_1, :param_2)"
+        )
+        return any(sqltext.endswith(marker) for marker in constraint_markers)
 
     constraints = []
     for constraint in table.constraints:
@@ -528,3 +552,58 @@ def _change_deleted_column_type_to_id_type_sqlite(migrate_engine, table_name,
         where(new_table.c.deleted == False).\
         values(deleted=default_deleted_value).\
         execute()
+
+
+def _index_exists(migrate_engine, table_name, index_name):
+    inspector = reflection.Inspector.from_engine(migrate_engine)
+    indexes = inspector.get_indexes(table_name)
+    index_names = [index['name'] for index in indexes]
+
+    return index_name in index_names
+
+
+def _add_index(migrate_engine, table, index_name, idx_columns):
+    index = Index(
+        index_name, *[getattr(table.c, col) for col in idx_columns]
+    )
+    index.create()
+
+
+def _drop_index(migrate_engine, table, index_name, idx_columns):
+    if _index_exists(migrate_engine, table.name, index_name):
+        index = Index(
+            index_name, *[getattr(table.c, col) for col in idx_columns]
+        )
+        index.drop()
+
+
+def _change_index_columns(migrate_engine, table, index_name,
+                          new_columns, old_columns):
+    _drop_index(migrate_engine, table, index_name, old_columns)
+    _add_index(migrate_engine, table, index_name, new_columns)
+
+
+def modify_indexes(migrate_engine, data, upgrade=True):
+    if migrate_engine.name == 'sqlite':
+        return
+
+    meta = MetaData()
+    meta.bind = migrate_engine
+
+    for table_name, indexes in data.iteritems():
+        table = Table(table_name, meta, autoload=True)
+
+        for index_name, old_columns, new_columns in indexes:
+            if not upgrade:
+                new_columns, old_columns = old_columns, new_columns
+
+            if migrate_engine.name == 'postgresql':
+                if upgrade:
+                    _add_index(migrate_engine, table, index_name, new_columns)
+                else:
+                    _drop_index(migrate_engine, table, index_name, old_columns)
+            elif migrate_engine.name == 'mysql':
+                _change_index_columns(migrate_engine, table, index_name,
+                                      new_columns, old_columns)
+            else:
+                raise ValueError('Unsupported DB %s' % migrate_engine.name)

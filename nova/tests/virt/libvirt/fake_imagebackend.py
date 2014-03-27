@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 Grid Dynamics
 # All Rights Reserved.
 #
@@ -54,7 +52,7 @@ class Backend(object):
 
         return FakeImage(instance, name)
 
-    def snapshot(self, path, name, image_type=''):
+    def snapshot(self, path, image_type=''):
         #NOTE(bfilippov): this is done in favor for
         # snapshot tests in test_libvirt.LibvirtConnTestCase
-        return imagebackend.Backend(True).snapshot(path, name, image_type)
+        return imagebackend.Backend(True).snapshot(path, image_type)

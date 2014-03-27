@@ -13,7 +13,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from lxml import etree
 import webob
 
 from nova.api.openstack.compute.plugins.v3 import extended_server_attributes
@@ -24,6 +23,7 @@ from nova.objects import instance as instance_obj
 from nova.openstack.common import jsonutils
 from nova import test
 from nova.tests.api.openstack import fakes
+from nova.tests import fake_instance
 
 from oslo.config import cfg
 
@@ -35,8 +35,10 @@ UUID3 = '00000000-0000-0000-0000-000000000003'
 
 
 def fake_compute_get(*args, **kwargs):
-    return fakes.stub_instance(1, uuid=UUID3, host="host-fake",
+    inst = fakes.stub_instance(1, uuid=UUID3, host="host-fake",
                                node="node-fake")
+    return fake_instance.fake_instance_obj(args[1],
+               expected_attrs=instance_obj.INSTANCE_DEFAULT_FIELDS, **inst)
 
 
 def fake_compute_get_all(*args, **kwargs):
@@ -90,7 +92,7 @@ class ExtendedServerAttributesTest(test.TestCase):
         self.assertServerAttributes(self._get_server(res.body),
                                 host='host-fake',
                                 node='node-fake',
-                                instance_name='instance-1')
+                                instance_name=NAME_FMT % (1))
 
     def test_detail(self):
         url = '/v3/servers/detail'
@@ -113,15 +115,3 @@ class ExtendedServerAttributesTest(test.TestCase):
         res = self._make_request(url)
 
         self.assertEqual(res.status_int, 404)
-
-
-class ExtendedServerAttributesXmlTest(ExtendedServerAttributesTest):
-    content_type = 'application/xml'
-    ext = extended_server_attributes
-    prefix = '{%s}' % ext.ExtendedServerAttributes.namespace
-
-    def _get_server(self, body):
-        return etree.XML(body)
-
-    def _get_servers(self, body):
-        return etree.XML(body).getchildren()

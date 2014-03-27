@@ -17,6 +17,7 @@ from lxml import etree
 from webob import exc
 
 from nova.api.openstack.compute.contrib import hypervisors
+from nova.api.openstack import extensions
 from nova import context
 from nova import db
 from nova.db.sqlalchemy import api as db_api
@@ -49,7 +50,8 @@ TEST_HYPERS = [
          current_workload=2,
          running_vms=2,
          cpu_info='cpu_info',
-         disk_available_least=100),
+         disk_available_least=100,
+         host_ip='1.1.1.1'),
     dict(id=2,
          service_id=2,
          service=dict(id=2,
@@ -73,7 +75,8 @@ TEST_HYPERS = [
          current_workload=2,
          running_vms=2,
          cpu_info='cpu_info',
-         disk_available_least=100)]
+         disk_available_least=100,
+         host_ip='2.2.2.2')]
 TEST_SERVERS = [dict(name="inst1", uuid="uuid1", host="compute1"),
                 dict(name="inst2", uuid="uuid2", host="compute2"),
                 dict(name="inst3", uuid="uuid3", host="compute1"),
@@ -130,11 +133,13 @@ def fake_instance_get_all_by_host(context, host):
     return results
 
 
-class HypervisorsTest(test.TestCase):
+class HypervisorsTest(test.NoDBTestCase):
     def setUp(self):
         super(HypervisorsTest, self).setUp()
         self.context = context.get_admin_context()
-        self.controller = hypervisors.HypervisorsController()
+        self.ext_mgr = extensions.ExtensionManager()
+        self.ext_mgr.extensions = {}
+        self.controller = hypervisors.HypervisorsController(self.ext_mgr)
 
         self.stubs.Set(db, 'compute_node_get_all', fake_compute_node_get_all)
         self.stubs.Set(db, 'compute_node_search_by_hypervisor',
@@ -336,7 +341,7 @@ class HypervisorsTest(test.TestCase):
                     disk_available_least=200)))
 
 
-class HypervisorsSerializersTest(test.TestCase):
+class HypervisorsSerializersTest(test.NoDBTestCase):
     def compare_to_exemplar(self, exemplar, hyper):
         # Check attributes
         for key, value in exemplar.items():
@@ -351,7 +356,7 @@ class HypervisorsSerializersTest(test.TestCase):
         required_children = set([child for child in ('service', 'servers')
                                  if child in exemplar])
         for child in hyper:
-            self.assertTrue(child.tag in required_children)
+            self.assertIn(child.tag, required_children)
             required_children.remove(child.tag)
 
             # Check the node...
@@ -402,6 +407,7 @@ class HypervisorsSerializersTest(test.TestCase):
                      running_vms=2,
                      cpu_info="json data",
                      disk_available_least=100,
+                     host_ip='1.1.1.1',
                      service=dict(id=1, host="compute1")),
                 dict(hypervisor_hostname="hyper2",
                      id=2,
@@ -419,6 +425,7 @@ class HypervisorsSerializersTest(test.TestCase):
                      running_vms=2,
                      cpu_info="json data",
                      disk_available_least=100,
+                     host_ip='2.2.2.2',
                      service=dict(id=2, host="compute2"))])
         text = serializer.serialize(exemplar)
         tree = etree.fromstring(text)
@@ -448,6 +455,7 @@ class HypervisorsSerializersTest(test.TestCase):
                 running_vms=2,
                 cpu_info="json data",
                 disk_available_least=100,
+                host_ip='1.1.1.1',
                 service=dict(id=1, host="compute1")))
         text = serializer.serialize(exemplar)
         tree = etree.fromstring(text)

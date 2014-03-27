@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010-2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -76,8 +74,9 @@ class V3ViewBuilder(ViewBuilder):
     def show(self, request, flavor):
         flavor_dict = super(V3ViewBuilder, self).show(request, flavor)
         flavor_dict['flavor'].update({
-            "swap": flavor.get("swap") or "",
-            "ephemeral": flavor.get("ephemeral_gb") or "",
-            "disabled": flavor.get("disabled", False)
+            "swap": flavor["swap"],
+            "ephemeral": flavor["ephemeral_gb"],
+            "disabled": flavor["disabled"],
+            "vcpus": flavor["vcpus"],
         })
         return flavor_dict

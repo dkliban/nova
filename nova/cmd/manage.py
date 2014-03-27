@@ -1,9 +1,8 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011 X.commerce, a business unit of eBay Inc.
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
+# Copyright 2013 Red Hat, Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -55,15 +54,16 @@
 
 from __future__ import print_function
 
-import netaddr
 import os
 import sys
 
+import netaddr
 from oslo.config import cfg
+from oslo import messaging
+import six
 
 from nova.api.ec2 import ec2utils
 from nova import availability_zones
-from nova.cells import rpc_driver
 from nova.compute import flavors
 from nova import config
 from nova import context
@@ -75,8 +75,8 @@ from nova.openstack.common.db import exception as db_exc
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
-from nova.openstack.common import rpc
 from nova import quota
+from nova import rpc
 from nova import servicegroup
 from nova import version
 
@@ -223,8 +223,7 @@ class ProjectCommands(object):
     @args('--key', metavar='<key>', help='Key')
     @args('--value', metavar='<value>', help='Value')
     def quota(self, project_id, user_id=None, key=None, value=None):
-        """
-        Create, update or display quotas for project/user
+        """Create, update or display quotas for project/user
 
         If no quota key is provided, the quota will be displayed.
         If a valid quota key is provided and it does not exist,
@@ -253,10 +252,10 @@ class ProjectCommands(object):
                     return(2)
                 if ((int(value) < minimum) and
                    (maximum != -1 or (maximum == -1 and int(value) != -1))):
-                    print(_('Quota limit must greater than %s.') % minimum)
+                    print(_('Quota limit must be greater than %s.') % minimum)
                     return(2)
                 if maximum != -1 and int(value) > maximum:
-                    print(_('Quota limit must less than %s.') % maximum)
+                    print(_('Quota limit must be less than %s.') % maximum)
                     return(2)
                 try:
                     db.quota_create(ctxt, project_id, key, value,
@@ -401,8 +400,7 @@ class FloatingIpCommands(object):
 
     @staticmethod
     def address_to_hosts(addresses):
-        """
-        Iterate over hosts within an address range.
+        """Iterate over hosts within an address range.
 
         If an explicit range specifier is missing, the parameter is
         interpreted as a specific individual address.
@@ -679,8 +677,8 @@ class ServiceCommands(object):
     @args('--host', metavar='<host>', help='Host')
     @args('--service', metavar='<service>', help='Nova service')
     def list(self, host=None, service=None):
-        """
-        Show a list of all running services. Filter by host & service name.
+        """Show a list of all running services. Filter by host & service
+        name
         """
         servicegroup_api = servicegroup.API()
         ctxt = context.get_admin_context()
@@ -801,7 +799,7 @@ class ServiceCommands(object):
             result = self._show_host_resources(context.get_admin_context(),
                                                host=host)
         except exception.NovaException as ex:
-            print (_("error: %s") % ex)
+            print(_("error: %s") % ex)
             return 2
 
         if not isinstance(result, dict):
@@ -909,11 +907,11 @@ class FlavorCommands(object):
     Note instance type is a deprecated synonym for flavor.
     """
 
-    def _print_flavors(self, name, val):
+    def _print_flavors(self, val):
         is_public = ('private', 'public')[val["is_public"] == 1]
         print(("%s: Memory: %sMB, VCPUS: %s, Root: %sGB, Ephemeral: %sGb, "
             "FlavorID: %s, Swap: %sMB, RXTX Factor: %s, %s, ExtraSpecs %s") % (
-            name, val["memory_mb"], val["vcpus"], val["root_gb"],
+            val["name"], val["memory_mb"], val["vcpus"], val["root_gb"],
             val["ephemeral_gb"], val["flavorid"], val["swap"],
             val["rxtx_factor"], is_public, val["extra_specs"]))
 
@@ -942,7 +940,7 @@ class FlavorCommands(object):
             print(_("Must supply valid parameters to create flavor"))
             print(e)
             return 1
-        except exception.InstanceTypeExists:
+        except exception.FlavorExists:
             print(_("Flavor exists."))
             print(_("Please ensure flavor name and flavorid are "
                     "unique."))
@@ -961,7 +959,7 @@ class FlavorCommands(object):
         """Marks flavors as deleted."""
         try:
             flavors.destroy(name)
-        except exception.InstanceTypeNotFound:
+        except exception.FlavorNotFound:
             print(_("Valid flavor name is required"))
             return 1
         except db_exc.DBError as e:
@@ -984,9 +982,9 @@ class FlavorCommands(object):
             _db_error(e)
         if isinstance(inst_types.values()[0], dict):
             for k, v in inst_types.iteritems():
-                self._print_flavors(k, v)
+                self._print_flavors(v)
         else:
-            self._print_flavors(name, inst_types)
+            self._print_flavors(inst_types)
 
     @args('--name', metavar='<name>', help='Name of flavor')
     @args('--key', metavar='<key>', help='The key of the key/value pair')
@@ -996,7 +994,7 @@ class FlavorCommands(object):
         try:
             try:
                 inst_type = flavors.get_flavor_by_name(name)
-            except exception.InstanceTypeNotFoundByName as e:
+            except exception.FlavorNotFoundByName as e:
                 print(e)
                 return(2)
 
@@ -1019,7 +1017,7 @@ class FlavorCommands(object):
         try:
             try:
                 inst_type = flavors.get_flavor_by_name(name)
-            except exception.InstanceTypeNotFoundByName as e:
+            except exception.FlavorNotFoundByName as e:
                 print(e)
                 return(2)
 
@@ -1097,7 +1095,7 @@ class AgentBuildCommands(object):
                              agent_build.version, agent_build.md5hash))
                 print('    %s' % agent_build.url)
 
-            print
+            print()
 
     @args('--os', metavar='<os>', help='os')
     @args('--architecture', dest='architecture',
@@ -1199,19 +1197,19 @@ class CellCommands(object):
             return(2)
 
         # Set up the transport URL
-        transport = {
-            'username': username,
-            'password': password,
-            'hostname': hostname,
-            'port': int(port),
-            'virtual_host': virtual_host,
-        }
-        transport_url = rpc_driver.unparse_transport_url(transport)
+        transport_host = messaging.TransportHost(hostname=hostname,
+                                                 port=int(port),
+                                                 username=username,
+                                                 password=password)
+
+        transport_url = rpc.get_transport_url()
+        transport_url.hosts.append(transport_host)
+        transport_url.virtual_host = virtual_host
 
         is_parent = cell_type == 'parent'
         values = {'name': name,
                   'is_parent': is_parent,
-                  'transport_url': transport_url,
+                  'transport_url': str(transport_url),
                   'weight_offset': float(woffset),
                   'weight_scale': float(wscale)}
         ctxt = context.get_admin_context()
@@ -1232,11 +1230,12 @@ class CellCommands(object):
         print(fmt % ('-' * 3, '-' * 10, '-' * 6, '-' * 10, '-' * 15,
                 '-' * 5, '-' * 10))
         for cell in cells:
-            transport = rpc_driver.parse_transport_url(cell.transport_url)
+            url = rpc.get_transport_url(cell.transport_url)
+            host = url.hosts[0] if url.hosts else messaging.TransportHost()
             print(fmt % (cell.id, cell.name,
                     'parent' if cell.is_parent else 'child',
-                    transport['username'], transport['hostname'],
-                    transport['port'], transport['virtual_host']))
+                    host.username, host.hostname,
+                    host.port, url.virtual_host))
         print(fmt % ('-' * 3, '-' * 10, '-' * 6, '-' * 10, '-' * 15,
                 '-' * 5, '-' * 10))
 
@@ -1250,8 +1249,6 @@ CATEGORIES = {
     'flavor': FlavorCommands,
     'floating': FloatingIpCommands,
     'host': HostCommands,
-    # Deprecated, remove in Icehouse
-    'instance_type': FlavorCommands,
     'logs': GetLogCommands,
     'network': NetworkCommands,
     'project': ProjectCommands,
@@ -1357,7 +1354,7 @@ def main():
         v = getattr(CONF.category, 'action_kwarg_' + k)
         if v is None:
             continue
-        if isinstance(v, basestring):
+        if isinstance(v, six.string_types):
             v = v.decode('utf-8')
         fn_kwargs[k] = v
 

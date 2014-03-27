@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 #
@@ -63,24 +61,27 @@ disk_opts = [
     #                 escape such commas.
     #
     cfg.MultiStrOpt('virt_mkfs',
-                    default=[
-                      'default=mkfs.ext3 -L %(fs_label)s -F %(target)s',
-                      'linux=mkfs.ext3 -L %(fs_label)s -F %(target)s',
-                      'windows=mkfs.ntfs'
-                      ' --force --fast --label %(fs_label)s %(target)s',
-                      # NOTE(yamahata): vfat case
-                      #'windows=mkfs.vfat -n %(fs_label)s %(target)s',
-                      ],
-                    help='mkfs commands for ephemeral device. '
+                    default=[],
+                    help='Name of the mkfs commands for ephemeral device. '
                          'The format is <os_type>=<mkfs command>'),
+
+    cfg.BoolOpt('resize_fs_using_block_device',
+                default=False,
+                help='Attempt to resize the filesystem by accessing the '
+                     'image over a block device. This is done by the host '
+                     'and may not be necessary if the image contains a recent '
+                     'version of cloud-init. Possible mechanisms require '
+                     'the nbd driver (for qcow and raw), or loop (for raw).'),
     ]
 
 CONF = cfg.CONF
 CONF.register_opts(disk_opts)
+CONF.import_opt('default_ephemeral_format', 'nova.virt.driver')
 
 _MKFS_COMMAND = {}
 _DEFAULT_MKFS_COMMAND = None
-
+_DEFAULT_FS_BY_OSTYPE = {'linux': 'ext3',
+                         'windows': 'ntfs'}
 
 for s in CONF.virt_mkfs:
     # NOTE(yamahata): mkfs command may includes '=' for its options.
@@ -92,20 +93,45 @@ for s in CONF.virt_mkfs:
         _DEFAULT_MKFS_COMMAND = mkfs_command
 
 
-def mkfs(os_type, fs_label, target):
+def get_fs_type_for_os_type(os_type):
+    return os_type if _MKFS_COMMAND.get(os_type) else 'default'
+
+
+def mkfs(os_type, fs_label, target, run_as_root=True):
+    """Format a file or block device using
+       a user provided command for each os type.
+       If user has not provided any configuration,
+       format type will be used according to a
+       default_ephemeral_format configuration
+       or a system defaults.
+    """
+
     mkfs_command = (_MKFS_COMMAND.get(os_type, _DEFAULT_MKFS_COMMAND) or
                     '') % {'fs_label': fs_label, 'target': target}
     if mkfs_command:
-        utils.execute(*mkfs_command.split(), run_as_root=True)
+        utils.execute(*mkfs_command.split(), run_as_root=run_as_root)
+    else:
+        default_fs = CONF.default_ephemeral_format
+        if not default_fs:
+            default_fs = _DEFAULT_FS_BY_OSTYPE.get(os_type, 'ext3')
+        utils.mkfs(default_fs, target, fs_label, run_as_root=run_as_root)
 
 
 def resize2fs(image, check_exit_code=False, run_as_root=False):
-    utils.execute('e2fsck', '-fp', image,
-                  check_exit_code=check_exit_code,
-                  run_as_root=run_as_root)
-    utils.execute('resize2fs', image,
-                  check_exit_code=check_exit_code,
-                  run_as_root=run_as_root)
+    try:
+        utils.execute('e2fsck',
+                      '-fp',
+                      image,
+                      check_exit_code=[0, 1, 2],
+                      run_as_root=run_as_root)
+    except processutils.ProcessExecutionError as exc:
+        LOG.debug(_("Checking the file system with e2fsck has failed, "
+                    "the resize will be aborted. (%s)"), exc)
+    else:
+        utils.execute('resize2fs',
+                      image,
+                      check_exit_code=check_exit_code,
+                      run_as_root=run_as_root)
 
 
 def get_disk_size(path):
@@ -118,29 +144,59 @@ def get_disk_size(path):
     return images.qemu_img_info(path).virtual_size
 
 
-def extend(image, size):
+def extend(image, size, use_cow=False):
     """Increase image to size."""
-    virt_size = get_disk_size(image)
-    if virt_size >= size:
+    if not can_resize_image(image, size):
         return
+
     utils.execute('qemu-img', 'resize', image, size)
+
+    # if we can't access the filesystem, we can't do anything more
+    if not is_image_partitionless(image, use_cow):
+        return
+
+    def safe_resize2fs(dev, run_as_root=False, finally_call=lambda: None):
+        try:
+            resize2fs(dev, run_as_root=run_as_root, check_exit_code=[0])
+        except processutils.ProcessExecutionError as exc:
+            LOG.debug(_("Resizing the file system with resize2fs "
+                        "has failed with error: %s"), exc)
+        finally:
+            finally_call()
+
     # NOTE(vish): attempts to resize filesystem
-    resize2fs(image)
+    if use_cow:
+        if CONF.resize_fs_using_block_device:
+            # in case of non-raw disks we can't just resize the image, but
+            # rather the mounted device instead
+            mounter = mount.Mount.instance_for_format(
+                image, None, None, 'qcow2')
+            if mounter.get_dev():
+                safe_resize2fs(mounter.device,
+                               run_as_root=True,
+                               finally_call=mounter.unget_dev)
+    else:
+        safe_resize2fs(image)
 
 
-def can_resize_fs(image, size, use_cow=False):
-    """Check whether we can resize contained file system."""
-
+def can_resize_image(image, size):
+    """Check whether we can resize the container image file."""
     LOG.debug(_('Checking if we can resize image %(image)s. '
-                'size=%(size)s, CoW=%(use_cow)s'),
-              {'image': image, 'size': size, 'use_cow': use_cow})
+                'size=%(size)s'), {'image': image, 'size': size})
 
     # Check that we're increasing the size
     virt_size = get_disk_size(image)
     if virt_size >= size:
-        LOG.debug(_('Cannot resize filesystem %s to a smaller size.'),
+        LOG.debug(_('Cannot resize image %s to a smaller size.'),
                   image)
         return False
+    return True
+
+
+def is_image_partitionless(image, use_cow=False):
+    """Check whether we can resize contained file system."""
+    LOG.debug(_('Checking if we can resize filesystem inside %(image)s. '
+                'CoW=%(use_cow)s'), {'image': image, 'use_cow': use_cow})
 
     # Check the image is unpartitioned
     if use_cow:
@@ -160,7 +216,7 @@ def can_resize_fs(image, size, use_cow=False):
             utils.execute('e2label', image)
         except processutils.ProcessExecutionError as e:
             LOG.debug(_('Unable to determine label for image %(image)s with '
-                        'error %(errror)s. Cannot resize.'),
+                        'error %(error)s. Cannot resize.'),
                       {'image': image,
                        'error': e})
             return False
@@ -242,11 +298,11 @@ class _DiskImage(object):
                                                   imgfmt)
         if mounter.do_mount():
             self._mounter = mounter
+            return self._mounter.device
         else:
             LOG.debug(mounter.error)
             self._errors.append(mounter.error)
-
-        return bool(self._mounter)
+            return None
 
     def umount(self):
         """Umount a mount point from the filesystem."""
@@ -291,6 +347,8 @@ def inject_data(image, key=None, net=None, metadata=None, admin_password=None,
     if use_cow:
         fmt = "qcow2"
     try:
+        # Note(mrda): Test if the image exists first to short circuit errors
+        os.stat(image)
         fs = vfs.VFS.instance_for_image(image, fmt, partition)
         fs.setup()
     except Exception as e:
@@ -316,17 +374,22 @@ def setup_container(image, container_dir, use_cow=False):
 
     It will mount the loopback image to the container directory in order
     to create the root filesystem for the container.
+
+    Returns path of image device which is mounted to the container directory.
     """
     img = _DiskImage(image=image, use_cow=use_cow, mount_dir=container_dir)
-    if not img.mount():
+    dev = img.mount()
+    if dev is None:
         LOG.error(_("Failed to mount container filesystem '%(image)s' "
                     "on '%(target)s': %(errors)s"),
                   {"image": img, "target": container_dir,
                    "errors": img.errors})
         raise exception.NovaException(img.errors)
 
+    return dev
 
-def teardown_container(container_dir):
+
+def teardown_container(container_dir, container_root_device=None):
     """Teardown the container rootfs mounting once it is spawned.
 
     It will umount the container that is mounted,
@@ -335,15 +398,26 @@ def teardown_container(container_dir):
     try:
         img = _DiskImage(image=None, mount_dir=container_dir)
         img.teardown()
+
+        # Make sure container_root_device is released when teardown container.
+        if container_root_device:
+            if 'loop' in container_root_device:
+                LOG.debug(_("Release loop device %s"), container_root_device)
+                utils.execute('losetup', '--detach', container_root_device,
+                              run_as_root=True, attempts=3)
+            else:
+                LOG.debug(_('Release nbd device %s'), container_root_device)
+                utils.execute('qemu-nbd', '-d', container_root_device,
+                              run_as_root=True)
     except Exception as exn:
-        LOG.exception(_('Failed to teardown ntainer filesystem: %s'), exn)
+        LOG.exception(_('Failed to teardown container filesystem: %s'), exn)
 
 
 def clean_lxc_namespace(container_dir):
     """Clean up the container namespace rootfs mounting one spawned.
 
-    It will umount the mounted names that is mounted
-    but leave the linked deivces alone.
+    It will umount the mounted names that are mounted
+    but leave the linked devices alone.
     """
     try:
         img = _DiskImage(image=None, mount_dir=container_dir)
@@ -382,6 +456,13 @@ def inject_data_into_fs(fs, key, net, metadata, admin_password, files,
 
 def _inject_files_into_fs(files, fs):
     for (path, contents) in files:
+        # NOTE(wangpan): Ensure the parent dir of injecting file exists
+        parent_dir = os.path.dirname(path)
+        if (len(parent_dir) > 0 and parent_dir != "/"
+                and not fs.has_file(parent_dir)):
+            fs.make_path(parent_dir)
+            fs.set_ownership(parent_dir, "root", "root")
+            fs.set_permissions(parent_dir, 0o744)
         _inject_file_into_fs(fs, path, contents)
 
 
@@ -397,7 +478,6 @@ def _inject_file_into_fs(fs, path, contents, append=False):
 def _inject_metadata_into_fs(metadata, fs):
     LOG.debug(_("Inject metadata fs=%(fs)s metadata=%(metadata)s"),
               {'fs': fs, 'metadata': metadata})
-    metadata = dict([(m['key'], m['value']) for m in metadata])
     _inject_file_into_fs(fs, 'meta.js', jsonutils.dumps(metadata))
 
 
@@ -492,11 +572,6 @@ def _inject_admin_password_into_fs(admin_passwd, fs):
     LOG.debug(_("Inject admin password fs=%(fs)s "
                 "admin_passwd=<SANITIZED>"), {'fs': fs})
     admin_user = 'root'
-
-    fd, tmp_passwd = tempfile.mkstemp()
-    os.close(fd)
-    fd, tmp_shadow = tempfile.mkstemp()
-    os.close(fd)
 
     passwd_path = os.path.join('etc', 'passwd')
     shadow_path = os.path.join('etc', 'shadow')

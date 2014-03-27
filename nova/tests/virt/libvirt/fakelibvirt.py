@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-#
 #    Copyright 2010 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -57,6 +55,9 @@ node_cpu_model = "Penryn"
 # CPU vendor
 node_cpu_vendor = "Intel"
 
+# Has libvirt connection been used at least once
+connection_used = False
+
 
 def _reset():
     global allow_default_uri_connection
@@ -108,6 +109,10 @@ VIR_CRED_EXTERNAL = 9
 VIR_MIGRATE_PEER2PEER = 2
 VIR_MIGRATE_UNDEFINE_SOURCE = 16
 
+VIR_NODE_CPU_STATS_ALL_CPUS = -1
+
+VIR_DOMAIN_START_PAUSED = 1
+
 # libvirtError enums
 # (Intentionally different from what's in libvirt. We do this to check,
 #  that consumers of the library are using the symbolic names rather than
@@ -117,6 +122,7 @@ VIR_FROM_DOMAIN = 200
 VIR_FROM_NWFILTER = 330
 VIR_FROM_REMOTE = 340
 VIR_FROM_RPC = 345
+VIR_ERR_NO_SUPPORT = 3
 VIR_ERR_XML_DETAIL = 350
 VIR_ERR_NO_DOMAIN = 420
 VIR_ERR_OPERATION_INVALID = 55
@@ -127,6 +133,15 @@ VIR_ERR_INTERNAL_ERROR = 950
 
 # Readonly
 VIR_CONNECT_RO = 1
+
+# virConnectBaselineCPU flags
+VIR_CONNECT_BASELINE_CPU_EXPAND_FEATURES = 1
+
+# snapshotCreateXML flags
+VIR_DOMAIN_SNAPSHOT_CREATE_NO_METADATA = 4
+VIR_DOMAIN_SNAPSHOT_CREATE_DISK_ONLY = 16
+VIR_DOMAIN_SNAPSHOT_CREATE_REUSE_EXT = 32
+VIR_DOMAIN_SNAPSHOT_CREATE_QUIESCE = 64
 
 
 def _parse_disk_info(element):
@@ -489,6 +504,9 @@ class Domain(object):
     def maxMemory(self):
         return self._def['memory']
 
+    def blockJobInfo(self, disk, flags):
+        return {}
+
 
 class DomainSnapshot(object):
     def __init__(self, name, domain):
@@ -500,7 +518,7 @@ class DomainSnapshot(object):
 
 
 class Connection(object):
-    def __init__(self, uri, readonly, version=9007):
+    def __init__(self, uri=None, readonly=False, version=9007):
         if not uri or uri == '':
             if allow_default_uri_connection:
                 uri = 'qemu:///session'
@@ -623,6 +641,9 @@ class Connection(object):
 
     def domainEventRegisterAny(self, dom, eventid, callback, opaque):
         self._event_callbacks[eventid] = [callback, opaque]
+
+    def registerCloseCallback(self, cb, opaque):
+        pass
 
     def getCapabilities(self):
         """Return spoofed capabilities."""
@@ -876,6 +897,15 @@ class Connection(object):
 
         return VIR_CPU_COMPARE_IDENTICAL
 
+    def getCPUStats(self, cpuNum, flag):
+        if cpuNum < 2:
+            return {'kernel': 5664160000000L,
+                    'idle': 1592705190000000L,
+                    'user': 26728850000000L,
+                    'iowait': 6121490000000L}
+        else:
+            raise libvirtError("invalid argument: Invalid cpu number")
+
     def nwfilterLookupByName(self, name):
         try:
             return self._nwfilters[name]
@@ -889,6 +919,17 @@ class Connection(object):
 
     def listDefinedDomains(self):
         return []
+
+    def listDevices(self, cap, flags):
+        return []
+
+    def baselineCPU(self, cpu, flag):
+        """Add new libvirt API."""
+        return """<cpu mode='custom' match='exact'>
+                    <model fallback='allow'>Westmere</model>
+                    <vendor>Intel</vendor>
+                    <feature policy='require' name='aes'/>
+                  </cpu>"""
 
 
 def openAuth(uri, auth, flags):
@@ -904,6 +945,8 @@ def openAuth(uri, auth, flags):
         raise Exception(
             _("Expected a function in 'auth[1]' parameter"))
 
+    connection_used = True
+
     return Connection(uri, (flags == VIR_CONNECT_RO))
 
 
@@ -912,7 +955,9 @@ def virEventRunDefaultImpl():
 
 
 def virEventRegisterDefaultImpl():
-    pass
+    if connection_used:
+        raise Exception(_("virEventRegisterDefaultImpl() must be \
+            called before connection is used."))
 
 
 def registerErrorHandler(handler, ctxt):

@@ -26,6 +26,7 @@ from nova.compute import vm_states
 from nova import exception
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
+from nova.openstack.common import strutils
 
 LOG = logging.getLogger(__name__)
 
@@ -53,11 +54,17 @@ class AdminActionsController(wsgi.Controller):
         try:
             server = self.compute_api.get(ctxt, id, want_objects=True)
             self.compute_api.pause(ctxt, server)
+        except exception.InstanceIsLocked as e:
+            raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
                     'pause')
         except exception.InstanceNotFound:
-            raise exc.HTTPNotFound(_("Server not found"))
+            msg = _("Server not found")
+            raise exc.HTTPNotFound(explanation=msg)
+        except NotImplementedError:
+            msg = _("Virt driver does not implement pause function.")
+            raise exc.HTTPNotImplemented(explanation=msg)
         except Exception:
             readable = traceback.format_exc()
             LOG.exception(_("Compute.api::pause %s"), readable)
@@ -72,11 +79,17 @@ class AdminActionsController(wsgi.Controller):
         try:
             server = self.compute_api.get(ctxt, id, want_objects=True)
             self.compute_api.unpause(ctxt, server)
+        except exception.InstanceIsLocked as e:
+            raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
                     'unpause')
         except exception.InstanceNotFound:
-            raise exc.HTTPNotFound(_("Server not found"))
+            msg = _("Server not found")
+            raise exc.HTTPNotFound(explanation=msg)
+        except NotImplementedError:
+            msg = _("Virt driver does not implement unpause function.")
+            raise exc.HTTPNotImplemented(explanation=msg)
         except Exception:
             readable = traceback.format_exc()
             LOG.exception(_("Compute.api::unpause %s"), readable)
@@ -91,11 +104,14 @@ class AdminActionsController(wsgi.Controller):
         try:
             server = self.compute_api.get(context, id, want_objects=True)
             self.compute_api.suspend(context, server)
+        except exception.InstanceIsLocked as e:
+            raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
                     'suspend')
         except exception.InstanceNotFound:
-            raise exc.HTTPNotFound(_("Server not found"))
+            msg = _("Server not found")
+            raise exc.HTTPNotFound(explanation=msg)
         except Exception:
             readable = traceback.format_exc()
             LOG.exception(_("compute.api::suspend %s"), readable)
@@ -110,11 +126,14 @@ class AdminActionsController(wsgi.Controller):
         try:
             server = self.compute_api.get(context, id, want_objects=True)
             self.compute_api.resume(context, server)
+        except exception.InstanceIsLocked as e:
+            raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
                     'resume')
         except exception.InstanceNotFound:
-            raise exc.HTTPNotFound(_("Server not found"))
+            msg = _("Server not found")
+            raise exc.HTTPNotFound(explanation=msg)
         except Exception:
             readable = traceback.format_exc()
             LOG.exception(_("compute.api::resume %s"), readable)
@@ -127,11 +146,19 @@ class AdminActionsController(wsgi.Controller):
         context = req.environ['nova.context']
         authorize(context, 'migrate')
         try:
-            instance = self.compute_api.get(context, id)
+            instance = self.compute_api.get(context, id, want_objects=True)
             self.compute_api.resize(req.environ['nova.context'], instance)
+        except exception.QuotaError as error:
+            raise exc.HTTPRequestEntityTooLarge(
+                explanation=error.format_message(),
+                headers={'Retry-After': 0})
+        except exception.InstanceIsLocked as e:
+            raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
                     'migrate')
+        except exception.InstanceNotFound as e:
+            raise exc.HTTPNotFound(explanation=e.format_message())
         except Exception as e:
             LOG.exception(_("Error in migrate %s"), e)
             raise exc.HTTPBadRequest()
@@ -143,10 +170,13 @@ class AdminActionsController(wsgi.Controller):
         context = req.environ['nova.context']
         authorize(context, 'resetNetwork')
         try:
-            instance = self.compute_api.get(context, id)
+            instance = self.compute_api.get(context, id, want_objects=True)
             self.compute_api.reset_network(context, instance)
         except exception.InstanceNotFound:
-            raise exc.HTTPNotFound(_("Server not found"))
+            msg = _("Server not found")
+            raise exc.HTTPNotFound(explanation=msg)
+        except exception.InstanceIsLocked as e:
+            raise exc.HTTPConflict(explanation=e.format_message())
         except Exception:
             readable = traceback.format_exc()
             LOG.exception(_("Compute.api::reset_network %s"), readable)
@@ -159,10 +189,13 @@ class AdminActionsController(wsgi.Controller):
         context = req.environ['nova.context']
         authorize(context, 'injectNetworkInfo')
         try:
-            instance = self.compute_api.get(context, id)
+            instance = self.compute_api.get(context, id, want_objects=True)
             self.compute_api.inject_network_info(context, instance)
         except exception.InstanceNotFound:
-            raise exc.HTTPNotFound(_("Server not found"))
+            msg = _("Server not found")
+            raise exc.HTTPNotFound(explanation=msg)
+        except exception.InstanceIsLocked as e:
+            raise exc.HTTPConflict(explanation=e.format_message())
         except Exception:
             readable = traceback.format_exc()
             LOG.exception(_("Compute.api::inject_network_info %s"), readable)
@@ -175,10 +208,11 @@ class AdminActionsController(wsgi.Controller):
         context = req.environ['nova.context']
         authorize(context, 'lock')
         try:
-            instance = self.compute_api.get(context, id)
+            instance = self.compute_api.get(context, id, want_objects=True)
             self.compute_api.lock(context, instance)
         except exception.InstanceNotFound:
-            raise exc.HTTPNotFound(_("Server not found"))
+            msg = _("Server not found")
+            raise exc.HTTPNotFound(explanation=msg)
         except Exception:
             readable = traceback.format_exc()
             LOG.exception(_("Compute.api::lock %s"), readable)
@@ -191,12 +225,13 @@ class AdminActionsController(wsgi.Controller):
         context = req.environ['nova.context']
         authorize(context, 'unlock')
         try:
-            instance = self.compute_api.get(context, id)
+            instance = self.compute_api.get(context, id, want_objects=True)
             self.compute_api.unlock(context, instance)
         except exception.PolicyNotAuthorized as e:
             raise webob.exc.HTTPForbidden(explanation=e.format_message())
         except exception.InstanceNotFound:
-            raise exc.HTTPNotFound(_("Server not found"))
+            msg = _("Server not found")
+            raise exc.HTTPNotFound(explanation=msg)
         except Exception:
             readable = traceback.format_exc()
             LOG.exception(_("Compute.api::unlock %s"), readable)
@@ -217,11 +252,7 @@ class AdminActionsController(wsgi.Controller):
         """
         context = req.environ["nova.context"]
         authorize(context, 'createBackup')
-
-        try:
-            entity = body["createBackup"]
-        except (KeyError, TypeError):
-            raise exc.HTTPBadRequest(_("Malformed request body"))
+        entity = body["createBackup"]
 
         try:
             image_name = entity["name"]
@@ -256,9 +287,10 @@ class AdminActionsController(wsgi.Controller):
             raise exc.HTTPBadRequest(explanation=msg)
 
         try:
-            instance = self.compute_api.get(context, id)
+            instance = self.compute_api.get(context, id, want_objects=True)
         except exception.NotFound:
-            raise exc.HTTPNotFound(_("Instance not found"))
+            msg = _("Instance not found")
+            raise exc.HTTPNotFound(explanation=msg)
 
         try:
             image = self.compute_api.backup(context, instance, image_name,
@@ -293,14 +325,31 @@ class AdminActionsController(wsgi.Controller):
             raise exc.HTTPBadRequest(explanation=msg)
 
         try:
-            instance = self.compute_api.get(context, id)
+            block_migration = strutils.bool_from_string(block_migration,
+                                                        strict=True)
+            disk_over_commit = strutils.bool_from_string(disk_over_commit,
+                                                         strict=True)
+        except ValueError as err:
+            raise exc.HTTPBadRequest(explanation=str(err))
+
+        try:
+            instance = self.compute_api.get(context, id, want_objects=True)
             self.compute_api.live_migrate(context, instance, block_migration,
                                           disk_over_commit, host)
         except (exception.ComputeServiceUnavailable,
                 exception.InvalidHypervisorType,
                 exception.UnableToMigrateToSelf,
-                exception.DestinationHypervisorTooOld) as ex:
+                exception.DestinationHypervisorTooOld,
+                exception.NoValidHost,
+                exception.InvalidLocalStorage,
+                exception.InvalidSharedStorage,
+                exception.MigrationPreCheckError) as ex:
             raise exc.HTTPBadRequest(explanation=ex.format_message())
+        except exception.InstanceNotFound as e:
+            raise exc.HTTPNotFound(explanation=e.format_message())
+        except exception.InstanceInvalidState as state_error:
+            common.raise_http_conflict_for_instance_invalid_state(state_error,
+                    'os-migrateLive')
         except Exception:
             if host is None:
                 msg = _("Live migration of instance %s to another host "
@@ -334,7 +383,8 @@ class AdminActionsController(wsgi.Controller):
             instance.task_state = None
             instance.save(admin_state_reset=True)
         except exception.InstanceNotFound:
-            raise exc.HTTPNotFound(_("Server not found"))
+            msg = _("Server not found")
+            raise exc.HTTPNotFound(explanation=msg)
         except Exception:
             readable = traceback.format_exc()
             LOG.exception(_("Compute.api::resetState %s"), readable)

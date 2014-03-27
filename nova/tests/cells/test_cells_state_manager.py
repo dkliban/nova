@@ -16,6 +16,8 @@
 Tests For CellStateManager
 """
 
+from oslo.config import cfg
+
 from nova.cells import state
 from nova import db
 from nova.db.sqlalchemy import models
@@ -30,9 +32,14 @@ FAKE_COMPUTES = [
     ('host4', 1024, 100, 300, 30),
 ]
 
+# NOTE(alaski): It's important to have multiple types that end up having the
+# same memory and disk requirements.  So two types need the same first value,
+# and two need the second and third values to add up to the same thing.
 FAKE_ITYPES = [
     (0, 0, 0),
     (50, 12, 13),
+    (50, 2, 4),
+    (10, 20, 5),
 ]
 
 
@@ -64,6 +71,12 @@ class TestCellsStateManager(test.TestCase):
 
         self.stubs.Set(db, 'compute_node_get_all', _fake_compute_node_get_all)
         self.stubs.Set(db, 'flavor_get_all', _fake_instance_type_all)
+
+    def test_cells_config_not_found(self):
+        self.flags(cells_config='no_such_file_exists.conf', group='cells')
+        e = self.assertRaises(cfg.ConfigFilesNotFoundError,
+                              state.CellStateManager)
+        self.assertEqual(['no_such_file_exists.conf'], e.config_files)
 
     def test_capacity_no_reserve(self):
         # utilize entire cell

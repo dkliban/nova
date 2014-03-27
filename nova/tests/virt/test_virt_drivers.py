@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-#
 #    Copyright 2010 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -16,13 +14,17 @@
 
 import base64
 import fixtures
-import netaddr
 import sys
 import traceback
+
+import mock
+import netaddr
+import six
 
 from nova.compute import manager
 from nova import exception
 from nova.openstack.common import importutils
+from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
 from nova import test
 from nova.tests.image import fake as fake_image
@@ -95,7 +97,8 @@ class _FakeDriverBackendTestCase(object):
         self.flags(rescue_image_id="2",
                    rescue_kernel_id="3",
                    rescue_ramdisk_id=None,
-                   libvirt_snapshots_directory='./')
+                   snapshots_directory='./',
+                   group='libvirt')
 
         def fake_extend(image, size):
             pass
@@ -202,9 +205,9 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
         self.ctxt = test_utils.get_test_admin_context()
         self.image_service = fake_image.FakeImageService()
 
-    def _get_running_instance(self):
-        instance_ref = test_utils.get_test_instance()
-        network_info = test_utils.get_test_network_info(legacy_model=False)
+    def _get_running_instance(self, obj=False):
+        instance_ref = test_utils.get_test_instance(obj=obj)
+        network_info = test_utils.get_test_network_info()
         network_info[0]['network']['subnets'][0]['meta']['dhcp_server'] = \
             '1.1.1.1'
         image_info = test_utils.get_test_image_info(None, instance_ref)
@@ -250,22 +253,6 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
                                  lambda *args, **kwargs: None)
 
     @catch_notimplementederror
-    def test_live_snapshot_not_running(self):
-        instance_ref = test_utils.get_test_instance()
-        img_ref = self.image_service.create(self.ctxt, {'name': 'snap-1'})
-        self.assertRaises(exception.InstanceNotRunning,
-                          self.connection.live_snapshot,
-                          self.ctxt, instance_ref, img_ref['id'],
-                          lambda *args, **kwargs: None)
-
-    @catch_notimplementederror
-    def test_live_snapshot_running(self):
-        img_ref = self.image_service.create(self.ctxt, {'name': 'snap-1'})
-        instance_ref, network_info = self._get_running_instance()
-        self.connection.live_snapshot(self.ctxt, instance_ref, img_ref['id'],
-                                      lambda *args, **kwargs: None)
-
-    @catch_notimplementederror
     def test_reboot(self):
         reboot_type = "SOFT"
         instance_ref, network_info = self._get_running_instance()
@@ -280,12 +267,12 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
         ip = netaddr.IPAddress(host_ip)
 
         # For now, assume IPv4.
-        self.assertEquals(ip.version, 4)
+        self.assertEqual(ip.version, 4)
 
     @catch_notimplementederror
     def test_set_admin_password(self):
-        instance_ref, network_info = self._get_running_instance()
-        self.connection.set_admin_password(instance_ref, 'p4ssw0rd')
+        instance, network_info = self._get_running_instance(obj=True)
+        self.connection.set_admin_password(instance, 'p4ssw0rd')
 
     @catch_notimplementederror
     def test_inject_file(self):
@@ -324,9 +311,9 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
     @catch_notimplementederror
     def test_migrate_disk_and_power_off(self):
         instance_ref, network_info = self._get_running_instance()
-        instance_type_ref = test_utils.get_test_instance_type()
+        flavor_ref = test_utils.get_test_flavor()
         self.connection.migrate_disk_and_power_off(
-            self.ctxt, instance_ref, 'dest_host', instance_type_ref,
+            self.ctxt, instance_ref, 'dest_host', flavor_ref,
             network_info)
 
     @catch_notimplementederror
@@ -348,7 +335,7 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
 
     @catch_notimplementederror
     def test_soft_delete(self):
-        instance_ref, network_info = self._get_running_instance()
+        instance_ref, network_info = self._get_running_instance(obj=True)
         self.connection.soft_delete(instance_ref)
 
     @catch_notimplementederror
@@ -386,51 +373,53 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
     @catch_notimplementederror
     def test_resume_unsuspended_instance(self):
         instance_ref, network_info = self._get_running_instance()
-        self.connection.resume(instance_ref, network_info)
+        self.connection.resume(self.ctxt, instance_ref, network_info)
 
     @catch_notimplementederror
     def test_resume_suspended_instance(self):
         instance_ref, network_info = self._get_running_instance()
         self.connection.suspend(instance_ref)
-        self.connection.resume(instance_ref, network_info)
+        self.connection.resume(self.ctxt, instance_ref, network_info)
 
     @catch_notimplementederror
     def test_destroy_instance_nonexistent(self):
         fake_instance = {'id': 42, 'name': 'I just made this up!',
                          'uuid': 'bda5fb9e-b347-40e8-8256-42397848cb00'}
-        network_info = test_utils.get_test_network_info(legacy_model=False)
-        self.connection.destroy(fake_instance, network_info)
+        network_info = test_utils.get_test_network_info()
+        self.connection.destroy(self.ctxt, fake_instance, network_info)
 
     @catch_notimplementederror
     def test_destroy_instance(self):
         instance_ref, network_info = self._get_running_instance()
         self.assertIn(instance_ref['name'],
                       self.connection.list_instances())
-        self.connection.destroy(instance_ref, network_info)
+        self.connection.destroy(self.ctxt, instance_ref, network_info)
         self.assertNotIn(instance_ref['name'],
                          self.connection.list_instances())
 
     @catch_notimplementederror
     def test_get_volume_connector(self):
         result = self.connection.get_volume_connector({'id': 'fake'})
-        self.assertTrue('ip' in result)
-        self.assertTrue('initiator' in result)
-        self.assertTrue('host' in result)
+        self.assertIn('ip', result)
+        self.assertIn('initiator', result)
+        self.assertIn('host', result)
 
     @catch_notimplementederror
     def test_attach_detach_volume(self):
         instance_ref, network_info = self._get_running_instance()
-        self.connection.attach_volume({'driver_volume_type': 'fake'},
-                                      instance_ref,
+        connection_info = {
+            "driver_volume_type": "fake",
+            "serial": "fake_serial",
+        }
+        self.connection.attach_volume(None, connection_info, instance_ref,
                                       '/dev/sda')
-        self.connection.detach_volume({'driver_volume_type': 'fake'},
-                                      instance_ref,
+        self.connection.detach_volume(connection_info, instance_ref,
                                       '/dev/sda')
 
     @catch_notimplementederror
     def test_swap_volume(self):
         instance_ref, network_info = self._get_running_instance()
-        self.connection.attach_volume({'driver_volume_type': 'fake'},
+        self.connection.attach_volume(None, {'driver_volume_type': 'fake'},
                                       instance_ref,
                                       '/dev/sda')
         self.connection.swap_volume({'driver_volume_type': 'fake'},
@@ -441,9 +430,12 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
     @catch_notimplementederror
     def test_attach_detach_different_power_states(self):
         instance_ref, network_info = self._get_running_instance()
+        connection_info = {
+            "driver_volume_type": "fake",
+            "serial": "fake_serial",
+        }
         self.connection.power_off(instance_ref)
-        self.connection.attach_volume({'driver_volume_type': 'fake'},
-                                      instance_ref,
+        self.connection.attach_volume(None, connection_info, instance_ref,
                                       '/dev/sda')
 
         bdm = {
@@ -463,7 +455,7 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
             }]
         }
         self.connection.power_on(self.ctxt, instance_ref, network_info, bdm)
-        self.connection.detach_volume({'driver_volume_type': 'fake'},
+        self.connection.detach_volume(connection_info,
                                       instance_ref,
                                       '/dev/sda')
 
@@ -485,32 +477,33 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
 
     @catch_notimplementederror
     def test_get_diagnostics(self):
-        instance_ref, network_info = self._get_running_instance()
+        instance_ref, network_info = self._get_running_instance(obj=True)
         self.connection.get_diagnostics(instance_ref)
 
     @catch_notimplementederror
     def test_block_stats(self):
         instance_ref, network_info = self._get_running_instance()
         stats = self.connection.block_stats(instance_ref['name'], 'someid')
-        self.assertEquals(len(stats), 5)
+        self.assertEqual(len(stats), 5)
 
     @catch_notimplementederror
     def test_interface_stats(self):
         instance_ref, network_info = self._get_running_instance()
         stats = self.connection.interface_stats(instance_ref['name'], 'someid')
-        self.assertEquals(len(stats), 8)
+        self.assertEqual(len(stats), 8)
 
     @catch_notimplementederror
     def test_get_console_output(self):
         fake_libvirt_utils.files['dummy.log'] = ''
         instance_ref, network_info = self._get_running_instance()
-        console_output = self.connection.get_console_output(instance_ref)
-        self.assertTrue(isinstance(console_output, basestring))
+        console_output = self.connection.get_console_output(self.ctxt,
+            instance_ref)
+        self.assertIsInstance(console_output, six.string_types)
 
     @catch_notimplementederror
     def test_get_vnc_console(self):
-        instance_ref, network_info = self._get_running_instance()
-        vnc_console = self.connection.get_vnc_console(instance_ref)
+        instance, network_info = self._get_running_instance(obj=True)
+        vnc_console = self.connection.get_vnc_console(self.ctxt, instance)
         self.assertIn('internal_access_path', vnc_console)
         self.assertIn('host', vnc_console)
         self.assertIn('port', vnc_console)
@@ -518,11 +511,20 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
     @catch_notimplementederror
     def test_get_spice_console(self):
         instance_ref, network_info = self._get_running_instance()
-        spice_console = self.connection.get_spice_console(instance_ref)
+        spice_console = self.connection.get_spice_console(self.ctxt,
+                instance_ref)
         self.assertIn('internal_access_path', spice_console)
         self.assertIn('host', spice_console)
         self.assertIn('port', spice_console)
         self.assertIn('tlsPort', spice_console)
+
+    @catch_notimplementederror
+    def test_get_rdp_console(self):
+        instance_ref, network_info = self._get_running_instance()
+        rdp_console = self.connection.get_rdp_console(self.ctxt, instance_ref)
+        self.assertIn('internal_access_path', rdp_console)
+        self.assertIn('host', rdp_console)
+        self.assertIn('port', rdp_console)
 
     @catch_notimplementederror
     def test_get_console_pool_info(self):
@@ -545,21 +547,27 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
         self.connection.refresh_security_group_members(1)
 
     @catch_notimplementederror
+    def test_refresh_instance_security_rules(self):
+        # FIXME: Create security group and add the instance to it
+        instance_ref, network_info = self._get_running_instance()
+        self.connection.refresh_instance_security_rules(instance_ref)
+
+    @catch_notimplementederror
     def test_refresh_provider_fw_rules(self):
         instance_ref, network_info = self._get_running_instance()
         self.connection.refresh_provider_fw_rules()
 
     @catch_notimplementederror
     def test_ensure_filtering_for_instance(self):
-        instance_ref = test_utils.get_test_instance()
-        network_info = test_utils.get_test_network_info(legacy_model=False)
-        self.connection.ensure_filtering_rules_for_instance(instance_ref,
+        instance = test_utils.get_test_instance(obj=True)
+        network_info = test_utils.get_test_network_info()
+        self.connection.ensure_filtering_rules_for_instance(instance,
                                                             network_info)
 
     @catch_notimplementederror
     def test_unfilter_instance(self):
         instance_ref = test_utils.get_test_instance()
-        network_info = test_utils.get_test_network_info(legacy_model=False)
+        network_info = test_utils.get_test_network_info()
         self.connection.unfilter_instance(instance_ref, network_info)
 
     @catch_notimplementederror
@@ -569,23 +577,38 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
                                        lambda *a: None, lambda *a: None)
 
     @catch_notimplementederror
-    def _check_available_resouce_fields(self, host_status):
+    def _check_available_resource_fields(self, host_status):
         keys = ['vcpus', 'memory_mb', 'local_gb', 'vcpus_used',
                 'memory_mb_used', 'hypervisor_type', 'hypervisor_version',
-                'hypervisor_hostname', 'cpu_info', 'disk_available_least']
+                'hypervisor_hostname', 'cpu_info', 'disk_available_least',
+                'supported_instances']
         for key in keys:
             self.assertIn(key, host_status)
 
     @catch_notimplementederror
     def test_get_host_stats(self):
         host_status = self.connection.get_host_stats()
-        self._check_available_resouce_fields(host_status)
+        self._check_available_resource_fields(host_status)
+        self.assertIsInstance(host_status['hypervisor_version'], int)
 
     @catch_notimplementederror
     def test_get_available_resource(self):
         available_resource = self.connection.get_available_resource(
                 'myhostname')
-        self._check_available_resouce_fields(available_resource)
+        self._check_available_resource_fields(available_resource)
+
+    @catch_notimplementederror
+    def _check_host_cpu_status_fields(self, host_cpu_status):
+        self.assertIn('kernel', host_cpu_status)
+        self.assertIn('idle', host_cpu_status)
+        self.assertIn('user', host_cpu_status)
+        self.assertIn('iowait', host_cpu_status)
+        self.assertIn('frequency', host_cpu_status)
+
+    @catch_notimplementederror
+    def test_get_host_cpu_stats(self):
+        host_cpu_status = self.connection.get_host_cpu_stats()
+        self._check_host_cpu_status_fields(host_cpu_status)
 
     @catch_notimplementederror
     def test_set_host_enabled(self):
@@ -681,6 +704,10 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
 
         self.connection.emit_event(event1)
 
+    def test_set_bootable(self):
+        self.assertRaises(NotImplementedError, self.connection.set_bootable,
+                          'instance', True)
+
 
 class AbstractDriverTestCase(_VirtDriverTestCase, test.TestCase):
     def setUp(self):
@@ -694,18 +721,95 @@ class FakeConnectionTestCase(_VirtDriverTestCase, test.TestCase):
         fake.set_nodes(['myhostname'])
         super(FakeConnectionTestCase, self).setUp()
 
+    def _check_available_resource_fields(self, host_status):
+        super(FakeConnectionTestCase, self)._check_available_resource_fields(
+            host_status)
+
+        hypervisor_type = host_status['hypervisor_type']
+        supported_instances = host_status['supported_instances']
+        try:
+            # supported_instances could be JSON wrapped
+            supported_instances = jsonutils.loads(supported_instances)
+        except TypeError:
+            pass
+        self.assertTrue(any(hypervisor_type in x for x in supported_instances))
+
 
 class LibvirtConnTestCase(_VirtDriverTestCase, test.TestCase):
     def setUp(self):
         # Point _VirtDriverTestCase at the right module
         self.driver_module = 'nova.virt.libvirt.LibvirtDriver'
         super(LibvirtConnTestCase, self).setUp()
+        self.stubs.Set(self.connection,
+                       '_set_host_enabled', mock.MagicMock())
+        self.useFixture(fixtures.MonkeyPatch(
+            'nova.context.get_admin_context',
+            self._fake_admin_context))
+
+    def _fake_admin_context(self, *args, **kwargs):
+        return self.ctxt
 
     def test_force_hard_reboot(self):
-        self.flags(libvirt_wait_soft_reboot_seconds=0)
+        self.flags(wait_soft_reboot_seconds=0, group='libvirt')
         self.test_reboot()
 
     def test_migrate_disk_and_power_off(self):
         # there is lack of fake stuff to execute this method. so pass.
         self.skipTest("Test nothing, but this method"
                       " needed to override superclass.")
+
+    def test_internal_set_host_enabled(self):
+        self.mox.UnsetStubs()
+        service_mock = mock.MagicMock()
+
+        # Previous status of the service: disabled: False
+        service_mock.configure_mock(disabled_reason='None',
+                                    disabled=False)
+        from nova.objects import service as service_obj
+        with mock.patch.object(service_obj.Service, "get_by_compute_host",
+                               return_value=service_mock):
+            self.connection._set_host_enabled(False, 'ERROR!')
+            self.assertTrue(service_mock.disabled)
+            self.assertEqual(service_mock.disabled_reason, 'AUTO: ERROR!')
+
+    def test_set_host_enabled_when_auto_disabled(self):
+        self.mox.UnsetStubs()
+        service_mock = mock.MagicMock()
+
+        # Previous status of the service: disabled: True, 'AUTO: ERROR'
+        service_mock.configure_mock(disabled_reason='AUTO: ERROR',
+                                    disabled=True)
+        from nova.objects import service as service_obj
+        with mock.patch.object(service_obj.Service, "get_by_compute_host",
+                               return_value=service_mock):
+            self.connection._set_host_enabled(True)
+            self.assertFalse(service_mock.disabled)
+            self.assertEqual(service_mock.disabled_reason, 'None')
+
+    def test_set_host_enabled_when_manually_disabled(self):
+        self.mox.UnsetStubs()
+        service_mock = mock.MagicMock()
+
+        # Previous status of the service: disabled: True, 'Manually disabled'
+        service_mock.configure_mock(disabled_reason='Manually disabled',
+                                    disabled=True)
+        from nova.objects import service as service_obj
+        with mock.patch.object(service_obj.Service, "get_by_compute_host",
+                               return_value=service_mock):
+            self.connection._set_host_enabled(True)
+            self.assertTrue(service_mock.disabled)
+            self.assertEqual(service_mock.disabled_reason, 'Manually disabled')
+
+    def test_set_host_enabled_dont_override_manually_disabled(self):
+        self.mox.UnsetStubs()
+        service_mock = mock.MagicMock()
+
+        # Previous status of the service: disabled: True, 'Manually disabled'
+        service_mock.configure_mock(disabled_reason='Manually disabled',
+                                    disabled=True)
+        from nova.objects import service as service_obj
+        with mock.patch.object(service_obj.Service, "get_by_compute_host",
+                               return_value=service_mock):
+            self.connection._set_host_enabled(False, 'ERROR!')
+            self.assertTrue(service_mock.disabled)
+            self.assertEqual(service_mock.disabled_reason, 'Manually disabled')

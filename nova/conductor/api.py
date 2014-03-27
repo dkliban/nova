@@ -15,13 +15,13 @@
 """Handles all requests to the conductor service."""
 
 from oslo.config import cfg
+from oslo import messaging
 
 from nova import baserpc
 from nova.conductor import manager
 from nova.conductor import rpcapi
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
-from nova.openstack.common.rpc import common as rpc_common
 from nova import utils
 
 conductor_opts = [
@@ -30,10 +30,13 @@ conductor_opts = [
                 help='Perform nova-conductor operations locally'),
     cfg.StrOpt('topic',
                default='conductor',
-               help='the topic conductor nodes listen on'),
+               help='The topic on which conductor nodes listen'),
     cfg.StrOpt('manager',
                default='nova.conductor.manager.ConductorManager',
-               help='full class name for the Manager for conductor'),
+               help='Full class name for the Manager for conductor'),
+    cfg.IntOpt('workers',
+               help='Number of workers for OpenStack Conductor service. '
+                    'The default will be the number of CPUs available.')
 ]
 conductor_group = cfg.OptGroup(name='conductor',
                                title='Conductor Options')
@@ -63,9 +66,6 @@ class LocalAPI(object):
         return self._manager.instance_update(context, instance_uuid,
                                              updates, 'compute')
 
-    def instance_get(self, context, instance_id):
-        return self._manager.instance_get(context, instance_id)
-
     def instance_get_by_uuid(self, context, instance_uuid,
                              columns_to_join=None):
         return self._manager.instance_get_by_uuid(context, instance_uuid,
@@ -84,73 +84,34 @@ class LocalAPI(object):
     def instance_get_all_by_filters(self, context, filters,
                                     sort_key='created_at',
                                     sort_dir='desc',
-                                    columns_to_join=None):
+                                    columns_to_join=None, use_slave=False):
         return self._manager.instance_get_all_by_filters(context,
                                                          filters,
                                                          sort_key,
                                                          sort_dir,
-                                                         columns_to_join)
+                                                         columns_to_join,
+                                                         use_slave)
 
     def instance_get_active_by_window_joined(self, context, begin, end=None,
                                              project_id=None, host=None):
         return self._manager.instance_get_active_by_window_joined(
             context, begin, end, project_id, host)
 
-    def instance_info_cache_update(self, context, instance, values):
-        return self._manager.instance_info_cache_update(context,
-                                                        instance,
-                                                        values)
-
     def instance_info_cache_delete(self, context, instance):
         return self._manager.instance_info_cache_delete(context, instance)
-
-    def instance_type_get(self, context, instance_type_id):
-        return self._manager.instance_type_get(context, instance_type_id)
 
     def instance_fault_create(self, context, values):
         return self._manager.instance_fault_create(context, values)
 
-    def migration_get(self, context, migration_id):
-        return self._manager.migration_get(context, migration_id)
-
-    def migration_get_unconfirmed_by_dest_compute(self, context,
-                                                  confirm_window,
-                                                  dest_compute):
-        return self._manager.migration_get_unconfirmed_by_dest_compute(
-            context, confirm_window, dest_compute)
-
     def migration_get_in_progress_by_host_and_node(self, context, host, node):
         return self._manager.migration_get_in_progress_by_host_and_node(
             context, host, node)
-
-    def migration_create(self, context, instance, values):
-        return self._manager.migration_create(context, instance, values)
-
-    def migration_update(self, context, migration, status):
-        return self._manager.migration_update(context, migration, status)
 
     def aggregate_host_add(self, context, aggregate, host):
         return self._manager.aggregate_host_add(context, aggregate, host)
 
     def aggregate_host_delete(self, context, aggregate, host):
         return self._manager.aggregate_host_delete(context, aggregate, host)
-
-    def aggregate_get(self, context, aggregate_id):
-        return self._manager.aggregate_get(context, aggregate_id)
-
-    def aggregate_get_by_host(self, context, host, key=None):
-        return self._manager.aggregate_get_by_host(context, host, key)
-
-    def aggregate_metadata_add(self, context, aggregate, metadata,
-                               set_delete=False):
-        return self._manager.aggregate_metadata_add(context, aggregate,
-                                                    metadata,
-                                                    set_delete)
-
-    def aggregate_metadata_delete(self, context, aggregate, key):
-        return self._manager.aggregate_metadata_delete(context,
-                                                       aggregate,
-                                                       key)
 
     def aggregate_metadata_get_by_host(self, context, host,
                                        key='availability_zone'):
@@ -169,13 +130,6 @@ class LocalAPI(object):
                                              last_ctr_in, last_ctr_out,
                                              last_refreshed,
                                              update_cells=update_cells)
-
-    def security_group_get_by_instance(self, context, instance):
-        return self._manager.security_group_get_by_instance(context, instance)
-
-    def security_group_rule_get_by_security_group(self, context, secgroup):
-        return self._manager.security_group_rule_get_by_security_group(
-            context, secgroup)
 
     def provider_fw_rule_get_all(self, context):
         return self._manager.provider_fw_rule_get_all(context)
@@ -203,21 +157,6 @@ class LocalAPI(object):
                                                  legacy=True):
         return self._manager.block_device_mapping_get_all_by_instance(
             context, instance, legacy)
-
-    def block_device_mapping_destroy(self, context, bdms):
-        return self._manager.block_device_mapping_destroy(context, bdms=bdms)
-
-    def block_device_mapping_destroy_by_instance_and_device(self, context,
-                                                            instance,
-                                                            device_name):
-        return self._manager.block_device_mapping_destroy(
-            context, instance=instance, device_name=device_name)
-
-    def block_device_mapping_destroy_by_instance_and_volume(self, context,
-                                                            instance,
-                                                            volume_id):
-        return self._manager.block_device_mapping_destroy(
-            context, instance=instance, volume_id=volume_id)
 
     def vol_get_usage_by_time(self, context, start_time):
         return self._manager.vol_get_usage_by_time(context, start_time)
@@ -269,8 +208,8 @@ class LocalAPI(object):
         return self._manager.compute_node_create(context, values)
 
     def compute_node_update(self, context, node, values, prune_stats=False):
-        return self._manager.compute_node_update(context, node, values,
-                                                 prune_stats)
+        # NOTE(belliott) ignore prune_stats param, it's no longer relevant
+        return self._manager.compute_node_update(context, node, values)
 
     def compute_node_delete(self, context, node):
         return self._manager.compute_node_delete(context, node)
@@ -334,12 +273,11 @@ class LocalAPI(object):
     def get_ec2_ids(self, context, instance):
         return self._manager.get_ec2_ids(context, instance)
 
-    def compute_confirm_resize(self, context, instance, migration_ref):
-        return self._manager.compute_confirm_resize(context, instance,
-                                                    migration_ref)
-
     def compute_unrescue(self, context, instance):
         return self._manager.compute_unrescue(context, instance)
+
+    def object_backport(self, context, objinst, target_version):
+        return self._manager.object_backport(context, objinst, target_version)
 
 
 class LocalComputeTaskAPI(object):
@@ -349,23 +287,34 @@ class LocalComputeTaskAPI(object):
         self._manager = utils.ExceptionHelper(
                 manager.ComputeTaskManager())
 
-    def migrate_server(self, context, instance, scheduler_hint, live, rebuild,
-                  flavor, block_migration, disk_over_commit,
-                  reservations=None):
+    def resize_instance(self, context, instance, extra_instance_updates,
+                        scheduler_hint, flavor, reservations):
+        # NOTE(comstud): 'extra_instance_updates' is not used here but is
+        # needed for compatibility with the cells_rpcapi version of this
+        # method.
         self._manager.migrate_server(
-            context, instance, scheduler_hint, live, rebuild, flavor,
-            block_migration, disk_over_commit, reservations)
+            context, instance, scheduler_hint, False, False, flavor,
+            None, None, reservations)
+
+    def live_migrate_instance(self, context, instance, host_name,
+                              block_migration, disk_over_commit):
+        scheduler_hint = {'host': host_name}
+        self._manager.migrate_server(
+            context, instance, scheduler_hint, True, False, None,
+            block_migration, disk_over_commit, None)
 
     def build_instances(self, context, instances, image,
             filter_properties, admin_password, injected_files,
-            requested_networks, security_groups, block_device_mapping):
+            requested_networks, security_groups, block_device_mapping,
+            legacy_bdm=True):
         utils.spawn_n(self._manager.build_instances, context,
                 instances=instances, image=image,
                 filter_properties=filter_properties,
                 admin_password=admin_password, injected_files=injected_files,
                 requested_networks=requested_networks,
                 security_groups=security_groups,
-                block_device_mapping=block_device_mapping)
+                block_device_mapping=block_device_mapping,
+                legacy_bdm=legacy_bdm)
 
     def unshelve_instance(self, context, instance):
         utils.spawn_n(self._manager.unshelve_instance, context,
@@ -404,7 +353,7 @@ class API(LocalAPI):
                 self.base_rpcapi.ping(context, '1.21 GigaWatts',
                                       timeout=timeout)
                 break
-            except rpc_common.Timeout:
+            except messaging.MessagingTimeout:
                 LOG.warning(_('Timed out waiting for nova-conductor. '
                                 'Is it running? Or did this service start '
                                 'before nova-conductor?'))
@@ -421,23 +370,33 @@ class ComputeTaskAPI(object):
     def __init__(self):
         self.conductor_compute_rpcapi = rpcapi.ComputeTaskAPI()
 
-    def migrate_server(self, context, instance, scheduler_hint, live, rebuild,
-                  flavor, block_migration, disk_over_commit,
-                  reservations=None):
+    def resize_instance(self, context, instance, extra_instance_updates,
+                        scheduler_hint, flavor, reservations):
+        # NOTE(comstud): 'extra_instance_updates' is not used here but is
+        # needed for compatibility with the cells_rpcapi version of this
+        # method.
         self.conductor_compute_rpcapi.migrate_server(
-            context, instance, scheduler_hint, live, rebuild,
-            flavor, block_migration, disk_over_commit, reservations)
+            context, instance, scheduler_hint, False, False, flavor,
+            None, None, reservations)
+
+    def live_migrate_instance(self, context, instance, host_name,
+                              block_migration, disk_over_commit):
+        scheduler_hint = {'host': host_name}
+        self.conductor_compute_rpcapi.migrate_server(
+            context, instance, scheduler_hint, True, False, None,
+            block_migration, disk_over_commit, None)
 
     def build_instances(self, context, instances, image, filter_properties,
             admin_password, injected_files, requested_networks,
-            security_groups, block_device_mapping):
+            security_groups, block_device_mapping, legacy_bdm=True):
         self.conductor_compute_rpcapi.build_instances(context,
                 instances=instances, image=image,
                 filter_properties=filter_properties,
                 admin_password=admin_password, injected_files=injected_files,
                 requested_networks=requested_networks,
                 security_groups=security_groups,
-                block_device_mapping=block_device_mapping)
+                block_device_mapping=block_device_mapping,
+                legacy_bdm=legacy_bdm)
 
     def unshelve_instance(self, context, instance):
         self.conductor_compute_rpcapi.unshelve_instance(context,

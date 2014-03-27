@@ -15,15 +15,21 @@
 """
 Tests For Scheduler Utils
 """
+import mock
 import mox
+from oslo.config import cfg
 
+from nova.compute import flavors
 from nova.compute import utils as compute_utils
 from nova.conductor import api as conductor_api
 from nova import db
 from nova import notifications
-from nova.openstack.common.notifier import api as notifier
+from nova import rpc
 from nova.scheduler import utils as scheduler_utils
 from nova import test
+from nova.tests import fake_instance
+
+CONF = cfg.CONF
 
 
 class SchedulerUtilsTestCase(test.NoDBTestCase):
@@ -32,19 +38,51 @@ class SchedulerUtilsTestCase(test.NoDBTestCase):
         super(SchedulerUtilsTestCase, self).setUp()
         self.context = 'fake-context'
 
+    def test_build_request_spec_without_image(self):
+        image = None
+        instance = {'uuid': 'fake-uuid'}
+        instance_type = {'flavorid': 'fake-id'}
+
+        self.mox.StubOutWithMock(flavors, 'extract_flavor')
+        self.mox.StubOutWithMock(db, 'flavor_extra_specs_get')
+        flavors.extract_flavor(mox.IgnoreArg()).AndReturn(instance_type)
+        db.flavor_extra_specs_get(self.context, mox.IgnoreArg()).AndReturn([])
+        self.mox.ReplayAll()
+
+        request_spec = scheduler_utils.build_request_spec(self.context, image,
+                                                          [instance])
+        self.assertEqual({}, request_spec['image'])
+
+    @mock.patch.object(flavors, 'extract_flavor')
+    @mock.patch.object(db, 'flavor_extra_specs_get')
+    def test_build_request_spec_with_object(self, flavor_extra_specs_get,
+                                            extract_flavor):
+        instance_type = {'flavorid': 'fake-id'}
+        instance = fake_instance.fake_instance_obj(self.context)
+
+        extract_flavor.return_value = instance_type
+        flavor_extra_specs_get.return_value = []
+
+        request_spec = scheduler_utils.build_request_spec(self.context, None,
+                                                          [instance])
+        self.assertIsInstance(request_spec['instance_properties'], dict)
+
     def _test_set_vm_state_and_notify(self, request_spec,
                                       expected_uuids):
         updates = dict(vm_state='fake-vm-state')
         service = 'fake-service'
         method = 'fake-method'
         exc_info = 'exc_info'
-        publisher_id = 'fake-publisher-id'
 
         self.mox.StubOutWithMock(compute_utils,
                                  'add_instance_fault_from_exc')
         self.mox.StubOutWithMock(notifications, 'send_update')
         self.mox.StubOutWithMock(db, 'instance_update_and_get_original')
-        self.mox.StubOutWithMock(notifier, 'publisher_id')
+
+        self.mox.StubOutWithMock(rpc, 'get_notifier')
+        notifier = self.mox.CreateMockAnything()
+        rpc.get_notifier('conductor', CONF.host).AndReturn(notifier)
+        rpc.get_notifier(service).AndReturn(notifier)
 
         old_ref = 'old_ref'
         new_ref = 'new_ref'
@@ -61,15 +99,13 @@ class SchedulerUtilsTestCase(test.NoDBTestCase):
 
             payload = dict(request_spec=request_spec,
                            instance_properties=request_spec.get(
-                               'instance_properties'),
+                               'instance_properties', {}),
                            instance_id=uuid,
                            state='fake-vm-state',
                            method=method,
                            reason=exc_info)
             event_type = '%s.%s' % (service, method)
-            notifier.publisher_id(service).AndReturn(publisher_id)
-            notifier.notify(self.context, publisher_id,
-                            event_type, notifier.ERROR, payload)
+            notifier.error(self.context, event_type, payload)
 
         self.mox.ReplayAll()
 
@@ -92,9 +128,19 @@ class SchedulerUtilsTestCase(test.NoDBTestCase):
         self._test_set_vm_state_and_notify(request_spec, expected_uuids)
 
     def _test_populate_filter_props(self, host_state_obj=True,
-                                    with_retry=True):
+                                    with_retry=True,
+                                    force_hosts=None,
+                                    force_nodes=None):
+        if force_hosts is None:
+            force_hosts = []
+        if force_nodes is None:
+            force_nodes = []
         if with_retry:
-            filter_properties = dict(retry=dict(hosts=[]))
+            if not force_hosts and not force_nodes:
+                filter_properties = dict(retry=dict(hosts=[]))
+            else:
+                filter_properties = dict(force_hosts=force_hosts,
+                                         force_nodes=force_nodes)
         else:
             filter_properties = dict()
 
@@ -110,13 +156,19 @@ class SchedulerUtilsTestCase(test.NoDBTestCase):
 
         scheduler_utils.populate_filter_properties(filter_properties,
                                                    host_state)
-        if with_retry:
+        if with_retry and not force_hosts and not force_nodes:
             # So we can check for 2 hosts
             scheduler_utils.populate_filter_properties(filter_properties,
                                                        host_state)
 
-        self.assertEqual('fake-limits', filter_properties['limits'])
-        if with_retry:
+        if force_hosts:
+            expected_limits = None
+        else:
+            expected_limits = 'fake-limits'
+        self.assertEqual(expected_limits,
+                         filter_properties.get('limits'))
+
+        if with_retry and not force_hosts and not force_nodes:
             self.assertEqual([['fake-host', 'fake-node'],
                               ['fake-host', 'fake-node']],
                              filter_properties['retry']['hosts'])
@@ -131,3 +183,38 @@ class SchedulerUtilsTestCase(test.NoDBTestCase):
 
     def test_populate_filter_props_no_retry(self):
         self._test_populate_filter_props(with_retry=False)
+
+    def test_populate_filter_props_force_hosts_no_retry(self):
+        self._test_populate_filter_props(force_hosts=['force-host'])
+
+    def test_populate_filter_props_force_nodes_no_retry(self):
+        self._test_populate_filter_props(force_nodes=['force-node'])
+
+    def _check_parse_options(self, opts, sep, converter, expected):
+        good = scheduler_utils.parse_options(opts,
+                                             sep=sep,
+                                             converter=converter)
+        for item in expected:
+            self.assertIn(item, good)
+
+    def test_parse_options(self):
+        # check normal
+        self._check_parse_options(['foo=1', 'bar=-2.1'],
+                                  '=',
+                                  float,
+                                  [('foo', 1.0), ('bar', -2.1)])
+        # check convert error
+        self._check_parse_options(['foo=a1', 'bar=-2.1'],
+                                  '=',
+                                  float,
+                                  [('bar', -2.1)])
+        # check separator missing
+        self._check_parse_options(['foo', 'bar=-2.1'],
+                                  '=',
+                                  float,
+                                  [('bar', -2.1)])
+        # check key missing
+        self._check_parse_options(['=5', 'bar=-2.1'],
+                                  '=',
+                                  float,
+                                  [('bar', -2.1)])

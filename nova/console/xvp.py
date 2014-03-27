@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2010 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -20,7 +18,7 @@
 import os
 import signal
 
-from Cheetah import Template
+import jinja2
 from oslo.config import cfg
 
 from nova import context
@@ -39,7 +37,7 @@ xvp_opts = [
                help='XVP conf template'),
     cfg.StrOpt('console_xvp_conf',
                default='/etc/xvp.conf',
-               help='generated XVP conf file'),
+               help='Generated XVP conf file'),
     cfg.StrOpt('console_xvp_pid',
                default='/var/run/xvp.pid',
                help='XVP master process pid file'),
@@ -48,7 +46,7 @@ xvp_opts = [
                help='XVP log file'),
     cfg.IntOpt('console_xvp_multiplex_port',
                default=5900,
-               help='port for XVP to multiplex VNC connections on'),
+               help='Port for XVP to multiplex VNC connections on'),
     ]
 
 CONF = cfg.CONF
@@ -108,11 +106,12 @@ class XVPConsoleProxy(object):
             self._xvp_stop()
             return
         conf_data = {'multiplex_port': CONF.console_xvp_multiplex_port,
-                     'pools': pools,
-                     'pass_encode': self.fix_console_password}
-        config = str(Template.Template(self.xvpconf_template,
-                                       searchList=[conf_data]))
-        self._write_conf(config)
+                     'pools': pools}
+        tmpl_path, tmpl_file = os.path.split(CONF.injected_network_template)
+        env = jinja2.Environment(loader=jinja2.FileSystemLoader(tmpl_path))
+        env.filters['pass_encode'] = self.fix_console_password
+        template = env.get_template(tmpl_file)
+        self._write_conf(template.render(conf_data))
         self._xvp_restart()
 
     def _write_conf(self, config):

@@ -1,4 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
 # Copyright (c) 2013 The Johns Hopkins University/Applied Physics Laboratory
 # All Rights Reserved.
 #
@@ -20,15 +19,16 @@ Key manager API
 
 import abc
 
+import six
 
+
+@six.add_metaclass(abc.ABCMeta)
 class KeyManager(object):
     """Base Key Manager Interface
 
     A Key Manager is responsible for managing encryption keys for volumes. A
     Key Manager is responsible for creating, reading, and deleting keys.
     """
-
-    __metaclass__ = abc.ABCMeta
 
     @abc.abstractmethod
     def create_key(self, ctxt, algorithm='AES', length=256, expiration=None,
@@ -49,6 +49,21 @@ class KeyManager(object):
         identifies it within the key manager. If the specified context does
         not permit the creation of keys, then a NotAuthorized exception should
         be raised.
+        """
+        pass
+
+    @abc.abstractmethod
+    def copy_key(self, ctxt, key_id, **kwargs):
+        """Copies (i.e., clones) a key stored by the key manager.
+
+        This method copies the specified key and returns the copy's UUID. If
+        the specified context does not permit copying keys, then a
+        NotAuthorized error should be raised.
+
+        Implementation note: This method should behave identically to
+            store_key(context, get_key(context, <encryption key UUID>))
+        although it is preferable to perform this operation within the key
+        manager to avoid unnecessary handling of the key material.
         """
         pass
 

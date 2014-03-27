@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 NTT DOCOMO, INC.
 # Copyright (c) 2011 University of Southern California / ISI
 # All Rights Reserved.
@@ -43,7 +41,7 @@ class FakeDriver(base.NodeDriver):
         pass
 
     def get_console_output(self, node, instance):
-        return 'fake\nconsole\noutput for instance %s' % instance['id']
+        return 'fake\nconsole\noutput for instance %s' % instance.id
 
 
 class FakePowerManager(base.PowerManager):
@@ -77,8 +75,8 @@ class FakeVolumeDriver(object):
         self.virtapi = virtapi
         self._initiator = "fake_initiator"
 
-    def attach_volume(self, connection_info, instance_name, mountpoint):
+    def attach_volume(self, connection_info, instance, mountpoint):
         pass
 
-    def detach_volume(self, connection_info, instance_name, mountpoint):
+    def detach_volume(self, connection_info, instance, mountpoint):
         pass

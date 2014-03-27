@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 Citrix Systems, Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -21,7 +19,7 @@ from nova.tests.virt.xenapi import stubs
 from nova.virt.xenapi import volumeops
 
 
-class VolumeAttachTestCase(test.TestCase):
+class VolumeAttachTestCase(test.NoDBTestCase):
     def test_detach_volume_call(self):
         registered_calls = []
 
@@ -52,7 +50,7 @@ class VolumeAttachTestCase(test.TestCase):
         volumeops.vm_utils.is_vm_shutdown('session', 'vmref').AndReturn(
             False)
 
-        volumeops.vm_utils.unplug_vbd('session', 'vbdref')
+        volumeops.vm_utils.unplug_vbd('session', 'vbdref', 'vmref')
 
         volumeops.vm_utils.destroy_vbd('session', 'vbdref').WithSideEffects(
             regcall('destroy_vbd'))
@@ -69,7 +67,7 @@ class VolumeAttachTestCase(test.TestCase):
             dict(driver_volume_type='iscsi', data='conn_data'),
             'instance_1', 'mountpoint')
 
-        self.assertEquals(
+        self.assertEqual(
             ['find_sr_from_vbd', 'destroy_vbd'], registered_calls)
 
     def test_attach_volume_call(self):
@@ -130,6 +128,7 @@ class VolumeAttachTestCase(test.TestCase):
         self.mox.StubOutWithMock(volumeops.volume_utils, 'introduce_vdi')
         self.mox.StubOutWithMock(volumeops.vm_utils, 'create_vbd')
         self.mox.StubOutWithMock(volumeops.vm_utils, 'is_vm_shutdown')
+        self.mox.StubOutWithMock(ops._session.VBD, 'plug')
         self.mox.StubOutWithMock(ops._session, 'call_xenapi')
 
         instance_name = 'instance_1'
@@ -161,7 +160,7 @@ class VolumeAttachTestCase(test.TestCase):
         volumeops.vm_utils.is_vm_shutdown(session,
             vm_ref).AndReturn(not vm_running)
         if plugged:
-            ops._session.call_xenapi("VBD.plug", vbd_ref)
+            ops._session.VBD.plug(vbd_ref, vm_ref)
         ops._session.call_xenapi("VDI.get_uuid",
             vdi_ref).AndReturn(vdi_uuid)
 
@@ -231,4 +230,4 @@ class VolumeAttachTestCase(test.TestCase):
 
         ops.connect_volume(connection_info)
 
-        self.assertEquals(False, called['VBD.plug'])
+        self.assertEqual(False, called['VBD.plug'])

@@ -87,9 +87,6 @@
   <extension alias="os-consoles" updated="%(timestamp)s" namespace="http://docs.openstack.org/compute/ext/os-consoles/api/v2" name="Consoles">
     <description>%(text)s</description>
   </extension>
-  <extension alias="os-coverage" updated="%(timestamp)s" namespace="http://docs.openstack.org/compute/ext/coverage/api/v2" name="Coverage">
-    <description>%(text)s</description>
-  </extension>
   <extension alias="os-create-server-ext" updated="%(timestamp)s" namespace="http://docs.openstack.org/compute/ext/createserverext/api/v1.1" name="Createserverext">
     <description>%(text)s</description>
   </extension>
@@ -150,6 +147,9 @@
   <extension alias="os-hypervisors" updated="%(timestamp)s" namespace="http://docs.openstack.org/compute/ext/hypervisors/api/v1.1" name="Hypervisors">
     <description>%(text)s</description>
   </extension>
+  <extension alias="os-extended-hypervisors" name="ExtendedHypervisors" namespace="http://docs.openstack.org/compute/ext/extended_hypervisors/api/v1.1" updated="%(timestamp)s">
+    <description>%(text)s</description>
+  </extension>
   <extension alias="os-instance_usage_audit_log" updated="%(timestamp)s" namespace="http://docs.openstack.org/ext/services/api/v1.1" name="OSInstanceUsageAuditLog">
     <description>%(text)s</description>
   </extension>
@@ -166,9 +166,6 @@
     <description>%(text)s</description>
   </extension>
   <extension alias="os-networks-associate" updated="%(timestamp)s" namespace="http://docs.openstack.org/compute/ext/networks_associate/api/v2" name="NetworkAssociationSupport">
-    <description>%(text)s</description>
-  </extension>
-  <extension alias="os-quota-class-sets" updated="%(timestamp)s" namespace="http://docs.openstack.org/compute/ext/quota-classes-sets/api/v1.1" name="QuotaClasses">
     <description>%(text)s</description>
   </extension>
   <extension alias="os-extended-quotas" updated="%(timestamp)s" namespace="http://docs.openstack.org/compute/ext/extended_quotas/api/v1.1" name="ExtendedQuotas">
@@ -225,7 +222,27 @@
   <extension alias="os-instance-actions" updated="%(timestamp)s" namespace="http://docs.openstack.org/compute/ext/instance-actions/api/v1.1" name="InstanceActions">
     <description>%(text)s</description>
   </extension>
+  <extension alias="os-server-external-events" updated="%(timestamp)s" namespace="http://docs.openstack.org/compute/ext/server-external-events/api/v2" name="ServerExternalEvents">
+    <description>%(text)s</description>
+  </extension>
   <extension alias="os-migrations" updated="%(timestamp)s" namespace="http://docs.openstack.org/compute/ext/migrations/api/v2.0" name="Migrations">
+    <description>%(text)s</description>
+  </extension>
+  <extension alias="os-assisted-volume-snapshots" updated="%(timestamp)s" namespace="http://docs.openstack.org/compute/ext/assisted-volume-snapshots/api/v2" name="AssistedVolumeSnapshots">
+    <description>%(text)s</description>
+  </extension>
+  <extension alias="os-baremetal-ext-status" updated="%(timestamp)s" namespace="http://docs.openstack.org/compute/ext/baremetal_ext_status/api/v2" name="BareMetalExtStatus">    <description>%(text)s</description>
+  </extension>
+  <extension alias="os-preserve-ephemeral-rebuild" updated="%(timestamp)s" namespace="http://docs.openstack.org/compute/ext/preserve_ephemeral_rebuild/api/v2" name="PreserveEphemeralOnRebuild">
+    <description>%(text)s</description>
+  </extension>
+  <extension alias="os-extended-services-delete" updated="%(timestamp)s" namespace="http://docs.openstack.org/compute/ext/extended_services_delete/api/v2" name="ExtendedServicesDelete">
+    <description>%(text)s</description>
+  </extension>
+  <extension alias="os-console-auth-tokens" updated="%(timestamp)s" namespace="http://docs.openstack.org/compute/ext/consoles-auth-tokens/api/v2" name="ConsoleAuthTokens">
+    <description>%(text)s</description>
+  </extension>
+  <extension alias="os-server-groups" updated="%(timestamp)s" namespace="http://docs.openstack.org/compute/ext/servergroups/api/v2" name="ServerGroups">
     <description>%(text)s</description>
   </extension>
 </extensions>

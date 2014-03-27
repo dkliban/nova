@@ -16,20 +16,26 @@
 Tests For Filter Scheduler.
 """
 
+import contextlib
+import mock
+import uuid
+
 import mox
 
-from nova.compute import rpcapi as compute_rpcapi
 from nova.compute import utils as compute_utils
 from nova.compute import vm_states
 from nova.conductor import api as conductor_api
 from nova import context
 from nova import db
 from nova import exception
+from nova.objects import instance_group as instance_group_obj
+from nova.pci import pci_request
 from nova.scheduler import driver
 from nova.scheduler import filter_scheduler
 from nova.scheduler import host_manager
 from nova.scheduler import utils as scheduler_utils
 from nova.scheduler import weights
+from nova.tests import fake_instance
 from nova.tests.scheduler import fakes
 from nova.tests.scheduler import test_scheduler
 
@@ -44,6 +50,15 @@ def fake_get_group_filtered_hosts(hosts, filter_properties, index):
         hosts = list(hosts)
         hosts.pop(0)
         return hosts
+    else:
+        return list(hosts)
+
+
+def fake_get_group_filtered_affinity_hosts(hosts, filter_properties, index):
+    group_hosts = filter_properties.get('group_hosts') or []
+    if group_hosts:
+        affinity_host = hosts.pop(0)
+        return [affinity_host]
     else:
         return list(hosts)
 
@@ -82,7 +97,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
 
         self.mox.ReplayAll()
         sched.schedule_run_instance(
-                fake_context, request_spec, None, None, None, None, {})
+                fake_context, request_spec, None, None,
+                None, None, {}, False)
 
     def test_run_instance_non_admin(self):
         self.was_admin = False
@@ -113,7 +129,7 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
                 mox.IsA(exception.NoValidHost), mox.IgnoreArg())
         self.mox.ReplayAll()
         sched.schedule_run_instance(
-                fake_context, request_spec, None, None, None, None, {})
+                fake_context, request_spec, None, None, None, None, {}, False)
         self.assertTrue(self.was_admin)
 
     def test_scheduler_includes_launch_index(self):
@@ -145,17 +161,19 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
             fake_context, 'host1',
             mox.Func(_has_launch_index(0)), {},
             None, None, None, None,
-            instance_uuid='fake-uuid1').AndReturn(instance1)
+            instance_uuid='fake-uuid1',
+            legacy_bdm_in_spec=False).AndReturn(instance1)
         # instance 2
         self.driver._provision_resource(
             fake_context, 'host2',
             mox.Func(_has_launch_index(1)), {},
             None, None, None, None,
-            instance_uuid='fake-uuid2').AndReturn(instance2)
+            instance_uuid='fake-uuid2',
+            legacy_bdm_in_spec=False).AndReturn(instance2)
         self.mox.ReplayAll()
 
         self.driver.schedule_run_instance(fake_context, request_spec,
-                None, None, None, None, {})
+                None, None, None, None, {}, False)
 
     def test_schedule_happy_day(self):
         """Make sure there's nothing glaringly wrong with _schedule()
@@ -191,9 +209,9 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
                                                 'os_type': 'Linux'}}
         self.mox.ReplayAll()
         weighed_hosts = sched._schedule(fake_context, request_spec, {})
-        self.assertEquals(len(weighed_hosts), 10)
+        self.assertEqual(len(weighed_hosts), 10)
         for weighed_host in weighed_hosts:
-            self.assertTrue(weighed_host.obj is not None)
+            self.assertIsNotNone(weighed_host.obj)
 
     def test_max_attempts(self):
         self.flags(scheduler_max_attempts=4)
@@ -213,7 +231,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
         sched = fakes.FakeFilterScheduler()
 
         instance_properties = {'project_id': '12345', 'os_type': 'Linux'}
-        request_spec = dict(instance_properties=instance_properties)
+        request_spec = dict(instance_properties=instance_properties,
+                            instance_type={})
         filter_properties = {}
 
         self.mox.StubOutWithMock(db, 'compute_node_get_all')
@@ -224,7 +243,45 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
                 filter_properties=filter_properties)
 
         # should not have retry info in the populated filter properties:
-        self.assertFalse("retry" in filter_properties)
+        self.assertNotIn("retry", filter_properties)
+
+    def test_retry_force_hosts(self):
+        # Retry info should not get populated when re-scheduling is off.
+        self.flags(scheduler_max_attempts=2)
+        sched = fakes.FakeFilterScheduler()
+
+        instance_properties = {'project_id': '12345', 'os_type': 'Linux'}
+        request_spec = dict(instance_properties=instance_properties)
+        filter_properties = dict(force_hosts=['force_host'])
+
+        self.mox.StubOutWithMock(db, 'compute_node_get_all')
+        db.compute_node_get_all(mox.IgnoreArg()).AndReturn([])
+        self.mox.ReplayAll()
+
+        sched._schedule(self.context, request_spec,
+                filter_properties=filter_properties)
+
+        # should not have retry info in the populated filter properties:
+        self.assertNotIn("retry", filter_properties)
+
+    def test_retry_force_nodes(self):
+        # Retry info should not get populated when re-scheduling is off.
+        self.flags(scheduler_max_attempts=2)
+        sched = fakes.FakeFilterScheduler()
+
+        instance_properties = {'project_id': '12345', 'os_type': 'Linux'}
+        request_spec = dict(instance_properties=instance_properties)
+        filter_properties = dict(force_nodes=['force_node'])
+
+        self.mox.StubOutWithMock(db, 'compute_node_get_all')
+        db.compute_node_get_all(mox.IgnoreArg()).AndReturn([])
+        self.mox.ReplayAll()
+
+        sched._schedule(self.context, request_spec,
+                filter_properties=filter_properties)
+
+        # should not have retry info in the populated filter properties:
+        self.assertNotIn("retry", filter_properties)
 
     def test_retry_attempt_one(self):
         # Test retry logic on initial scheduling attempt.
@@ -232,7 +289,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
         sched = fakes.FakeFilterScheduler()
 
         instance_properties = {'project_id': '12345', 'os_type': 'Linux'}
-        request_spec = dict(instance_properties=instance_properties)
+        request_spec = dict(instance_properties=instance_properties,
+                            instance_type={})
         filter_properties = {}
 
         self.mox.StubOutWithMock(db, 'compute_node_get_all')
@@ -251,7 +309,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
         sched = fakes.FakeFilterScheduler()
 
         instance_properties = {'project_id': '12345', 'os_type': 'Linux'}
-        request_spec = dict(instance_properties=instance_properties)
+        request_spec = dict(instance_properties=instance_properties,
+                            instance_type={})
 
         retry = dict(num_attempts=1)
         filter_properties = dict(retry=retry)
@@ -285,7 +344,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
                           self.context, request_spec, admin_password=None,
                           injected_files=None, requested_networks=None,
                           is_first_time=False,
-                          filter_properties=filter_properties)
+                          filter_properties=filter_properties,
+                          legacy_bdm_in_spec=False)
         uuids = request_spec.get('instance_uuids')
         self.assertEqual(uuids, instance_uuids)
 
@@ -316,71 +376,35 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
 
         self.assertEqual({'vcpus': 5}, host_state.limits)
 
-    def test_basic_schedule_run_instances_anti_affinity(self):
-        filter_properties = {'scheduler_hints':
-                             {'group': 'cats'}}
-        # Request spec 1
-        instance_opts1 = {'project_id': 1, 'os_type': 'Linux',
-                          'memory_mb': 512, 'root_gb': 512,
-                          'ephemeral_gb': 0, 'vcpus': 1,
-                          'system_metadata': {'system': 'metadata'}}
-        request_spec1 = {'instance_uuids': ['fake-uuid1-1', 'fake-uuid1-2'],
-                         'instance_properties': instance_opts1,
-                         'instance_type': {'memory_mb': 512, 'root_gb': 512,
-                                           'ephemeral_gb': 0, 'vcpus': 1}}
-        self.next_weight = 1.0
-
-        def _fake_weigh_objects(_self, functions, hosts, options):
-            self.next_weight += 2.0
-            host_state = hosts[0]
-            return [weights.WeighedHost(host_state, self.next_weight)]
-
+    def test_group_details_in_filter_properties(self):
         sched = fakes.FakeFilterScheduler()
 
-        fake_context = context.RequestContext('user', 'project',
-                is_admin=True)
+        instance = fake_instance.fake_instance_obj(self.context,
+                params={'host': 'hostA'})
 
-        self.stubs.Set(sched.host_manager, 'get_filtered_hosts',
-                fake_get_group_filtered_hosts)
-        self.stubs.Set(weights.HostWeightHandler,
-                'get_weighed_objects', _fake_weigh_objects)
-        fakes.mox_host_manager_db_calls(self.mox, fake_context)
+        group = instance_group_obj.InstanceGroup()
+        group.uuid = str(uuid.uuid4())
+        group.members = [instance.uuid]
+        group.policies = ['anti-affinity']
 
-        self.mox.StubOutWithMock(driver, 'instance_update_db')
-        self.mox.StubOutWithMock(compute_rpcapi.ComputeAPI, 'run_instance')
-        self.mox.StubOutWithMock(sched, 'group_hosts')
+        filter_properties = {
+            'scheduler_hints': {
+                'group': group.uuid,
+            },
+        }
 
-        instance1_1 = {'uuid': 'fake-uuid1-1'}
-        instance1_2 = {'uuid': 'fake-uuid1-2'}
-
-        sched.group_hosts(mox.IgnoreArg(), 'cats').AndReturn([])
-
-        def inc_launch_index1(*args, **kwargs):
-            request_spec1['instance_properties']['launch_index'] = (
-                request_spec1['instance_properties']['launch_index'] + 1)
-
-        expected_metadata = {'system_metadata':
-                             {'system': 'metadata', 'group': 'cats'}}
-        driver.instance_update_db(fake_context, instance1_1['uuid'],
-                extra_values=expected_metadata).WithSideEffects(
-                inc_launch_index1).AndReturn(instance1_1)
-        compute_rpcapi.ComputeAPI.run_instance(fake_context, host='host3',
-                instance=instance1_1, requested_networks=None,
-                injected_files=None, admin_password=None, is_first_time=None,
-                request_spec=request_spec1, filter_properties=mox.IgnoreArg(),
-                node='node3')
-
-        driver.instance_update_db(fake_context, instance1_2['uuid'],
-                extra_values=expected_metadata).WithSideEffects(
-                inc_launch_index1).AndReturn(instance1_2)
-        compute_rpcapi.ComputeAPI.run_instance(fake_context, host='host4',
-                instance=instance1_2, requested_networks=None,
-                injected_files=None, admin_password=None, is_first_time=None,
-                request_spec=request_spec1, filter_properties=mox.IgnoreArg(),
-                node='node4')
-        self.mox.ReplayAll()
-        sched.schedule_run_instance(fake_context, request_spec1,
-                None, None, None, None, filter_properties)
+        with contextlib.nested(
+            mock.patch.object(instance_group_obj.InstanceGroup, 'get_by_uuid',
+                               return_value=group),
+            mock.patch.object(instance_group_obj.InstanceGroup, 'get_hosts',
+                               return_value=['hostA']),
+        ) as (get_group, get_hosts):
+            update_group_hosts = sched._setup_instance_group(self.context,
+                    filter_properties)
+            self.assertTrue(update_group_hosts)
+            self.assertEqual(set(['hostA']), filter_properties['group_hosts'])
+            self.assertEqual(['anti-affinity'],
+                    filter_properties['group_policies'])
 
     def test_schedule_host_pool(self):
         """Make sure the scheduler_host_subset_size property works properly."""
@@ -401,7 +425,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
                                     'vcpus': 1,
                                     'os_type': 'Linux'}
 
-        request_spec = dict(instance_properties=instance_properties)
+        request_spec = dict(instance_properties=instance_properties,
+                            instance_type={})
         filter_properties = {}
         self.mox.ReplayAll()
         hosts = sched._schedule(self.context, request_spec,
@@ -430,7 +455,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
                                     'ephemeral_gb': 0,
                                     'vcpus': 1,
                                     'os_type': 'Linux'}
-        request_spec = dict(instance_properties=instance_properties)
+        request_spec = dict(instance_properties=instance_properties,
+                            instance_type={})
         filter_properties = {}
         self.mox.ReplayAll()
         hosts = sched._schedule(self.context, request_spec,
@@ -469,7 +495,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
                                 'vcpus': 1,
                                 'os_type': 'Linux'}
 
-        request_spec = dict(instance_properties=instance_properties)
+        request_spec = dict(instance_properties=instance_properties,
+                            instance_type={})
 
         self.stubs.Set(weights.HostWeightHandler,
                         'get_weighed_objects', _fake_weigh_objects)
@@ -480,60 +507,9 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
                 filter_properties=filter_properties)
 
         # one host should be chosen
-        self.assertEquals(1, len(hosts))
+        self.assertEqual(1, len(hosts))
 
-        self.assertEquals(50, hosts[0].weight)
-
-    def test_select_hosts_happy_day(self):
-        """select_hosts is basically a wrapper around the _select() method.
-
-        Similar to the _select tests, this just does a happy path test to
-        ensure there is nothing glaringly wrong.
-        """
-
-        self.next_weight = 1.0
-
-        selected_hosts = []
-
-        def _fake_weigh_objects(_self, functions, hosts, options):
-            self.next_weight += 2.0
-            host_state = hosts[0]
-            selected_hosts.append(host_state.host)
-            return [weights.WeighedHost(host_state, self.next_weight)]
-
-        sched = fakes.FakeFilterScheduler()
-        fake_context = context.RequestContext('user', 'project',
-            is_admin=True)
-
-        self.stubs.Set(sched.host_manager, 'get_filtered_hosts',
-            fake_get_filtered_hosts)
-        self.stubs.Set(weights.HostWeightHandler,
-            'get_weighed_objects', _fake_weigh_objects)
-        fakes.mox_host_manager_db_calls(self.mox, fake_context)
-
-        request_spec = {'num_instances': 10,
-                        'instance_type': {'memory_mb': 512, 'root_gb': 512,
-                                          'ephemeral_gb': 0,
-                                          'vcpus': 1},
-                        'instance_properties': {'project_id': 1,
-                                                'root_gb': 512,
-                                                'memory_mb': 512,
-                                                'ephemeral_gb': 0,
-                                                'vcpus': 1,
-                                                'os_type': 'Linux'}}
-        self.mox.ReplayAll()
-        hosts = sched.select_hosts(fake_context, request_spec, {})
-        self.assertEquals(len(hosts), 10)
-        self.assertEquals(hosts, selected_hosts)
-
-    def test_select_hosts_no_valid_host(self):
-
-        def _return_no_host(*args, **kwargs):
-            return []
-
-        self.stubs.Set(self.driver, '_schedule', _return_no_host)
-        self.assertRaises(exception.NoValidHost,
-                          self.driver.select_hosts, self.context, {}, {})
+        self.assertEqual(50, hosts[0].weight)
 
     def test_select_destinations(self):
         """select_destinations is basically a wrapper around _schedule().
@@ -577,8 +553,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
         self.mox.ReplayAll()
         dests = sched.select_destinations(fake_context, request_spec, {})
         (host, node) = (dests[0]['host'], dests[0]['nodename'])
-        self.assertEquals(host, selected_hosts[0])
-        self.assertEquals(node, selected_nodes[0])
+        self.assertEqual(host, selected_hosts[0])
+        self.assertEqual(node, selected_nodes[0])
 
     def test_select_destinations_no_valid_host(self):
 
@@ -614,3 +590,19 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
         sched._provision_resource(fake_context, weighted_host,
                                   request_spec, filter_properties,
                                   None, None, None, None)
+
+    def test_pci_request_in_filter_properties(self):
+        instance_type = {}
+        request_spec = {'instance_type': instance_type,
+                        'instance_properties': {'project_id': 1,
+                                                'os_type': 'Linux'}}
+        filter_properties = {}
+        requests = [{'count': 1, 'spec': [{'vendor_id': '8086'}]}]
+        self.mox.StubOutWithMock(pci_request, 'get_pci_requests_from_flavor')
+        pci_request.get_pci_requests_from_flavor(
+            instance_type).AndReturn(requests)
+        self.mox.ReplayAll()
+        self.driver.populate_filter_properties(
+            request_spec, filter_properties)
+        self.assertEqual(filter_properties.get('pci_requests'),
+                         requests)

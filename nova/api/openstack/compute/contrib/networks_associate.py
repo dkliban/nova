@@ -1,3 +1,15 @@
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
 from webob import exc
 
 from nova.api.openstack import extensions
@@ -25,7 +37,12 @@ class NetworkAssociateActionController(wsgi.Controller):
         try:
             self.network_api.associate(context, id, host=None)
         except exception.NetworkNotFound:
-            raise exc.HTTPNotFound(_("Network not found"))
+            msg = _("Network not found")
+            raise exc.HTTPNotFound(explanation=msg)
+        except NotImplementedError:
+            msg = _('Disassociate host is not implemented by the configured '
+                    'Network API')
+            raise exc.HTTPNotImplemented(explanation=msg)
         return exc.HTTPAccepted()
 
     @wsgi.action("disassociate_project")
@@ -36,7 +53,13 @@ class NetworkAssociateActionController(wsgi.Controller):
         try:
             self.network_api.associate(context, id, project=None)
         except exception.NetworkNotFound:
-            raise exc.HTTPNotFound(_("Network not found"))
+            msg = _("Network not found")
+            raise exc.HTTPNotFound(explanation=msg)
+        except NotImplementedError:
+            msg = _('Disassociate project is not implemented by the '
+                    'configured Network API')
+            raise exc.HTTPNotImplemented(explanation=msg)
+
         return exc.HTTPAccepted()
 
     @wsgi.action("associate_host")
@@ -48,7 +71,13 @@ class NetworkAssociateActionController(wsgi.Controller):
             self.network_api.associate(context, id,
                                        host=body['associate_host'])
         except exception.NetworkNotFound:
-            raise exc.HTTPNotFound(_("Network not found"))
+            msg = _("Network not found")
+            raise exc.HTTPNotFound(explanation=msg)
+        except NotImplementedError:
+            msg = _('Associate host is not implemented by the configured '
+                    'Network API')
+            raise exc.HTTPNotImplemented(explanation=msg)
+
         return exc.HTTPAccepted()
 
 

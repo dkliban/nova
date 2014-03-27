@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -27,27 +25,30 @@ import eventlet
 eventlet.monkey_patch(os=False)
 
 import copy
+import gettext
+import logging
 import os
 import shutil
 import sys
-import tempfile
 import uuid
 
 import fixtures
-import mox
 from oslo.config import cfg
-import stubout
+from oslo.messaging import conffixture as messaging_conffixture
 import testtools
 
 from nova import context
 from nova import db
 from nova.db import migration
+from nova.db.sqlalchemy import api as session
 from nova.network import manager as network_manager
 from nova.objects import base as objects_base
-from nova.openstack.common.db.sqlalchemy import session
-from nova.openstack.common import log as logging
+from nova.openstack.common.fixture import logging as log_fixture
+from nova.openstack.common.fixture import moxstubout
+from nova.openstack.common import log as oslo_logging
 from nova.openstack.common import timeutils
 from nova import paths
+from nova import rpc
 from nova import service
 from nova.tests import conf_fixture
 from nova.tests import policy_fixture
@@ -62,15 +63,17 @@ test_opts = [
 CONF = cfg.CONF
 CONF.register_opts(test_opts)
 CONF.import_opt('connection',
-                'nova.openstack.common.db.sqlalchemy.session',
+                'nova.openstack.common.db.options',
                 group='database')
-CONF.import_opt('sqlite_db', 'nova.openstack.common.db.sqlalchemy.session')
+CONF.import_opt('sqlite_db', 'nova.openstack.common.db.options',
+                group='database')
 CONF.import_opt('enabled', 'nova.api.openstack', group='osapi_v3')
 CONF.set_override('use_stderr', False)
 
-logging.setup('nova')
+oslo_logging.setup('nova')
 
 _DB_CACHE = None
+_TRUE_VALUES = ('True', 'true', '1', 'yes')
 
 
 class Database(fixtures.Fixture):
@@ -85,7 +88,7 @@ class Database(fixtures.Fixture):
         self.engine.dispose()
         conn = self.engine.connect()
         if sql_connection == "sqlite://":
-            if db_migrate.db_version() > db_migrate.INIT_VERSION:
+            if db_migrate.db_version() > db_migrate.db_initial_version():
                 return
         else:
             testdb = paths.state_path_rel(sqlite_db)
@@ -116,10 +119,13 @@ class SampleNetworks(fixtures.Fixture):
 
     """Create sample networks in the database."""
 
+    def __init__(self, host=None):
+        self.host = host
+
     def setUp(self):
         super(SampleNetworks, self).setUp()
         ctxt = context.get_admin_context()
-        network = network_manager.VlanManager()
+        network = network_manager.VlanManager(host=self.host)
         bridge_interface = CONF.flat_interface or CONF.vlan_interface
         network.create_networks(ctxt,
                                 label='test',
@@ -173,19 +179,15 @@ class ServiceFixture(fixtures.Fixture):
         self.addCleanup(self.service.kill)
 
 
-class MoxStubout(fixtures.Fixture):
-    """Deal with code around mox and stubout as a fixture."""
+class TranslationFixture(fixtures.Fixture):
+    """Use gettext NullTranslation objects in tests."""
 
     def setUp(self):
-        super(MoxStubout, self).setUp()
-        # emulate some of the mox stuff, we can't use the metaclass
-        # because it screws with our generators
-        self.mox = mox.Mox()
-        self.stubs = stubout.StubOutForTesting()
-        self.addCleanup(self.stubs.UnsetAll)
-        self.addCleanup(self.stubs.SmartUnsetAll)
-        self.addCleanup(self.mox.UnsetStubs)
-        self.addCleanup(self.mox.VerifyAll)
+        super(TranslationFixture, self).setUp()
+        nulltrans = gettext.NullTranslations()
+        gettext_fixture = fixtures.MonkeyPatch('gettext.translation',
+                                               lambda *x, **y: nulltrans)
+        self.gettext_patcher = self.useFixture(gettext_fixture)
 
 
 class TestingException(Exception):
@@ -200,6 +202,11 @@ class TestCase(testtools.TestCase):
     """
     USES_DB = True
 
+    # NOTE(rpodolyaka): this attribute can be overridden in subclasses in order
+    #                   to scale the global test timeout value set for each
+    #                   test case separately. Use 0 value to disable timeout.
+    TIMEOUT_SCALING_FACTOR = 1
+
     def setUp(self):
         """Run before each test method to initialize test environment."""
         super(TestCase, self).setUp()
@@ -209,29 +216,49 @@ class TestCase(testtools.TestCase):
         except ValueError:
             # If timeout value is invalid do not set a timeout.
             test_timeout = 0
+
+        if self.TIMEOUT_SCALING_FACTOR >= 0:
+            test_timeout *= self.TIMEOUT_SCALING_FACTOR
+        else:
+            raise ValueError('TIMEOUT_SCALING_FACTOR value must be >= 0')
+
         if test_timeout > 0:
             self.useFixture(fixtures.Timeout(test_timeout, gentle=True))
         self.useFixture(fixtures.NestedTempfile())
         self.useFixture(fixtures.TempHomeDir())
+        self.useFixture(TranslationFixture())
+        self.useFixture(log_fixture.get_logging_handle_error_fixture())
 
-        if (os.environ.get('OS_STDOUT_CAPTURE') == 'True' or
-                os.environ.get('OS_STDOUT_CAPTURE') == '1'):
+        if os.environ.get('OS_STDOUT_CAPTURE') in _TRUE_VALUES:
             stdout = self.useFixture(fixtures.StringStream('stdout')).stream
             self.useFixture(fixtures.MonkeyPatch('sys.stdout', stdout))
-        if (os.environ.get('OS_STDERR_CAPTURE') == 'True' or
-                os.environ.get('OS_STDERR_CAPTURE') == '1'):
+        if os.environ.get('OS_STDERR_CAPTURE') in _TRUE_VALUES:
             stderr = self.useFixture(fixtures.StringStream('stderr')).stream
             self.useFixture(fixtures.MonkeyPatch('sys.stderr', stderr))
 
-        self.log_fixture = self.useFixture(fixtures.FakeLogger())
+        rpc.add_extra_exmods('nova.test')
+        self.addCleanup(rpc.clear_extra_exmods)
+        self.addCleanup(rpc.cleanup)
+
+        fs = '%(levelname)s [%(name)s] %(message)s'
+        self.log_fixture = self.useFixture(fixtures.FakeLogger(
+            level=logging.DEBUG,
+            format=fs))
         self.useFixture(conf_fixture.ConfFixture(CONF))
+
+        self.messaging_conf = messaging_conffixture.ConfFixture(CONF)
+        self.messaging_conf.transport_driver = 'fake'
+        self.messaging_conf.response_timeout = 15
+        self.useFixture(self.messaging_conf)
+
+        rpc.init(CONF)
 
         if self.USES_DB:
             global _DB_CACHE
             if not _DB_CACHE:
                 _DB_CACHE = Database(session, migration,
                         sql_connection=CONF.database.connection,
-                        sqlite_db=CONF.sqlite_db,
+                        sqlite_db=CONF.database.sqlite_db,
                         sqlite_clean_db=CONF.sqlite_clean_db)
 
             self.useFixture(_DB_CACHE)
@@ -244,7 +271,7 @@ class TestCase(testtools.TestCase):
             objects_base.NovaObject._obj_classes)
         self.addCleanup(self._restore_obj_registry)
 
-        mox_fixture = self.useFixture(MoxStubout())
+        mox_fixture = self.useFixture(moxstubout.MoxStubout())
         self.mox = mox_fixture.mox
         self.stubs = mox_fixture.stubs
         self.addCleanup(self._clear_attrs)
@@ -253,8 +280,6 @@ class TestCase(testtools.TestCase):
         CONF.set_override('fatal_exception_format_errors', True)
         CONF.set_override('enabled', True, 'osapi_v3')
         CONF.set_override('force_dhcp_release', False)
-        # This will be cleaned up by the NestedTempfile fixture
-        CONF.set_override('lock_path', tempfile.mkdtemp())
 
     def _restore_obj_registry(self):
         objects_base.NovaObject._obj_classes = self._base_test_obj_backup
@@ -302,8 +327,7 @@ class TimeOverride(fixtures.Fixture):
 
 
 class NoDBTestCase(TestCase):
-    """
-    `NoDBTestCase` differs from TestCase in that DB access is not supported.
+    """`NoDBTestCase` differs from TestCase in that DB access is not supported.
     This makes tests run significantly faster. If possible, all new tests
     should derive from this class.
     """

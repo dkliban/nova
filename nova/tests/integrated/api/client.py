@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #    Copyright (c) 2011 Justin Santa Barbara
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -16,11 +14,13 @@
 
 import httplib
 import urllib
-import urlparse
+
+import six.moves.urllib.parse as urlparse
 
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
+from nova.tests.image import fake
 
 
 LOG = logging.getLogger(__name__)
@@ -299,3 +299,41 @@ class TestOpenStackClient(object):
     def delete_server_volume(self, server_id, attachment_id):
         return self.api_delete('/servers/%s/os-volume_attachments/%s' %
                             (server_id, attachment_id))
+
+
+class TestOpenStackClientV3(TestOpenStackClient):
+    """Simple OpenStack v3 API Client.
+
+    This is a really basic OpenStack API client that is under our control,
+    so we can make changes / insert hooks for testing.
+
+    Note that the V3 API does not have an image API and so it is
+    not possible to query the api for the image information.
+    So instead we just access the fake image service used by the unittests
+    directly.
+
+    """
+
+    def get_image(self, image_id):
+        return fake._fakeImageService.show(None, image_id)
+
+    def get_images(self, detail=True):
+        return fake._fakeImageService.detail(None)
+
+    def post_image(self, image):
+        raise NotImplementedError
+
+    def delete_image(self, image_id):
+        return fake._fakeImageService.delete(None, image_id)
+
+    def post_server(self, server):
+        response = self.api_post('/servers', server)
+        if 'servers_reservation' in response:
+            return response['servers_reservation']
+        else:
+            return response['server']
+
+
+class TestOpenStackClientV3Mixin(object):
+    def _get_test_client(self):
+        return TestOpenStackClientV3('fake', 'fake', self.auth_url)

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -17,7 +15,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from eventlet import tpool
 from oslo.config import cfg
 
 from nova.cloudpipe import pipelib
@@ -34,8 +31,7 @@ libvirt = None
 
 
 class NWFilterFirewall(base_firewall.FirewallDriver):
-    """
-    This class implements a network filtering mechanism by using
+    """This class implements a network filtering mechanism by using
     libvirt's nwfilter.
     all instances get a filter ("nova-base") applied. This filter
     provides some basic security such as protection against MAC
@@ -65,8 +61,7 @@ class NWFilterFirewall(base_firewall.FirewallDriver):
 
     @staticmethod
     def nova_no_nd_reflection_filter():
-        """
-        This filter protects false positives on IPv6 Duplicate Address
+        """This filter protects false positives on IPv6 Duplicate Address
         Detection(DAD).
         """
         return '''<filter name='nova-no-nd-reflection' chain='ipv6'>
@@ -189,8 +184,7 @@ class NWFilterFirewall(base_firewall.FirewallDriver):
         return xml
 
     def get_base_filter_list(self, instance, allow_dhcp):
-        """
-        Obtain a list of base filters to apply to an instance.
+        """Obtain a list of base filters to apply to an instance.
         The return value should be a list of strings, each
         specifying a filter name.  Subclasses can override this
         function to add additional filters as needed.  Additional
@@ -219,9 +213,8 @@ class NWFilterFirewall(base_firewall.FirewallDriver):
         filter_set = ['no-mac-spoofing',
                       'no-ip-spoofing',
                       'no-arp-spoofing']
-        if CONF.use_ipv6:
-            self._define_filter(self.nova_no_nd_reflection_filter)
-            filter_set.append('nova-no-nd-reflection')
+        self._define_filter(self.nova_no_nd_reflection_filter)
+        filter_set.append('nova-no-nd-reflection')
         self._define_filter(self._filter_container('nova-nodhcp', filter_set))
         filter_set.append('allow-dhcp-server')
         self._define_filter(self._filter_container('nova-base', filter_set))
@@ -240,14 +233,7 @@ class NWFilterFirewall(base_firewall.FirewallDriver):
     def _define_filter(self, xml):
         if callable(xml):
             xml = xml()
-        # execute in a native thread and block current greenthread until done
-        if not CONF.libvirt_nonblocking:
-            # NOTE(maoy): the original implementation is to have the API called
-            # in the thread pool no matter what.
-            tpool.execute(self._conn.nwfilterDefineXML, xml)
-        else:
-            # NOTE(maoy): self._conn is an eventlet.tpool.Proxy object
-            self._conn.nwfilterDefineXML(xml)
+        self._conn.nwfilterDefineXML(xml)
 
     def unfilter_instance(self, instance, network_info):
         """Clear out the nwfilter rules."""
@@ -267,10 +253,6 @@ class NWFilterFirewall(base_firewall.FirewallDriver):
                     raise
                 LOG.debug(_('The nwfilter(%s) is not found.'),
                           instance_filter_name, instance=instance)
-
-    def _define_filters(self, filter_name, filter_children):
-        self._define_filter(self._filter_container(filter_name,
-                                                   filter_children))
 
     @staticmethod
     def _instance_filter_name(instance, nic_id=None):

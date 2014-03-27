@@ -23,13 +23,13 @@ import random
 
 from oslo.config import cfg
 
-from nova.compute import flavors
 from nova.compute import rpcapi as compute_rpcapi
-from nova import db
 from nova import exception
+from nova.objects import instance_group as instance_group_obj
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
-from nova.openstack.common.notifier import api as notifier
+from nova.pci import pci_request
+from nova import rpc
 from nova.scheduler import driver
 from nova.scheduler import scheduler_options
 from nova.scheduler import utils as scheduler_utils
@@ -60,11 +60,12 @@ class FilterScheduler(driver.Scheduler):
         super(FilterScheduler, self).__init__(*args, **kwargs)
         self.options = scheduler_options.SchedulerOptions()
         self.compute_rpcapi = compute_rpcapi.ComputeAPI()
+        self.notifier = rpc.get_notifier('scheduler')
 
     def schedule_run_instance(self, context, request_spec,
                               admin_password, injected_files,
                               requested_networks, is_first_time,
-                              filter_properties):
+                              filter_properties, legacy_bdm_in_spec):
         """This method is called from nova.compute.api to provision
         an instance.  We first create a build plan (a list of WeightedHosts)
         and then provision.
@@ -72,8 +73,7 @@ class FilterScheduler(driver.Scheduler):
         Returns a list of the instances created.
         """
         payload = dict(request_spec=request_spec)
-        notifier.notify(context, notifier.publisher_id("scheduler"),
-                        'scheduler.run_instance.start', notifier.INFO, payload)
+        self.notifier.info(context, 'scheduler.run_instance.start', payload)
 
         instance_uuids = request_spec.get('instance_uuids')
         LOG.info(_("Attempting to build %(num_instances)d instance(s) "
@@ -113,7 +113,8 @@ class FilterScheduler(driver.Scheduler):
                                          requested_networks,
                                          injected_files, admin_password,
                                          is_first_time,
-                                         instance_uuid=instance_uuid)
+                                         instance_uuid=instance_uuid,
+                                         legacy_bdm_in_spec=legacy_bdm_in_spec)
             except Exception as ex:
                 # NOTE(vish): we don't reraise the exception here to make sure
                 #             that all instances in the request get set to
@@ -125,17 +126,7 @@ class FilterScheduler(driver.Scheduler):
             retry = filter_properties.get('retry', {})
             retry['hosts'] = []
 
-        notifier.notify(context, notifier.publisher_id("scheduler"),
-                        'scheduler.run_instance.end', notifier.INFO, payload)
-
-    def select_hosts(self, context, request_spec, filter_properties):
-        """Selects a filtered set of hosts."""
-        instance_uuids = request_spec.get('instance_uuids')
-        hosts = [host.obj.host for host in self._schedule(context,
-            request_spec, filter_properties, instance_uuids)]
-        if not hosts:
-            raise exception.NoValidHost(reason="")
-        return hosts
+        self.notifier.info(context, 'scheduler.run_instance.end', payload)
 
     def select_destinations(self, context, request_spec, filter_properties):
         """Selects a filtered set of hosts and nodes."""
@@ -154,30 +145,22 @@ class FilterScheduler(driver.Scheduler):
 
     def _provision_resource(self, context, weighed_host, request_spec,
             filter_properties, requested_networks, injected_files,
-            admin_password, is_first_time, instance_uuid=None):
+            admin_password, is_first_time, instance_uuid=None,
+            legacy_bdm_in_spec=True):
         """Create the requested resource in this Zone."""
         # NOTE(vish): add our current instance back into the request spec
         request_spec['instance_uuids'] = [instance_uuid]
         payload = dict(request_spec=request_spec,
                        weighted_host=weighed_host.to_dict(),
                        instance_id=instance_uuid)
-        notifier.notify(context, notifier.publisher_id("scheduler"),
-                        'scheduler.run_instance.scheduled', notifier.INFO,
-                        payload)
+        self.notifier.info(context,
+                           'scheduler.run_instance.scheduled', payload)
 
         # Update the metadata if necessary
         scheduler_hints = filter_properties.get('scheduler_hints') or {}
-        group = scheduler_hints.get('group', None)
-        values = None
-        if group:
-            values = request_spec['instance_properties']['system_metadata']
-            values.update({'group': group})
-            values = {'system_metadata': values}
-
         try:
             updated_instance = driver.instance_update_db(context,
-                    instance_uuid, extra_values=values)
-
+                                                         instance_uuid)
         except exception.InstanceNotFound:
             LOG.warning(_("Instance disappeared during scheduling"),
                         context=context, instance_uuid=instance_uuid)
@@ -194,7 +177,8 @@ class FilterScheduler(driver.Scheduler):
                     requested_networks=requested_networks,
                     injected_files=injected_files,
                     admin_password=admin_password, is_first_time=is_first_time,
-                    node=weighed_host.obj.nodename)
+                    node=weighed_host.obj.nodename,
+                    legacy_bdm_in_spec=legacy_bdm_in_spec)
 
     def _get_configuration_options(self):
         """Fetch options dictionary. Broken out for testing."""
@@ -209,6 +193,10 @@ class FilterScheduler(driver.Scheduler):
         os_type = request_spec['instance_properties']['os_type']
         filter_properties['project_id'] = project_id
         filter_properties['os_type'] = os_type
+        pci_requests = pci_request.get_pci_requests_from_flavor(
+            request_spec.get('instance_type') or {})
+        if pci_requests:
+            filter_properties['pci_requests'] = pci_requests
 
     def _max_attempts(self):
         max_attempts = CONF.scheduler_max_attempts
@@ -223,7 +211,7 @@ class FilterScheduler(driver.Scheduler):
         """
         exc = retry.pop('exc', None)  # string-ified exception from compute
         if not exc:
-            return  # no exception info from a prevous attempt, skip
+            return  # no exception info from a previous attempt, skip
 
         hosts = retry.get('hosts', None)
         if not hosts:
@@ -242,12 +230,14 @@ class FilterScheduler(driver.Scheduler):
         request. If maximum retries is exceeded, raise NoValidHost.
         """
         max_attempts = self._max_attempts()
-        retry = filter_properties.pop('retry', {})
+        force_hosts = filter_properties.get('force_hosts', [])
+        force_nodes = filter_properties.get('force_nodes', [])
 
-        if max_attempts == 1:
+        if max_attempts == 1 or force_hosts or force_nodes:
             # re-scheduling is disabled.
             return
 
+        retry = filter_properties.pop('retry', {})
         # retry is enabled, update attempt count:
         if retry:
             retry['num_attempts'] += 1
@@ -268,6 +258,24 @@ class FilterScheduler(driver.Scheduler):
                       'instance_uuid': instance_uuid})
             raise exception.NoValidHost(reason=msg)
 
+    @staticmethod
+    def _setup_instance_group(context, filter_properties):
+        update_group_hosts = False
+        scheduler_hints = filter_properties.get('scheduler_hints') or {}
+        group_uuid = scheduler_hints.get('group', None)
+        if group_uuid:
+            group = instance_group_obj.InstanceGroup.get_by_uuid(context,
+                    group_uuid)
+            policies = set(('anti-affinity', 'affinity'))
+            if any((policy in policies) for policy in group.policies):
+                update_group_hosts = True
+                filter_properties.setdefault('group_hosts', set())
+                user_hosts = filter_properties['group_hosts']
+                group_hosts = set(group.get_hosts(context))
+                filter_properties['group_hosts'] = user_hosts | group_hosts
+                filter_properties['group_policies'] = group.policies
+        return update_group_hosts
+
     def _schedule(self, context, request_spec, filter_properties,
                   instance_uuids=None):
         """Returns a list of hosts that meet the required specs,
@@ -277,17 +285,8 @@ class FilterScheduler(driver.Scheduler):
         instance_properties = request_spec['instance_properties']
         instance_type = request_spec.get("instance_type", None)
 
-        # Get the group
-        update_group_hosts = False
-        scheduler_hints = filter_properties.get('scheduler_hints') or {}
-        group = scheduler_hints.get('group', None)
-        if group:
-            group_hosts = self.group_hosts(elevated, group)
-            update_group_hosts = True
-            if 'group_hosts' not in filter_properties:
-                filter_properties.update({'group_hosts': []})
-            configured_hosts = filter_properties['group_hosts']
-            filter_properties['group_hosts'] = configured_hosts + group_hosts
+        update_group_hosts = self._setup_instance_group(context,
+                filter_properties)
 
         config_options = self._get_configuration_options()
 
@@ -315,7 +314,7 @@ class FilterScheduler(driver.Scheduler):
         # Note: remember, we are using an iterator here. So only
         # traverse this list once. This can bite you if the hosts
         # are being scanned in a filter or weighing function.
-        hosts = self.host_manager.get_all_host_states(elevated)
+        hosts = self._get_all_host_states(elevated)
 
         selected_hosts = []
         if instance_uuids:
@@ -351,45 +350,9 @@ class FilterScheduler(driver.Scheduler):
             # will change for the next instance.
             chosen_host.obj.consume_from_instance(instance_properties)
             if update_group_hosts is True:
-                filter_properties['group_hosts'].append(chosen_host.obj.host)
+                filter_properties['group_hosts'].add(chosen_host.obj.host)
         return selected_hosts
 
-    def _get_compute_info(self, context, dest):
-        """Get compute node's information
-
-        :param context: security context
-        :param dest: hostname (must be compute node)
-        :return: dict of compute node information
-
-        """
-        service_ref = db.service_get_by_compute_host(context, dest)
-        return service_ref['compute_node'][0]
-
-    def _assert_compute_node_has_enough_memory(self, context,
-                                              instance_ref, dest):
-        """Checks if destination host has enough memory for live migration.
-
-
-        :param context: security context
-        :param instance_ref: nova.db.sqlalchemy.models.Instance object
-        :param dest: destination host
-
-        """
-        compute = self._get_compute_info(context, dest)
-        node = compute.get('hypervisor_hostname')
-        host_state = self.host_manager.host_state_cls(dest, node)
-        host_state.update_from_compute_node(compute)
-
-        instance_type = flavors.extract_flavor(instance_ref)
-        filter_properties = {'instance_type': instance_type}
-
-        hosts = self.host_manager.get_filtered_hosts([host_state],
-                                                     filter_properties,
-                                                     'RamFilter')
-        if not hosts:
-            instance_uuid = instance_ref['uuid']
-            reason = (_("Unable to migrate %(instance_uuid)s to %(dest)s: "
-                        "Lack of memory")
-                      % {'instance_uuid': instance_uuid,
-                         'dest': dest})
-            raise exception.MigrationPreCheckError(reason=reason)
+    def _get_all_host_states(self, context):
+        """Template method, so a subclass can implement caching."""
+        return self.host_manager.get_all_host_states(context)

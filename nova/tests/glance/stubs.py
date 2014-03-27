@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011 Citrix Systems, Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -40,7 +38,7 @@ class StubGlanceClient(object):
             setattr(self.images, fn, getattr(self, fn))
 
     #TODO(bcwaldon): implement filters
-    def list(self, filters=None, marker=None, limit=30):
+    def list(self, filters=None, marker=None, limit=30, page_size=20):
         if marker is None:
             index = 0
         else:
@@ -50,7 +48,6 @@ class StubGlanceClient(object):
                     break
             else:
                 raise glanceclient.exc.BadRequest('Marker not found')
-
         return self._images[index:index + limit]
 
     def get(self, image_id):
@@ -102,6 +99,7 @@ class StubGlanceClient(object):
                 if image_data.deleted:
                     raise glanceclient.exc.HTTPForbidden()
                 image_data.deleted = True
+                image_data.deleted_at = NOW_GLANCE_FORMAT
                 return
         raise glanceclient.exc.NotFound(image_id)
 
@@ -111,7 +109,7 @@ class FakeImage(object):
         IMAGE_ATTRIBUTES = ['size', 'disk_format', 'owner',
                             'container_format', 'checksum', 'id',
                             'name', 'created_at', 'updated_at',
-                            'deleted', 'status',
+                            'deleted', 'deleted_at', 'status',
                             'min_disk', 'min_ram', 'is_public']
         raw = dict.fromkeys(IMAGE_ATTRIBUTES)
         raw.update(metadata)

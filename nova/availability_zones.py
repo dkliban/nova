@@ -28,10 +28,10 @@ MC = None
 availability_zone_opts = [
     cfg.StrOpt('internal_service_availability_zone',
                default='internal',
-               help='availability_zone to show internal services under'),
+               help='The availability_zone to show internal services under'),
     cfg.StrOpt('default_availability_zone',
                default='nova',
-               help='default compute node availability_zone'),
+               help='Default compute node availability_zone'),
     ]
 
 CONF = cfg.CONF
@@ -47,8 +47,10 @@ def _get_cache():
     return MC
 
 
-def _reset_cache():
-    """Reset the cache, mainly for testing purposes."""
+def reset_cache():
+    """Reset the cache, mainly for testing purposes and update
+    availability_zone for host aggregate
+    """
 
     global MC
 
@@ -56,7 +58,7 @@ def _reset_cache():
 
 
 def _make_cache_key(host):
-    return "azcache-%s" % host
+    return "azcache-%s" % host.encode('utf-8')
 
 
 def set_availability_zones(context, services):
@@ -72,10 +74,8 @@ def set_availability_zones(context, services):
             else:
                 az = CONF.default_availability_zone
                 # update the cache
-                cache = _get_cache()
-                cache_key = _make_cache_key(service['host'])
-                cache.delete(cache_key)
-                cache.set(cache_key, az, AZ_CACHE_SECONDS)
+                update_host_availability_zone_cache(context,
+                                                    service['host'], az)
         service['availability_zone'] = az
     return services
 
@@ -94,8 +94,17 @@ def get_host_availability_zone(context, host, conductor_api=None):
     return az
 
 
+def update_host_availability_zone_cache(context, host, availability_zone=None):
+    if not availability_zone:
+        availability_zone = get_host_availability_zone(context, host)
+    cache = _get_cache()
+    cache_key = _make_cache_key(host)
+    cache.delete(cache_key)
+    cache.set(cache_key, availability_zone, AZ_CACHE_SECONDS)
+
+
 def get_availability_zones(context, get_only_available=False):
-    """Return available and unavailable zones on demands.
+    """Return available and unavailable zones on demand.
 
        :param get_only_available: flag to determine whether to return
            available zones only, default False indicates return both

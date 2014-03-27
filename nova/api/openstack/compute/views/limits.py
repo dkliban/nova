@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010-2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -98,3 +96,10 @@ class ViewBuilder(object):
             "unit": rate_limit["unit"],
             "next-available": timeutils.isotime(at=next_avail),
         }
+
+
+class ViewBuilderV3(ViewBuilder):
+
+    def build(self, rate_limits):
+        rate_limits = self._build_rate_limits(rate_limits)
+        return {"limits": {"rate": rate_limits}}

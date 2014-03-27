@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -36,14 +34,13 @@ try:
     os_network_opts = [
         cfg.BoolOpt("enable_network_quota",
                     default=False,
-                    help="Enables or disables quotaing of tenant networks"),
+                    help=('Enables or disables quota checking for tenant '
+                          'networks')),
         cfg.StrOpt('use_neutron_default_nets',
                          default="False",
-                         deprecated_name='use_quantum_default_nets',
                          help=('Control for checking for default networks')),
         cfg.StrOpt('neutron_default_tenant_id',
                          default="default",
-                         deprecated_name='quantum_default_tenant_id',
                          help=('Default tenant id when creating neutron '
                                'networks'))
     ]
@@ -57,7 +54,7 @@ if CONF.enable_network_quota:
     opts = [
         cfg.IntOpt('quota_networks',
                    default=3,
-                   help='number of private networks allowed per project'),
+                   help='Number of private networks allowed per project'),
         ]
     CONF.register_opts(opts)
 
@@ -83,7 +80,7 @@ class NetworkController(object):
             try:
                 self._default_networks = self._get_default_networks()
             except Exception:
-                LOG.exception("Failed to get default networks")
+                LOG.exception(_("Failed to get default networks"))
 
     def _get_default_networks(self):
         project_id = CONF.neutron_default_tenant_id
@@ -110,7 +107,8 @@ class NetworkController(object):
         try:
             network = self.network_api.get(context, id)
         except exception.NetworkNotFound:
-            raise exc.HTTPNotFound(_("Network not found"))
+            msg = _("Network not found")
+            raise exc.HTTPNotFound(explanation=msg)
         return {'network': network_dict(network)}
 
     def delete(self, req, id):
@@ -131,8 +129,11 @@ class NetworkController(object):
             if CONF.enable_network_quota and reservation:
                 QUOTAS.commit(context, reservation)
             response = exc.HTTPAccepted()
+        except exception.PolicyNotAuthorized as e:
+            raise exc.HTTPForbidden(explanation=str(e))
         except exception.NetworkNotFound:
-            response = exc.HTTPNotFound(_("Network not found"))
+            msg = _("Network not found")
+            raise exc.HTTPNotFound(explanation=msg)
 
         return response
 
@@ -180,6 +181,8 @@ class NetworkController(object):
                                                label=label, **kwargs)
             if CONF.enable_network_quota:
                 QUOTAS.commit(context, reservation)
+        except exception.PolicyNotAuthorized as e:
+            raise exc.HTTPForbidden(explanation=str(e))
         except Exception:
             if CONF.enable_network_quota:
                 QUOTAS.rollback(context, reservation)

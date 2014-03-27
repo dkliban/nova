@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 Pedro Navarro Perez
 # Copyright 2013 Cloudbase Solutions Srl
 # All Rights Reserved.
@@ -24,11 +22,11 @@ import time
 from oslo.config import cfg
 
 from nova import exception
+from nova.openstack.common import excutils
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova.virt import driver
 from nova.virt.hyperv import utilsfactory
-from nova.virt.hyperv import vmutils
 
 LOG = logging.getLogger(__name__)
 
@@ -39,16 +37,24 @@ hyper_volumeops_opts = [
     cfg.IntOpt('volume_attach_retry_interval',
                default=5,
                help='Interval between volume attachment attempts, in seconds'),
+    cfg.IntOpt('mounted_disk_query_retry_count',
+               default=10,
+               help='The number of times to retry checking for a disk mounted '
+                    'via iSCSI.'),
+    cfg.IntOpt('mounted_disk_query_retry_interval',
+               default=5,
+               help='Interval between checks for a mounted iSCSI '
+                    'disk, in seconds.'),
 ]
 
 CONF = cfg.CONF
 CONF.register_opts(hyper_volumeops_opts, 'hyperv')
+CONF.import_opt('host', 'nova.netconf')
 CONF.import_opt('my_ip', 'nova.netconf')
 
 
 class VolumeOps(object):
-    """
-    Management class for Volume-related tasks
+    """Management class for Volume-related tasks
     """
 
     def __init__(self):
@@ -101,10 +107,10 @@ class VolumeOps(object):
             self._get_mounted_disk_from_lun(target_iqn, target_lun, True)
 
     def attach_volume(self, connection_info, instance_name, ebs_root=False):
-        """
-        Attach a volume to the SCSI controller or to the IDE controller if
+        """Attach a volume to the SCSI controller or to the IDE controller if
         ebs_root is True
         """
+        target_iqn = None
         LOG.debug(_("Attach_volume: %(connection_info)s to %(instance_name)s"),
                   {'connection_info': connection_info,
                    'instance_name': instance_name})
@@ -135,14 +141,15 @@ class VolumeOps(object):
                                                       ctrller_path,
                                                       slot,
                                                       mounted_disk_path)
-        except Exception as exn:
-            LOG.exception(_('Attach volume failed: %s'), exn)
-            self._volutils.logout_storage_target(target_iqn)
-            raise vmutils.HyperVException(_('Unable to attach volume '
-                                            'to instance %s') % instance_name)
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                LOG.error(_('Unable to attach volume to instance %s'),
+                          instance_name)
+                if target_iqn:
+                    self._volutils.logout_storage_target(target_iqn)
 
     def _get_free_controller_slot(self, scsi_controller_path):
-        #Slots starts from 0, so the lenght of the disks gives us the free slot
+        #Slots starts from 0, so the length of the disks gives us the free slot
         return self._vmutils.get_attached_disks_count(scsi_controller_path)
 
     def detach_volumes(self, block_device_info, instance_name):
@@ -155,7 +162,7 @@ class VolumeOps(object):
         self._volutils.logout_storage_target(target_iqn)
 
     def detach_volume(self, connection_info, instance_name):
-        """Dettach a volume to the SCSI controller."""
+        """Detach a volume to the SCSI controller."""
         LOG.debug(_("Detach_volume: %(connection_info)s "
                     "from %(instance_name)s"),
                   {'connection_info': connection_info,
@@ -183,13 +190,27 @@ class VolumeOps(object):
                          instance=instance)
         return {
             'ip': CONF.my_ip,
+            'host': CONF.host,
             'initiator': self._initiator,
         }
 
     def _get_mounted_disk_from_lun(self, target_iqn, target_lun,
                                    wait_for_device=False):
-        device_number = self._volutils.get_device_number_for_target(target_iqn,
-                                                                    target_lun)
+        # The WMI query in get_device_number_for_target can incorrectly
+        # return no data when the system is under load.  This issue can
+        # be avoided by adding a retry.
+        for i in xrange(CONF.hyperv.mounted_disk_query_retry_count):
+            device_number = self._volutils.get_device_number_for_target(
+                            target_iqn, target_lun)
+            if device_number is None:
+                attempt = i + 1
+                LOG.debug(_('Attempt %d to get device_number '
+                          'from get_device_number_for_target failed. '
+                          'Retrying...') % attempt)
+                time.sleep(CONF.hyperv.mounted_disk_query_retry_interval)
+            else:
+                break
+
         if device_number is None:
             raise exception.NotFound(_('Unable to find a mounted disk for '
                                        'target_iqn: %s') % target_iqn)

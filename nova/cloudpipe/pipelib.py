@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -43,10 +41,8 @@ from nova import utils
 cloudpipe_opts = [
     cfg.StrOpt('vpn_image_id',
                default='0',
-               help='image id used when starting up a cloudpipe vpn server'),
+               help='Image ID used when starting up a cloudpipe vpn server'),
     cfg.StrOpt('vpn_flavor',
-               # Deprecated in Havana
-               deprecated_name='vpn_instance_type',
                default='m1.tiny',
                help=_('Flavor for vpn instances')),
     cfg.StrOpt('boot_script_template',
@@ -129,12 +125,11 @@ class CloudPipe(object):
         LOG.debug(_("Launching VPN for %s") % (context.project_id))
         key_name = self.setup_key_pair(context)
         group_name = self.setup_security_group(context)
-        instance_type = flavors.get_flavor_by_name(
-                CONF.vpn_flavor)
+        flavor = flavors.get_flavor_by_name(CONF.vpn_flavor)
         instance_name = '%s%s' % (context.project_id, CONF.vpn_key_suffix)
         user_data = self.get_encoded_zip(context.project_id)
         return self.compute_api.create(context,
-                                       instance_type,
+                                       flavor,
                                        CONF.vpn_image_id,
                                        display_name=instance_name,
                                        user_data=user_data,
@@ -171,15 +166,14 @@ class CloudPipe(object):
         key_name = '%s%s' % (context.project_id, CONF.vpn_key_suffix)
         try:
             keypair_api = compute.api.KeypairAPI()
-            result = keypair_api.create_key_pair(context,
-                                                 context.user_id,
-                                                 key_name)
-            private_key = result['private_key']
+            result, private_key = keypair_api.create_key_pair(context,
+                                                              context.user_id,
+                                                              key_name)
             key_dir = os.path.join(CONF.keys_path, context.user_id)
             fileutils.ensure_tree(key_dir)
             key_path = os.path.join(key_dir, '%s.pem' % key_name)
             with open(key_path, 'w') as f:
                 f.write(private_key)
-        except (exception.Duplicate, os.error, IOError):
+        except (exception.KeyPairExists, os.error, IOError):
             pass
         return key_name

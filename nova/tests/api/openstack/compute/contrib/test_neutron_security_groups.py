@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 Nicira, Inc.
 # All Rights Reserved
 #
@@ -14,13 +12,12 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-#
-# @author: Aaron Rosen, Nicira Networks, Inc.
 
 import uuid
 
 from lxml import etree
-from neutronclient.common import exceptions as q_exc
+from neutronclient.common import exceptions as n_exc
+from neutronclient.neutron import v2_0 as neutronv20
 from oslo.config import cfg
 import webob
 
@@ -80,8 +77,17 @@ class TestNeutronSecurityGroups(
         neutron = get_client()
         return neutron.create_port(body)
 
+    def _create_security_group(self, **kwargs):
+        body = {'security_group': {}}
+        fields = ['name', 'description']
+        for field in fields:
+            if field in kwargs:
+                body['security_group'][field] = kwargs[field]
+        neutron = get_client()
+        return neutron.create_security_group(body)
+
     def test_create_security_group_with_no_description(self):
-        # Neutron's security group descirption field is optional.
+        # Neutron's security group description field is optional.
         pass
 
     def test_create_security_group_with_blank_name(self):
@@ -93,7 +99,7 @@ class TestNeutronSecurityGroups(
         pass
 
     def test_create_security_group_with_blank_description(self):
-        # Neutron's security group descirption field is optional.
+        # Neutron's security group description field is optional.
         pass
 
     def test_create_security_group_with_whitespace_description(self):
@@ -124,7 +130,7 @@ class TestNeutronSecurityGroups(
         self._create_sg_template().get('security_group')
         req = fakes.HTTPRequest.blank('/v2/fake/os-security-groups')
         list_dict = self.controller.index(req)
-        self.assertEquals(len(list_dict['security_groups']), 2)
+        self.assertEqual(len(list_dict['security_groups']), 2)
 
     def test_get_security_group_list_all_tenants(self):
         pass
@@ -143,7 +149,7 @@ class TestNeutronSecurityGroups(
                                       % test_security_groups.FAKE_UUID1)
         res_dict = self.server_controller.index(
             req, test_security_groups.FAKE_UUID1)['security_groups']
-        self.assertEquals(expected, res_dict)
+        self.assertEqual(expected, res_dict)
 
     def test_get_security_group_by_id(self):
         sg = self._create_sg_template().get('security_group')
@@ -151,7 +157,7 @@ class TestNeutronSecurityGroups(
                                       % sg['id'])
         res_dict = self.controller.show(req, sg['id'])
         expected = {'security_group': sg}
-        self.assertEquals(res_dict, expected)
+        self.assertEqual(res_dict, expected)
 
     def test_delete_security_group_by_id(self):
         sg = self._create_sg_template().get('security_group')
@@ -159,11 +165,18 @@ class TestNeutronSecurityGroups(
                                       sg['id'])
         self.controller.delete(req, sg['id'])
 
+    def test_delete_security_group_by_admin(self):
+        sg = self._create_sg_template().get('security_group')
+        req = fakes.HTTPRequest.blank('/v2/fake/os-security-groups/%s' %
+                                      sg['id'], use_admin_context=True)
+        self.controller.delete(req, sg['id'])
+
     def test_delete_security_group_in_use(self):
         sg = self._create_sg_template().get('security_group')
         self._create_network()
         fake_instance = {'project_id': 'fake_tenant',
                          'availability_zone': 'zone_one',
+                         'info_cache': {'network_info': []},
                          'security_groups': [],
                          'uuid': str(uuid.uuid4()),
                          'display_name': 'test_instance'}
@@ -202,6 +215,24 @@ class TestNeutronSecurityGroups(
 
         req = fakes.HTTPRequest.blank('/v2/fake/servers/1/action')
         self.manager._addSecurityGroup(req, '1', body)
+
+    def test_associate_duplicate_names(self):
+        sg1 = self._create_security_group(name='sg1',
+                                          description='sg1')['security_group']
+        self._create_security_group(name='sg1',
+                                    description='sg1')['security_group']
+        net = self._create_network()
+        self._create_port(
+            network_id=net['network']['id'], security_groups=[sg1['id']],
+            device_id=test_security_groups.FAKE_UUID1)
+
+        self.stubs.Set(nova.db, 'instance_get',
+                       test_security_groups.return_server)
+        body = dict(addSecurityGroup=dict(name="sg1"))
+
+        req = fakes.HTTPRequest.blank('/v2/fake/servers/1/action')
+        self.assertRaises(webob.exc.HTTPConflict,
+                          self.manager._addSecurityGroup, req, '1', body)
 
     def test_associate_port_security_enabled_true(self):
         sg = self._create_sg_template().get('security_group')
@@ -269,7 +300,21 @@ class TestNeutronSecurityGroups(
         req = fakes.HTTPRequest.blank('/v2/fake/servers/1/action')
         self.manager._removeSecurityGroup(req, '1', body)
 
+    def test_get_raises_no_unique_match_error(self):
+
+        def fake_find_resourceid_by_name_or_id(client, param, name):
+
+            raise n_exc.NeutronClientNoUniqueMatch()
+
+        self.stubs.Set(neutronv20, 'find_resourceid_by_name_or_id',
+                       fake_find_resourceid_by_name_or_id)
+        security_group_api = self.controller.security_group_api
+        self.assertRaises(exception.NoUniqueMatch, security_group_api.get,
+                          context.get_admin_context(), 'foobar')
+
     def test_get_instances_security_groups_bindings(self):
+        servers = [{'id': test_security_groups.FAKE_UUID1},
+                   {'id': test_security_groups.FAKE_UUID2}]
         sg1 = self._create_sg_template(name='test1').get('security_group')
         sg2 = self._create_sg_template(name='test2').get('security_group')
         # test name='' is replaced with id
@@ -290,8 +335,8 @@ class TestNeutronSecurityGroups(
         security_group_api = self.controller.security_group_api
         bindings = (
             security_group_api.get_instances_security_groups_bindings(
-                context.get_admin_context()))
-        self.assertEquals(bindings, expected)
+                context.get_admin_context(), servers))
+        self.assertEqual(bindings, expected)
 
     def test_get_instance_security_groups(self):
         sg1 = self._create_sg_template(name='test1').get('security_group')
@@ -310,7 +355,7 @@ class TestNeutronSecurityGroups(
         security_group_api = self.controller.security_group_api
         sgs = security_group_api.get_instance_security_groups(
             context.get_admin_context(), test_security_groups.FAKE_UUID1)
-        self.assertEquals(sgs, expected)
+        self.assertEqual(sgs, expected)
 
     def test_create_port_with_sg_and_port_security_enabled_true(self):
         sg1 = self._create_sg_template(name='test1').get('security_group')
@@ -322,7 +367,7 @@ class TestNeutronSecurityGroups(
         security_group_api = self.controller.security_group_api
         sgs = security_group_api.get_instance_security_groups(
             context.get_admin_context(), test_security_groups.FAKE_UUID1)
-        self.assertEquals(sgs, [{'name': 'test1'}])
+        self.assertEqual(sgs, [{'name': 'test1'}])
 
     def test_create_port_with_sg_and_port_security_enabled_false(self):
         sg1 = self._create_sg_template(name='test1').get('security_group')
@@ -480,7 +525,7 @@ class TestNeutronSecurityGroupsOutputTest(TestNeutronSecurityGroupsTestCase):
         self.assertEqual(res.status_int, 202)
         server = self._get_server(res.body)
         group = self._get_groups(server)[0]
-        self.assertEquals(group.get('name'), 'default')
+        self.assertEqual(group.get('name'), 'default')
 
     def test_show(self):
         def fake_get_instance_security_groups(inst, context, id):
@@ -610,7 +655,7 @@ class MockClient(object):
         s = body.get('security_group')
         if len(s.get('name')) > 255 or len(s.get('description')) > 255:
             msg = 'Security Group name great than 255'
-            raise q_exc.NeutronClientException(message=msg, status_code=401)
+            raise n_exc.NeutronClientException(message=msg, status_code=401)
         ret = {'name': s.get('name'), 'description': s.get('description'),
                'tenant_id': 'fake_tenant', 'security_group_rules': [],
                'id': str(uuid.uuid4())}
@@ -635,7 +680,7 @@ class MockClient(object):
             net = self._fake_networks[s.get('network_id')]
         except KeyError:
             msg = 'Network %s not found' % s.get('network_id')
-            raise q_exc.NeutronClientException(message=msg, status_code=404)
+            raise n_exc.NeutronClientException(message=msg, status_code=404)
         ret = {'name': s.get('name'), 'network_id': s.get('network_id'),
                'tenant_id': 'fake_tenant', 'cidr': s.get('cidr'),
                'id': str(uuid.uuid4()), 'gateway_ip': '10.0.0.1'}
@@ -694,7 +739,7 @@ class MockClient(object):
             sg = self._fake_security_groups[security_group]
         except KeyError:
             msg = 'Security Group %s not found' % security_group
-            raise q_exc.NeutronClientException(message=msg, status_code=404)
+            raise n_exc.NeutronClientException(message=msg, status_code=404)
         for security_group_rule in self._fake_security_group_rules.values():
             if security_group_rule['security_group_id'] == sg['id']:
                 sg['security_group_rules'].append(security_group_rule)
@@ -707,7 +752,7 @@ class MockClient(object):
                     self._fake_security_group_rules[security_group_rule]}
         except KeyError:
             msg = 'Security Group rule %s not found' % security_group_rule
-            raise q_exc.NeutronClientException(message=msg, status_code=404)
+            raise n_exc.NeutronClientException(message=msg, status_code=404)
 
     def show_network(self, network, **_params):
         try:
@@ -715,7 +760,7 @@ class MockClient(object):
                     self._fake_networks[network]}
         except KeyError:
             msg = 'Network %s not found' % network
-            raise q_exc.NeutronClientException(message=msg, status_code=404)
+            raise n_exc.NeutronClientException(message=msg, status_code=404)
 
     def show_port(self, port, **_params):
         try:
@@ -723,7 +768,7 @@ class MockClient(object):
                     self._fake_ports[port]}
         except KeyError:
             msg = 'Port %s not found' % port
-            raise q_exc.NeutronClientException(message=msg, status_code=404)
+            raise n_exc.NeutronClientException(message=msg, status_code=404)
 
     def show_subnet(self, subnet, **_params):
         try:
@@ -731,7 +776,7 @@ class MockClient(object):
                     self._fake_subnets[subnet]}
         except KeyError:
             msg = 'Port %s not found' % subnet
-            raise q_exc.NeutronClientException(message=msg, status_code=404)
+            raise n_exc.NeutronClientException(message=msg, status_code=404)
 
     def list_security_groups(self, **_params):
         ret = []
@@ -763,7 +808,7 @@ class MockClient(object):
         device_id = _params.get('device_id')
         for port in self._fake_ports.values():
             if device_id:
-                if device_id == port['device_id']:
+                if port['device_id'] in device_id:
                     ret.append(port)
             else:
                 ret.append(port)
@@ -784,7 +829,7 @@ class MockClient(object):
                 if sg_port == security_group:
                     msg = ('Unable to delete Security group %s in use'
                            % security_group)
-                    raise q_exc.NeutronClientException(message=msg,
+                    raise n_exc.NeutronClientException(message=msg,
                                                        status_code=409)
         del self._fake_security_groups[security_group]
 
@@ -824,4 +869,4 @@ class MockClient(object):
                 msg = ('Unable to complete operation on network %s. There is '
                        'one or more ports still in use on the network'
                        % network)
-            raise q_exc.NeutronClientException(message=msg, status_code=409)
+            raise n_exc.NeutronClientException(message=msg, status_code=409)

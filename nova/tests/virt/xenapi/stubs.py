@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2010 Citrix Systems, Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -21,7 +19,7 @@ import random
 from nova.openstack.common import jsonutils
 from nova import test
 import nova.tests.image.fake
-from nova.virt.xenapi import driver as xenapi_conn
+from nova.virt.xenapi.client import session
 from nova.virt.xenapi import fake
 from nova.virt.xenapi import vm_utils
 from nova.virt.xenapi import vmops
@@ -55,14 +53,14 @@ def stubout_instance_snapshot(stubs):
 def stubout_session(stubs, cls, product_version=(5, 6, 2),
                     product_brand='XenServer', **opt_args):
     """Stubs out methods from XenAPISession."""
-    stubs.Set(xenapi_conn.XenAPISession, '_create_session',
+    stubs.Set(session.XenAPISession, '_create_session',
               lambda s, url: cls(url, **opt_args))
-    stubs.Set(xenapi_conn.XenAPISession, '_get_product_version_and_brand',
+    stubs.Set(session.XenAPISession, '_get_product_version_and_brand',
               lambda s: (product_version, product_brand))
 
 
 def stubout_get_this_vm_uuid(stubs):
-    def f():
+    def f(session):
         vms = [rec['uuid'] for ref, rec
                in fake.get_all_records('VM').iteritems()
                if rec['is_control_domain']]
@@ -239,7 +237,10 @@ class FakeSessionForFirewallTests(FakeSessionForVMTests):
                     if '*filter' in lines:
                         output = '\n'.join(lines)
                 ret_str = fake.as_json(out=output, err='')
-        return ret_str
+            return ret_str
+        else:
+            return (super(FakeSessionForVMTests, self).
+                    host_call_plugin(_1, _2, plugin, method, args))
 
 
 def stub_out_vm_methods(stubs):
@@ -293,13 +294,17 @@ class FakeSessionForVolumeFailedTests(FakeSessionForVolumeTests):
 def stub_out_migration_methods(stubs):
     fakesr = fake.create_sr()
 
-    def fake_move_disks(self, instance, disk_info):
+    def fake_import_all_migrated_disks(session, instance):
         vdi_ref = fake.create_vdi(instance['name'], fakesr)
         vdi_rec = fake.get_record('VDI', vdi_ref)
         vdi_rec['other_config']['nova_disk_type'] = 'root'
-        return {'uuid': vdi_rec['uuid'], 'ref': vdi_ref}
+        return {"root": {'uuid': vdi_rec['uuid'], 'ref': vdi_ref},
+                "ephemerals": {}}
 
-    def fake_get_vdi(session, vm_ref):
+    def fake_wait_for_instance_to_start(self, *args):
+        pass
+
+    def fake_get_vdi(session, vm_ref, userdevice='0'):
         vdi_ref_parent = fake.create_vdi('derp-parent', fakesr)
         vdi_rec_parent = fake.get_record('VDI', vdi_ref_parent)
         vdi_ref = fake.create_vdi('derp', fakesr,
@@ -320,7 +325,10 @@ def stub_out_migration_methods(stubs):
         pass
 
     stubs.Set(vmops.VMOps, '_destroy', fake_destroy)
-    stubs.Set(vm_utils, 'move_disks', fake_move_disks)
+    stubs.Set(vmops.VMOps, '_wait_for_instance_to_start',
+              fake_wait_for_instance_to_start)
+    stubs.Set(vm_utils, 'import_all_migrated_disks',
+              fake_import_all_migrated_disks)
     stubs.Set(vm_utils, 'scan_default_sr', fake_sr)
     stubs.Set(vm_utils, 'get_vdi_for_vm_safely', fake_get_vdi)
     stubs.Set(vm_utils, 'get_sr_path', fake_get_sr_path)
@@ -340,10 +348,17 @@ class FakeSessionForFailedMigrateTests(FakeSessionForVMTests):
         raise fake.Failure("XenAPI VM.migrate_send failed")
 
 
+# FIXME(sirp): XenAPITestBase is deprecated, all tests should be converted
+# over to use XenAPITestBaseNoDB
 class XenAPITestBase(test.TestCase):
     def setUp(self):
         super(XenAPITestBase, self).setUp()
-
         self.useFixture(test.ReplaceModule('XenAPI', fake))
+        fake.reset()
 
+
+class XenAPITestBaseNoDB(test.NoDBTestCase):
+    def setUp(self):
+        super(XenAPITestBaseNoDB, self).setUp()
+        self.useFixture(test.ReplaceModule('XenAPI', fake))
         fake.reset()

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -26,8 +24,6 @@ IMPL = utils.LazyPluggable(
         config_group='baremetal',
         sqlalchemy='nova.virt.baremetal.db.sqlalchemy.migration')
 
-INIT_VERSION = 0
-
 
 def db_sync(version=None):
     """Migrate the database to `version` or the most recent version."""
@@ -37,3 +33,8 @@ def db_sync(version=None):
 def db_version():
     """Display the current database version."""
     return IMPL.db_version()
+
+
+def db_initial_version():
+    """The starting version for the database."""
+    return IMPL.db_initial_version()

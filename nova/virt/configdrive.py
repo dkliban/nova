@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 Michael Still and Canonical Inc
 # All Rights Reserved.
 #
@@ -27,6 +25,7 @@ from nova import exception
 from nova.openstack.common import fileutils
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
+from nova.openstack.common import units
 from nova import utils
 from nova import version
 
@@ -55,7 +54,7 @@ CONF = cfg.CONF
 CONF.register_opts(configdrive_opts)
 
 # Config drives are 64mb, if we can't size to the exact size of the data
-CONFIGDRIVESIZE_BYTES = 64 * 1024 * 1024
+CONFIGDRIVESIZE_BYTES = 64 * units.Mi
 
 
 class ConfigDriveBuilder(object):
@@ -88,7 +87,7 @@ class ConfigDriveBuilder(object):
         filepath = os.path.join(self.tempdir, path)
         dirname = os.path.dirname(filepath)
         fileutils.ensure_tree(dirname)
-        with open(filepath, 'w') as f:
+        with open(filepath, 'wb') as f:
             f.write(data)
 
     def add_instance_metadata(self, instance_md):
@@ -122,7 +121,7 @@ class ConfigDriveBuilder(object):
     def _make_vfat(self, path):
         # NOTE(mikal): This is a little horrible, but I couldn't find an
         # equivalent to genisoimage for vfat filesystems.
-        with open(path, 'w') as f:
+        with open(path, 'wb') as f:
             f.truncate(CONFIGDRIVESIZE_BYTES)
 
         utils.mkfs('vfat', path, label='config-2')

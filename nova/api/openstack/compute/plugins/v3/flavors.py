@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -17,57 +15,14 @@
 
 import webob
 
-from nova.api.openstack import common
 from nova.api.openstack.compute.views import flavors as flavors_view
 from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
-from nova.api.openstack import xmlutil
 from nova.compute import flavors
 from nova import exception
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import strutils
 from nova import utils
-
-
-def make_flavor(elem, detailed=False):
-    elem.set('name')
-    elem.set('id')
-    if detailed:
-        elem.set('ram')
-        elem.set('disk')
-        elem.set('vcpus', xmlutil.EmptyStringSelector('vcpus'))
-        # NOTE(vish): this was originally added without a namespace
-        elem.set('swap', xmlutil.EmptyStringSelector('swap'))
-        elem.set('ephemeral', xmlutil.EmptyStringSelector('ephemeral'))
-        elem.set('disabled')
-
-    xmlutil.make_links(elem, 'links')
-
-
-flavor_nsmap = {None: xmlutil.XMLNS_V11, 'atom': xmlutil.XMLNS_ATOM}
-
-
-class FlavorTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('flavor', selector='flavor')
-        make_flavor(root, detailed=True)
-        return xmlutil.MasterTemplate(root, 1, nsmap=flavor_nsmap)
-
-
-class MinimalFlavorsTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('flavors')
-        elem = xmlutil.SubTemplateElement(root, 'flavor', selector='flavors')
-        make_flavor(elem)
-        return xmlutil.MasterTemplate(root, 1, nsmap=flavor_nsmap)
-
-
-class FlavorsTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('flavors')
-        elem = xmlutil.SubTemplateElement(root, 'flavor', selector='flavors')
-        make_flavor(elem, detailed=True)
-        return xmlutil.MasterTemplate(root, 1, nsmap=flavor_nsmap)
 
 
 class FlavorsController(wsgi.Controller):
@@ -76,14 +31,12 @@ class FlavorsController(wsgi.Controller):
     _view_builder_class = flavors_view.V3ViewBuilder
 
     @extensions.expected_errors(400)
-    @wsgi.serializers(xml=MinimalFlavorsTemplate)
     def index(self, req):
         """Return all flavors in brief."""
         limited_flavors = self._get_flavors(req)
         return self._view_builder.index(req, limited_flavors)
 
     @extensions.expected_errors(400)
-    @wsgi.serializers(xml=FlavorsTemplate)
     def detail(self, req):
         """Return all flavors in detail."""
         limited_flavors = self._get_flavors(req)
@@ -91,11 +44,11 @@ class FlavorsController(wsgi.Controller):
         return self._view_builder.detail(req, limited_flavors)
 
     @extensions.expected_errors(404)
-    @wsgi.serializers(xml=FlavorTemplate)
     def show(self, req, id):
         """Return data about the given flavor id."""
+        context = req.environ['nova.context']
         try:
-            flavor = flavors.get_flavor_by_flavor_id(id)
+            flavor = flavors.get_flavor_by_flavor_id(id, ctxt=context)
             req.cache_db_flavor(flavor)
         except exception.FlavorNotFound as e:
             raise webob.exc.HTTPNotFound(explanation=e.format_message())
@@ -120,6 +73,10 @@ class FlavorsController(wsgi.Controller):
     def _get_flavors(self, req):
         """Helper function that returns a list of flavor dicts."""
         filters = {}
+        sort_key = req.params.get('sort_key') or 'flavorid'
+        sort_dir = req.params.get('sort_dir') or 'asc'
+        limit = req.params.get('limit') or None
+        marker = req.params.get('marker') or None
 
         context = req.environ['nova.context']
         if context.is_admin:
@@ -145,11 +102,14 @@ class FlavorsController(wsgi.Controller):
                        req.params['min_disk'])
                 raise webob.exc.HTTPBadRequest(explanation=msg)
 
-        limited_flavors = flavors.get_all_flavors(context, filters=filters)
-        flavors_list = limited_flavors.values()
-        sorted_flavors = sorted(flavors_list,
-                                key=lambda item: item['flavorid'])
-        limited_flavors = common.limited_by_marker(sorted_flavors, req)
+        try:
+            limited_flavors = flavors.get_all_flavors_sorted_list(context,
+                filters=filters, sort_key=sort_key, sort_dir=sort_dir,
+                limit=limit, marker=marker)
+        except exception.MarkerNotFound:
+            msg = _('marker [%s] not found') % marker
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
         return limited_flavors
 
 
@@ -157,7 +117,6 @@ class Flavors(extensions.V3APIExtensionBase):
     """Flavors Extension."""
     name = "flavors"
     alias = "flavors"
-    namespace = "http://docs.openstack.org/compute/core/flavors/v3"
     version = 1
 
     def get_resources(self):

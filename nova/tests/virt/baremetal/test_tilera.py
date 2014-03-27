@@ -1,4 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
 # coding=utf-8
 
 # Copyright (c) 2011-2013 University of Southern California / ISI
@@ -35,6 +34,7 @@ from nova.virt.baremetal import utils as bm_utils
 from nova.virt.disk import api as disk_api
 from nova.virt import fake as fake_virt
 
+
 CONF = cfg.CONF
 
 COMMON_FLAGS = dict(
@@ -44,7 +44,7 @@ COMMON_FLAGS = dict(
 
 BAREMETAL_FLAGS = dict(
     driver='nova.virt.baremetal.tilera.Tilera',
-    instance_type_extra_specs=['cpu_arch:test', 'test_spec:test_value'],
+    flavor_extra_specs=['cpu_arch:test', 'test_spec:test_value'],
     power_manager='nova.virt.baremetal.fake.FakePowerManager',
     vif_driver='nova.virt.baremetal.fake.FakeVifDriver',
     volume_driver='nova.virt.baremetal.fake.FakeVolumeDriver',
@@ -65,8 +65,7 @@ class BareMetalTileraTestCase(bm_db_base.BMDBTestCase):
         self.context = utils.get_test_admin_context()
         self.test_block_device_info = None,
         self.instance = utils.get_test_instance()
-        self.test_network_info = utils.get_test_network_info(
-                                        legacy_model=False),
+        self.test_network_info = utils.get_test_network_info()
         self.node_info = bm_db_utils.new_bm_node(
                 service_host='test_host',
                 cpus=4,
@@ -105,12 +104,12 @@ class BareMetalTileraTestCase(bm_db_base.BMDBTestCase):
 class TileraClassMethodsTestCase(BareMetalTileraTestCase):
 
     def test_build_network_config(self):
-        net = utils.get_test_network_info(1, legacy_model=False)
+        net = utils.get_test_network_info(1)
         config = tilera.build_network_config(net)
         self.assertIn('eth0', config)
         self.assertNotIn('eth1', config)
 
-        net = utils.get_test_network_info(2, legacy_model=False)
+        net = utils.get_test_network_info(2)
         config = tilera.build_network_config(net)
         self.assertIn('eth0', config)
         self.assertIn('eth1', config)
@@ -121,7 +120,7 @@ class TileraClassMethodsTestCase(BareMetalTileraTestCase):
                                     'net-dhcp.ubuntu.template',
                 group='baremetal',
             )
-        net = utils.get_test_network_info(legacy_model=False)
+        net = utils.get_test_network_info()
         net[0]['network']['subnets'][0]['ips'][0]['address'] = '1.2.3.4'
         config = tilera.build_network_config(net)
         self.assertIn('iface eth0 inet dhcp', config)
@@ -133,7 +132,7 @@ class TileraClassMethodsTestCase(BareMetalTileraTestCase):
                                     'net-static.ubuntu.template',
                 group='baremetal',
             )
-        net = utils.get_test_network_info(legacy_model=False)
+        net = utils.get_test_network_info()
         net[0]['network']['subnets'][0]['ips'][0]['address'] = '1.2.3.4'
         config = tilera.build_network_config(net)
         self.assertIn('iface eth0 inet static', config)
@@ -167,9 +166,9 @@ class TileraClassMethodsTestCase(BareMetalTileraTestCase):
 
     def test_swap_not_zero(self):
         # override swap to 0
-        instance_type = utils.get_test_instance_type(self.context)
-        instance_type['swap'] = 0
-        self.instance = utils.get_test_instance(self.context, instance_type)
+        flavor = utils.get_test_flavor(self.context)
+        flavor['swap'] = 0
+        self.instance = utils.get_test_instance(self.context, flavor)
 
         sizes = tilera.get_partition_sizes(self.instance)
         self.assertEqual(sizes[0], 40960)
@@ -217,9 +216,13 @@ class TileraPrivateMethodsTestCase(BareMetalTileraTestCase):
 
     def test_cache_image(self):
         self.mox.StubOutWithMock(os, 'makedirs')
+        self.mox.StubOutWithMock(os, 'unlink')
         self.mox.StubOutWithMock(os.path, 'exists')
-        os.makedirs(tilera.get_image_dir_path(self.instance)).\
-                AndReturn(True)
+        os.makedirs(tilera.get_image_dir_path(self.instance)).AndReturn(True)
+        disk_path = os.path.join(
+            tilera.get_image_dir_path(self.instance), 'disk')
+        os.path.exists(disk_path).AndReturn(True)
+        os.unlink(disk_path).AndReturn(None)
         os.path.exists(tilera.get_image_file_path(self.instance)).\
                 AndReturn(True)
         self.mox.ReplayAll()
@@ -236,7 +239,7 @@ class TileraPrivateMethodsTestCase(BareMetalTileraTestCase):
         self.instance['hostname'] = 'fake hostname'
         files.append(('/etc/hostname', 'fake hostname'))
         self.instance['key_data'] = 'fake ssh key'
-        net_info = utils.get_test_network_info(1, legacy_model=False)
+        net_info = utils.get_test_network_info(1)
         net = tilera.build_network_config(net_info)
         admin_password = 'fake password'
 
@@ -334,17 +337,17 @@ class TileraPublicMethodsTestCase(BareMetalTileraTestCase):
         # activate and deactivate the bootloader
         # and check the deployment task_state in the database
         row = db.bm_node_get(self.context, 1)
-        self.assertTrue(row['deploy_key'] is None)
+        self.assertIsNone(row['deploy_key'])
 
         self.driver.activate_bootloader(self.context, self.node, self.instance,
                                         network_info=self.test_network_info)
         row = db.bm_node_get(self.context, 1)
-        self.assertTrue(row['deploy_key'] is not None)
+        self.assertIsNotNone(row['deploy_key'])
 
         self.driver.deactivate_bootloader(self.context, self.node,
                                             self.instance)
         row = db.bm_node_get(self.context, 1)
-        self.assertTrue(row['deploy_key'] is None)
+        self.assertIsNone(row['deploy_key'])
 
         self.mox.VerifyAll()
 

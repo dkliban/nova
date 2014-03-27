@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -22,6 +20,9 @@ from oslo.config import cfg
 from nova.compute import utils as compute_utils
 from nova import context
 from nova.network import linux_net
+from nova.objects import instance as instance_obj
+from nova.objects import security_group as security_group_obj
+from nova.objects import security_group_rule as security_group_rule_obj
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
@@ -257,10 +258,6 @@ class IptablesFirewallDriver(FirewallDriver):
         if CONF.use_ipv6:
             self.iptables.ipv6['filter'].remove_chain(chain_name)
 
-    @staticmethod
-    def _security_group_chain_name(security_group_id):
-        return 'nova-sg-%s' % (security_group_id,)
-
     def _instance_chain_name(self, instance):
         return 'inst-%s' % (instance['id'],)
 
@@ -336,6 +333,11 @@ class IptablesFirewallDriver(FirewallDriver):
 
     def instance_rules(self, instance, network_info):
         ctxt = context.get_admin_context()
+        if isinstance(instance, dict):
+            # NOTE(danms): allow old-world instance objects from
+            # unconverted callers; all we need is instance.uuid below
+            instance = instance_obj.Instance._from_db_object(
+                ctxt, instance_obj.Instance(), instance, [])
 
         ipv4_rules = []
         ipv6_rules = []
@@ -356,13 +358,13 @@ class IptablesFirewallDriver(FirewallDriver):
             # Allow RA responses
             self._do_ra_rules(ipv6_rules, network_info)
 
-        security_groups = self._virtapi.security_group_get_by_instance(
+        security_groups = security_group_obj.SecurityGroupList.get_by_instance(
             ctxt, instance)
 
         # then, security group chains and rules
         for security_group in security_groups:
-            rules = self._virtapi.security_group_rule_get_by_security_group(
-                ctxt, security_group)
+            rules_cls = security_group_rule_obj.SecurityGroupRuleList
+            rules = rules_cls.get_by_security_group(ctxt, security_group)
 
             for rule in rules:
                 LOG.debug(_('Adding security group rule: %r'), rule,
@@ -396,11 +398,17 @@ class IptablesFirewallDriver(FirewallDriver):
                     args += self._build_icmp_rule(rule, version)
                 if rule['cidr']:
                     LOG.debug('Using cidr %r', rule['cidr'], instance=instance)
-                    args += ['-s', rule['cidr']]
+                    args += ['-s', str(rule['cidr'])]
                     fw_rules += [' '.join(args)]
                 else:
                     if rule['grantee_group']:
-                        for instance in rule['grantee_group']['instances']:
+                        insts = (
+                            instance_obj.InstanceList.get_by_security_group(
+                                ctxt, rule['grantee_group']))
+                        for instance in insts:
+                            if instance['info_cache']['deleted']:
+                                LOG.debug('ignoring deleted cache')
+                                continue
                             nw_info = compute_utils.get_nw_info_for_instance(
                                     instance)
 

@@ -38,11 +38,12 @@ def compute_api_remove_fixed_ip(self, context, instance, address):
     last_remove_fixed_ip = (instance['uuid'], address)
 
 
-def compute_api_get(self, context, instance_id):
+def compute_api_get(self, context, instance_id, expected_attrs=None,
+                    want_objects=False):
     return {'id': 1, 'uuid': instance_id}
 
 
-class FixedIpTest(test.TestCase):
+class FixedIpTest(test.NoDBTestCase):
     def setUp(self):
         super(FixedIpTest, self).setUp()
         fakes.stub_out_networking(self.stubs)
@@ -67,6 +68,24 @@ class FixedIpTest(test.TestCase):
         resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 202)
         self.assertEqual(last_add_fixed_ip, (UUID, 'test_net'))
+
+    def test_add_fixed_ip_empty_network_id(self):
+        body = {'add_fixed_ip': {'network_id': ''}}
+        req = webob.Request.blank('/v3/servers/%s/action' % UUID)
+        req.method = 'POST'
+        req.body = jsonutils.dumps(body)
+        req.headers['content-type'] = 'application/json'
+        resp = req.get_response(self.app)
+        self.assertEqual(400, resp.status_int)
+
+    def test_add_fixed_ip_network_id_bigger_than_36(self):
+        body = {'add_fixed_ip': {'network_id': 'a' * 37}}
+        req = webob.Request.blank('/v3/servers/%s/action' % UUID)
+        req.method = 'POST'
+        req.body = jsonutils.dumps(body)
+        req.headers['content-type'] = 'application/json'
+        resp = req.get_response(self.app)
+        self.assertEqual(400, resp.status_int)
 
     def test_add_fixed_ip_no_network(self):
         global last_add_fixed_ip
@@ -95,6 +114,15 @@ class FixedIpTest(test.TestCase):
         resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 202)
         self.assertEqual(last_remove_fixed_ip, (UUID, '10.10.10.1'))
+
+    def test_remove_fixed_ip_invalid_address(self):
+        body = {'remove_fixed_ip': {'address': ''}}
+        req = webob.Request.blank('/v3/servers/%s/action' % UUID)
+        req.method = 'POST'
+        req.body = jsonutils.dumps(body)
+        req.headers['content-type'] = 'application/json'
+        resp = req.get_response(self.app)
+        self.assertEqual(400, resp.status_int)
 
     def test_remove_fixed_ip_no_address(self):
         global last_remove_fixed_ip

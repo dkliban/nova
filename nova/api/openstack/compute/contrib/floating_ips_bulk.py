@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 IBM Corp.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -52,13 +50,16 @@ class FloatingIPBulkController(object):
     def _get_floating_ip_info(self, context, host=None):
         floating_ip_info = {"floating_ip_info": []}
 
-        try:
-            if host is None:
+        if host is None:
+            try:
                 floating_ips = db.floating_ip_get_all(context)
-            else:
+            except exception.NoFloatingIpsDefined:
+                return floating_ip_info
+        else:
+            try:
                 floating_ips = db.floating_ip_get_all_by_host(context, host)
-        except exception.NoFloatingIpsDefined:
-            return floating_ip_info
+            except exception.FloatingIpNotFoundForHost as e:
+                raise webob.exc.HTTPNotFound(explanation=e.format_message())
 
         for floating_ip in floating_ips:
             instance_uuid = None
@@ -116,7 +117,8 @@ class FloatingIPBulkController(object):
         authorize(context)
 
         if id != "delete":
-            raise webob.exc.HTTPNotFound("Unknown action")
+            msg = _("Unknown action")
+            raise webob.exc.HTTPNotFound(explanation=msg)
 
         try:
             ip_range = body['ip_range']
@@ -133,8 +135,7 @@ class FloatingIPBulkController(object):
         return {"floating_ips_bulk_delete": ip_range}
 
     def _address_to_hosts(self, addresses):
-        """
-        Iterate over hosts within an address range.
+        """Iterate over hosts within an address range.
 
         If an explicit range specifier is missing, the parameter is
         interpreted as a specific individual address.
@@ -161,9 +162,6 @@ class Floating_ips_bulk(extensions.ExtensionDescriptor):
     namespace = ("http://docs.openstack.org/compute/ext/"
                  "floating_ips_bulk/api/v2")
     updated = "2012-10-29T13:25:27-06:00"
-
-    def __init__(self, ext_mgr):
-        ext_mgr.register(self)
 
     def get_resources(self):
         resources = []

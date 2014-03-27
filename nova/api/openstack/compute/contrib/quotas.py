@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -15,7 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import urlparse
+import six.moves.urllib.parse as urlparse
 import webob
 
 from nova.api.openstack import extensions
@@ -28,6 +26,7 @@ from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova.openstack.common import strutils
 from nova import quota
+from nova import utils
 
 
 QUOTAS = quota.QUOTAS
@@ -52,7 +51,7 @@ class QuotaTemplate(xmlutil.TemplateBuilder):
         return xmlutil.MasterTemplate(root, 1)
 
 
-class QuotaSetsController(object):
+class QuotaSetsController(wsgi.Controller):
 
     def __init__(self, ext_mgr):
         self.ext_mgr = ext_mgr
@@ -74,10 +73,10 @@ class QuotaSetsController(object):
             raise webob.exc.HTTPBadRequest(explanation=msg)
         if ((limit < minimum) and
            (maximum != -1 or (maximum == -1 and limit != -1))):
-            msg = _("Quota limit must greater than %s.") % minimum
+            msg = _("Quota limit must be greater than %s.") % minimum
             raise webob.exc.HTTPBadRequest(explanation=msg)
         if maximum != -1 and limit > maximum:
-            msg = _("Quota limit must less than %s.") % maximum
+            msg = _("Quota limit must be less than %s.") % maximum
             raise webob.exc.HTTPBadRequest(explanation=msg)
 
     def _get_quotas(self, context, id, user_id=None, usages=False):
@@ -137,7 +136,11 @@ class QuotaSetsController(object):
         except exception.NotAuthorized:
             raise webob.exc.HTTPForbidden()
 
-        for key, value in body['quota_set'].items():
+        if not self.is_valid_body(body, 'quota_set'):
+            msg = _("quota_set not specified")
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+        quota_set = body['quota_set']
+        for key, value in quota_set.items():
             if (key not in QUOTAS and
                     key not in NON_QUOTA_KEYS):
                 bad_keys.append(key)
@@ -148,12 +151,11 @@ class QuotaSetsController(object):
                 force_update = strutils.bool_from_string(value)
             elif key not in NON_QUOTA_KEYS and value:
                 try:
-                    value = int(value)
-                except (ValueError, TypeError):
-                    msg = _("Quota '%(value)s' for %(key)s should be "
-                            "integer.") % {'value': value, 'key': key}
-                    LOG.warn(msg)
-                    raise webob.exc.HTTPBadRequest(explanation=msg)
+                    value = utils.validate_integer(value, key)
+                except exception.InvalidInput as e:
+                    LOG.warn(e.format_message())
+                    raise webob.exc.HTTPBadRequest(
+                        explanation=e.format_message())
 
         LOG.debug(_("force update quotas: %s") % force_update)
 
@@ -167,8 +169,8 @@ class QuotaSetsController(object):
         except exception.NotAuthorized:
             raise webob.exc.HTTPForbidden()
 
-        for key, value in body['quota_set'].items():
-            if key in NON_QUOTA_KEYS or not value:
+        for key, value in quota_set.items():
+            if key in NON_QUOTA_KEYS or (not value and value != 0):
                 continue
             # validate whether already used and reserved exceeds the new
             # quota, this check will be ignored if admin want to force
@@ -185,7 +187,7 @@ class QuotaSetsController(object):
                                'value': value})
                     if quota_used > value:
                         msg = (_("Quota value %(value)s for %(key)s are "
-                                "greater than already used and reserved "
+                                "less than already used and reserved "
                                 "%(quota_used)s") %
                                 {'value': value, 'key': key,
                                  'quota_used': quota_used})

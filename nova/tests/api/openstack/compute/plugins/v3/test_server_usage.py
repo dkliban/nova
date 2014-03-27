@@ -15,16 +15,15 @@
 
 import datetime
 
-from lxml import etree
-
-from nova.api.openstack.compute.plugins.v3 import server_usage
 from nova import compute
+from nova import db
 from nova import exception
 from nova.objects import instance as instance_obj
 from nova.openstack.common import jsonutils
 from nova.openstack.common import timeutils
 from nova import test
 from nova.tests.api.openstack import fakes
+from nova.tests import fake_instance
 
 UUID1 = '00000000-0000-0000-0000-000000000001'
 UUID2 = '00000000-0000-0000-0000-000000000002'
@@ -36,8 +35,9 @@ DATE3 = datetime.datetime(year=2013, month=4, day=5, hour=14)
 
 
 def fake_compute_get(*args, **kwargs):
-    return fakes.stub_instance(1, uuid=UUID3, launched_at=DATE1,
+    inst = fakes.stub_instance(1, uuid=UUID3, launched_at=DATE1,
                                terminated_at=DATE2)
+    return fake_instance.fake_instance_obj(args[1], **inst)
 
 
 def fake_compute_get_all(*args, **kwargs):
@@ -62,9 +62,11 @@ class ServerUsageTest(test.TestCase):
         fakes.stub_out_nw_api(self.stubs)
         self.stubs.Set(compute.api.API, 'get', fake_compute_get)
         self.stubs.Set(compute.api.API, 'get_all', fake_compute_get_all)
+        return_server = fakes.fake_instance_get()
+        self.stubs.Set(db, 'instance_get_by_uuid', return_server)
 
     def _make_request(self, url):
-        req = fakes.HTTPRequest.blank(url)
+        req = fakes.HTTPRequestV3.blank(url)
         req.accept = self.content_type
         res = req.get_response(fakes.wsgi_app_v3(init_only=(
             'servers', 'os-server-usage')))
@@ -120,14 +122,3 @@ class ServerUsageTest(test.TestCase):
         res = self._make_request(url)
 
         self.assertEqual(res.status_int, 404)
-
-
-class ServerUsageXmlTest(ServerUsageTest):
-    content_type = 'application/xml'
-    prefix = '{%s}' % server_usage.ServerUsage.namespace
-
-    def _get_server(self, body):
-        return etree.XML(body)
-
-    def _get_servers(self, body):
-        return etree.XML(body).getchildren()

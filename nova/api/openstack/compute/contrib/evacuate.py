@@ -21,11 +21,9 @@ from nova.api.openstack import wsgi
 from nova import compute
 from nova import exception
 from nova.openstack.common.gettextutils import _
-from nova.openstack.common import log as logging
 from nova.openstack.common import strutils
 from nova import utils
 
-LOG = logging.getLogger(__name__)
 authorize = extensions.extension_authorizer('compute', 'evacuate')
 
 
@@ -37,37 +35,35 @@ class Controller(wsgi.Controller):
 
     @wsgi.action('evacuate')
     def _evacuate(self, req, id, body):
-        """
-        Permit admins to evacuate a server from a failed host
+        """Permit admins to evacuate a server from a failed host
         to a new one.
         """
         context = req.environ["nova.context"]
         authorize(context)
 
-        try:
-            if len(body) != 1:
-                raise exc.HTTPBadRequest(_("Malformed request body"))
+        if not self.is_valid_body(body, "evacuate"):
+            raise exc.HTTPBadRequest(_("Malformed request body"))
+        evacuate_body = body["evacuate"]
 
-            evacuate_body = body["evacuate"]
+        try:
             host = evacuate_body["host"]
             on_shared_storage = strutils.bool_from_string(
                                             evacuate_body["onSharedStorage"])
-
-            password = None
-            if 'adminPass' in evacuate_body:
-                # check that if requested to evacuate server on shared storage
-                # password not specified
-                if on_shared_storage:
-                    msg = _("admin password can't be changed on existing disk")
-                    raise exc.HTTPBadRequest(explanation=msg)
-
-                password = evacuate_body['adminPass']
-            elif not on_shared_storage:
-                password = utils.generate_password()
-
         except (TypeError, KeyError):
             msg = _("host and onSharedStorage must be specified.")
             raise exc.HTTPBadRequest(explanation=msg)
+
+        password = None
+        if 'adminPass' in evacuate_body:
+            # check that if requested to evacuate server on shared storage
+            # password not specified
+            if on_shared_storage:
+                msg = _("admin password can't be changed on existing disk")
+                raise exc.HTTPBadRequest(explanation=msg)
+
+            password = evacuate_body['adminPass']
+        elif not on_shared_storage:
+            password = utils.generate_password()
 
         try:
             self.host_api.service_get_by_compute_host(context, host)
@@ -84,7 +80,7 @@ class Controller(wsgi.Controller):
                     'evacuate')
         except exception.InstanceNotFound as e:
             raise exc.HTTPNotFound(explanation=e.format_message())
-        except exception.ComputeServiceUnavailable as e:
+        except exception.ComputeServiceInUse as e:
             raise exc.HTTPBadRequest(explanation=e.format_message())
 
         if password:

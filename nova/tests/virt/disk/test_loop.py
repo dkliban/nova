@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 Michael Still
 # All Rights Reserved.
 #
@@ -34,7 +32,7 @@ def _fake_trycmd_losetup_fails(*args, **kwards):
     return '', 'doh'
 
 
-class LoopTestCase(test.TestCase):
+class LoopTestCase(test.NoDBTestCase):
     def test_get_dev(self):
         tempdir = self.useFixture(fixtures.TempDir()).path
         l = loop.LoopMount(None, tempdir)
@@ -46,14 +44,14 @@ class LoopTestCase(test.TestCase):
         # No error logged, device consumed
         self.assertTrue(l.get_dev())
         self.assertTrue(l.linked)
-        self.assertEquals('', l.error)
-        self.assertEquals('/dev/loop0', l.device)
+        self.assertEqual('', l.error)
+        self.assertEqual('/dev/loop0', l.device)
 
         # Free
         l.unget_dev()
         self.assertFalse(l.linked)
-        self.assertEquals('', l.error)
-        self.assertEquals(None, l.device)
+        self.assertEqual('', l.error)
+        self.assertIsNone(l.device)
 
     def test_inner_get_dev_fails(self):
         tempdir = self.useFixture(fixtures.TempDir()).path
@@ -64,13 +62,13 @@ class LoopTestCase(test.TestCase):
         # No error logged, device consumed
         self.assertFalse(l._inner_get_dev())
         self.assertFalse(l.linked)
-        self.assertNotEquals('', l.error)
-        self.assertEquals(None, l.device)
+        self.assertNotEqual('', l.error)
+        self.assertIsNone(l.device)
 
         # Free
         l.unget_dev()
         self.assertFalse(l.linked)
-        self.assertEquals(None, l.device)
+        self.assertIsNone(l.device)
 
     def test_get_dev_timeout(self):
         tempdir = self.useFixture(fixtures.TempDir()).path

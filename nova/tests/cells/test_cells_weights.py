@@ -1,4 +1,4 @@
-# Copyright (c) 2012 Openstack, LLC
+# Copyright (c) 2012 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -58,7 +58,7 @@ def _get_fake_cells():
     return [cell1, cell2, cell3, cell4]
 
 
-class CellsWeightsTestCase(test.TestCase):
+class CellsWeightsTestCase(test.NoDBTestCase):
     """Makes sure the proper weighers are in the directory."""
 
     def test_all_weighers(self):
@@ -67,10 +67,10 @@ class CellsWeightsTestCase(test.TestCase):
         self.assertTrue(len(weighers) >= 2)
         class_names = [cls.__name__ for cls in weighers]
         self.assertIn('WeightOffsetWeigher', class_names)
-        self.assert_('RamByInstanceTypeWeigher', class_names)
+        self.assertIn('RamByInstanceTypeWeigher', class_names)
 
 
-class _WeigherTestClass(test.TestCase):
+class _WeigherTestClass(test.NoDBTestCase):
     """Base class for testing individual weigher plugins."""
     weigher_cls_name = None
 
@@ -213,5 +213,5 @@ class MuteWeigherTestClass(_WeigherTestClass):
 
         for i in range(2):
             weighed_cell = weighed_cells.pop(0)
-            self.assertEqual(1000 * -10.0, weighed_cell.weight)
+            self.assertEqual(-10.0, weighed_cell.weight)
             self.assertIn(weighed_cell.obj.name, ['cell1', 'cell2'])

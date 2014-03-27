@@ -31,13 +31,13 @@ def fake_get_diagnostics(self, _context, instance_uuid):
     return {'data': 'Some diagnostic info'}
 
 
-def fake_instance_get(self, _context, instance_uuid):
+def fake_instance_get(self, _context, instance_uuid, want_objects=False):
     if instance_uuid != UUID:
         raise Exception("Invalid UUID")
     return {'uuid': instance_uuid}
 
 
-class ServerDiagnosticsTest(test.TestCase):
+class ServerDiagnosticsTest(test.NoDBTestCase):
 
     def setUp(self):
         super(ServerDiagnosticsTest, self).setUp()
@@ -58,7 +58,7 @@ class ServerDiagnosticsTest(test.TestCase):
         self.assertEqual(output, {'data': 'Some diagnostic info'})
 
 
-class TestServerDiagnosticsXMLSerializer(test.TestCase):
+class TestServerDiagnosticsXMLSerializer(test.NoDBTestCase):
     namespace = wsgi.XMLNS_V11
 
     def _tag(self, elem):
@@ -80,5 +80,5 @@ class TestServerDiagnosticsXMLSerializer(test.TestCase):
         self.assertEqual(len(tree), len(exemplar))
         for child in tree:
             tag = self._tag(child)
-            self.assertTrue(tag in exemplar)
+            self.assertIn(tag, exemplar)
             self.assertEqual(child.text, exemplar[tag])

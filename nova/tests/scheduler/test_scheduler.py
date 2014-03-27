@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -19,7 +17,11 @@
 Tests For Scheduler
 """
 
+import mock
+
 import mox
+from oslo.config import cfg
+from oslo import messaging
 
 from nova.compute import api as compute_api
 from nova.compute import task_states
@@ -31,16 +33,20 @@ from nova import context
 from nova import db
 from nova import exception
 from nova.image import glance
-from nova.openstack.common.notifier import api as notifier
-from nova.openstack.common.rpc import common as rpc_common
+from nova.objects import instance as instance_obj
+from nova import rpc
 from nova.scheduler import driver
 from nova.scheduler import manager
 from nova import servicegroup
 from nova import test
+from nova.tests import fake_instance
 from nova.tests import fake_instance_actions
 from nova.tests.image import fake as fake_image
 from nova.tests import matchers
 from nova.tests.scheduler import fakes
+from nova import utils
+
+CONF = cfg.CONF
 
 
 class SchedulerManagerTestCase(test.NoDBTestCase):
@@ -61,63 +67,10 @@ class SchedulerManagerTestCase(test.NoDBTestCase):
         self.fake_kwargs = {'cat': 'meow', 'dog': 'woof'}
         fake_instance_actions.stub_out_action_events(self.stubs)
 
-    def stub_out_client_exceptions(self):
-        def passthru(exceptions, func, *args, **kwargs):
-            return func(*args, **kwargs)
-
-        self.stubs.Set(rpc_common, 'catch_client_exception', passthru)
-
     def test_1_correct_init(self):
         # Correct scheduler driver
         manager = self.manager
-        self.assertTrue(isinstance(manager.driver, self.driver_cls))
-
-    def test_update_service_capabilities(self):
-        service_name = 'fake_service'
-        host = 'fake_host'
-
-        self.mox.StubOutWithMock(self.manager.driver,
-                'update_service_capabilities')
-
-        # Test no capabilities passes empty dictionary
-        self.manager.driver.update_service_capabilities(service_name,
-                host, {})
-        self.mox.ReplayAll()
-        self.manager.update_service_capabilities(self.context,
-                service_name=service_name, host=host, capabilities={})
-        self.mox.VerifyAll()
-
-        self.mox.ResetAll()
-        # Test capabilities passes correctly
-        capabilities = {'fake_capability': 'fake_value'}
-        self.manager.driver.update_service_capabilities(
-                service_name, host, capabilities)
-        self.mox.ReplayAll()
-        self.manager.update_service_capabilities(self.context,
-                service_name=service_name, host=host,
-                capabilities=capabilities)
-
-    def test_update_service_multiple_capabilities(self):
-        service_name = 'fake_service'
-        host = 'fake_host'
-
-        self.mox.StubOutWithMock(self.manager.driver,
-                                 'update_service_capabilities')
-
-        capab1 = {'fake_capability': 'fake_value1'},
-        capab2 = {'fake_capability': 'fake_value2'},
-        capab3 = None
-        self.manager.driver.update_service_capabilities(
-                service_name, host, capab1)
-        self.manager.driver.update_service_capabilities(
-                service_name, host, capab2)
-        # None is converted to {}
-        self.manager.driver.update_service_capabilities(
-                service_name, host, {})
-        self.mox.ReplayAll()
-        self.manager.update_service_capabilities(self.context,
-                service_name=service_name, host=host,
-                capabilities=[capab1, capab2, capab3])
+        self.assertIsInstance(manager.driver, self.driver_cls)
 
     def test_show_host_resources(self):
         host = 'fake_host'
@@ -192,7 +145,7 @@ class SchedulerManagerTestCase(test.NoDBTestCase):
                         'instance_uuids': [fake_instance_uuid]}
 
         self.manager.driver.schedule_run_instance(self.context,
-                request_spec, None, None, None, None, {}).AndRaise(
+                request_spec, None, None, None, None, {}, False).AndRaise(
                         exception.NoValidHost(reason=""))
         old, new_ref = db.instance_update_and_get_original(self.context,
                 fake_instance_uuid,
@@ -204,7 +157,7 @@ class SchedulerManagerTestCase(test.NoDBTestCase):
 
         self.mox.ReplayAll()
         self.manager.run_instance(self.context, request_spec,
-                None, None, None, None, {})
+                None, None, None, None, {}, False)
 
     def test_live_migration_schedule_novalidhost(self):
         inst = {"uuid": "fake-instance-id",
@@ -233,7 +186,7 @@ class SchedulerManagerTestCase(test.NoDBTestCase):
                                 mox.IgnoreArg())
 
         self.mox.ReplayAll()
-        self.stub_out_client_exceptions()
+        self.manager = utils.ExceptionHelper(self.manager)
         self.assertRaises(exception.NoValidHost,
                           self.manager.live_migration,
                           self.context, inst, dest, block_migration,
@@ -266,7 +219,7 @@ class SchedulerManagerTestCase(test.NoDBTestCase):
                                 mox.IgnoreArg())
 
         self.mox.ReplayAll()
-        self.stub_out_client_exceptions()
+        self.manager = utils.ExceptionHelper(self.manager)
         self.assertRaises(exception.ComputeServiceUnavailable,
                           self.manager.live_migration,
                           self.context, inst, dest, block_migration,
@@ -276,7 +229,7 @@ class SchedulerManagerTestCase(test.NoDBTestCase):
         instance = {'host': 'h'}
         self.mox.StubOutClassWithMocks(live_migrate, "LiveMigrationTask")
         task = live_migrate.LiveMigrationTask(self.context, instance,
-                    "dest", "bm", "doc", self.manager.driver.select_hosts)
+                    "dest", "bm", "doc")
         task.execute()
 
         self.mox.ReplayAll()
@@ -307,7 +260,7 @@ class SchedulerManagerTestCase(test.NoDBTestCase):
                                 mox.IgnoreArg())
 
         self.mox.ReplayAll()
-        self.stub_out_client_exceptions()
+        self.manager = utils.ExceptionHelper(self.manager)
         self.assertRaises(ValueError,
                           self.manager.live_migration,
                           self.context, inst, dest, block_migration,
@@ -436,26 +389,28 @@ class SchedulerManagerTestCase(test.NoDBTestCase):
 
         self.mox.StubOutWithMock(db, 'instance_update_and_get_original')
         self.mox.StubOutWithMock(db, 'instance_fault_create')
-        self.mox.StubOutWithMock(notifier, 'notify')
+        self.mox.StubOutWithMock(rpc, 'get_notifier')
+        notifier = self.mox.CreateMockAnything()
+        rpc.get_notifier('conductor', CONF.host).AndReturn(notifier)
+        rpc.get_notifier('scheduler').AndReturn(notifier)
         db.instance_update_and_get_original(self.context, 'fake-uuid',
                                             updates).AndReturn((None,
                                                                 fake_inst))
         db.instance_fault_create(self.context, mox.IgnoreArg())
-        notifier.notify(self.context, mox.IgnoreArg(), 'scheduler.foo',
-                        notifier.ERROR, mox.IgnoreArg())
+        notifier.error(self.context, 'scheduler.foo', mox.IgnoreArg())
         self.mox.ReplayAll()
 
         self.manager._set_vm_state_and_notify('foo', {'vm_state': 'foo'},
                                               self.context, None, request)
 
     def test_select_hosts_throws_rpc_clientexception(self):
-        self.mox.StubOutWithMock(self.manager.driver, 'select_hosts')
+        self.mox.StubOutWithMock(self.manager.driver, 'select_destinations')
 
-        self.manager.driver.select_hosts(self.context, {}, {}).AndRaise(
+        self.manager.driver.select_destinations(self.context, {}, {}).AndRaise(
                 exception.NoValidHost(reason=""))
 
         self.mox.ReplayAll()
-        self.assertRaises(rpc_common.ClientException,
+        self.assertRaises(messaging.ExpectedException,
                           self.manager.select_hosts,
                           self.context, {}, {})
 
@@ -464,7 +419,7 @@ class SchedulerManagerTestCase(test.NoDBTestCase):
 
         image = 'image'
         instance_uuid = 'fake-instance-id'
-        instance = {'uuid': instance_uuid}
+        instance = fake_instance.fake_db_instance(uuid=instance_uuid)
 
         instance_properties = {'project_id': 'fake', 'os_type': 'Linux'}
         instance_type = "m1.tiny"
@@ -482,7 +437,8 @@ class SchedulerManagerTestCase(test.NoDBTestCase):
             self.context, request_spec, filter_properties).AndReturn(hosts)
 
         self.mox.StubOutWithMock(self.manager.compute_rpcapi, 'prep_resize')
-        self.manager.compute_rpcapi.prep_resize(self.context, image, instance,
+        self.manager.compute_rpcapi.prep_resize(self.context, image,
+                mox.IsA(instance_obj.Instance),
                 instance_type, 'host', reservations, request_spec=request_spec,
                 filter_properties=filter_properties, node='node')
 
@@ -524,20 +480,6 @@ class SchedulerTestCase(test.NoDBTestCase):
         self.topic = 'fake_topic'
         self.servicegroup_api = servicegroup.API()
 
-    def test_update_service_capabilities(self):
-        service_name = 'fake_service'
-        host = 'fake_host'
-
-        self.mox.StubOutWithMock(self.driver.host_manager,
-                'update_service_capabilities')
-
-        capabilities = {'fake_capability': 'fake_value'}
-        self.driver.host_manager.update_service_capabilities(
-                service_name, host, capabilities)
-        self.mox.ReplayAll()
-        self.driver.update_service_capabilities(service_name,
-                host, capabilities)
-
     def test_hosts_up(self):
         service1 = {'host': 'host1'}
         service2 = {'host': 'host2'}
@@ -559,14 +501,15 @@ class SchedulerTestCase(test.NoDBTestCase):
         instance = {'uuid': 'fake-uuid'}
         self.mox.StubOutWithMock(db, 'instance_update_and_get_original')
         self.mox.StubOutWithMock(db, 'instance_fault_create')
-        self.mox.StubOutWithMock(notifier, 'notify')
         db.instance_update_and_get_original(self.context, instance['uuid'],
                                             mox.IgnoreArg()).AndReturn(
                                                 (None, instance))
         db.instance_fault_create(self.context, mox.IgnoreArg())
-        notifier.notify(self.context, mox.IgnoreArg(),
-                        'scheduler.run_instance',
-                        notifier.ERROR, mox.IgnoreArg())
+        self.mox.StubOutWithMock(rpc, 'get_notifier')
+        notifier = self.mox.CreateMockAnything()
+        rpc.get_notifier('conductor', CONF.host).AndReturn(notifier)
+        rpc.get_notifier('scheduler').AndReturn(notifier)
+        notifier.error(self.context, 'scheduler.run_instance', mox.IgnoreArg())
         self.mox.ReplayAll()
 
         driver.handle_schedule_error(self.context,
@@ -586,38 +529,56 @@ class SchedulerDriverBaseTestCase(SchedulerTestCase):
         self.assertRaises(NotImplementedError,
                          self.driver.schedule_run_instance,
                          self.context, fake_request_spec, None, None, None,
-                         None, None)
-
-    def test_unimplemented_select_hosts(self):
-        self.assertRaises(NotImplementedError,
-                          self.driver.select_hosts, self.context, {}, {})
+                         None, None, False)
 
     def test_unimplemented_select_destinations(self):
         self.assertRaises(NotImplementedError,
                 self.driver.select_destinations, self.context, {}, {})
 
 
-class SchedulerDriverModuleTestCase(test.NoDBTestCase):
-    """Test case for scheduler driver module methods."""
+class SchedulerInstanceGroupData(test.TestCase):
+
+    driver_cls = driver.Scheduler
 
     def setUp(self):
-        super(SchedulerDriverModuleTestCase, self).setUp()
-        self.context = context.RequestContext('fake_user', 'fake_project')
+        super(SchedulerInstanceGroupData, self).setUp()
+        self.user_id = 'fake_user'
+        self.project_id = 'fake_project'
+        self.context = context.RequestContext(self.user_id, self.project_id)
+        self.driver = self.driver_cls()
 
-    def test_encode_instance(self):
-        instance = {'id': 31337,
-                    'test_arg': 'meow'}
+    def _get_default_values(self):
+        return {'name': 'fake_name',
+                'user_id': self.user_id,
+                'project_id': self.project_id}
 
-        result = driver.encode_instance(instance, True)
-        expected = {'id': instance['id'], '_is_precooked': False}
-        self.assertThat(result, matchers.DictMatches(expected))
-        # Orig dict not changed
-        self.assertNotEqual(result, instance)
+    def _create_instance_group(self, context, values, policies=None,
+                               metadata=None, members=None):
+        return db.instance_group_create(context, values, policies=policies,
+                                        metadata=metadata, members=members)
 
-        result = driver.encode_instance(instance, False)
-        expected = {}
-        expected.update(instance)
-        expected['_is_precooked'] = True
-        self.assertThat(result, matchers.DictMatches(expected))
-        # Orig dict not changed
-        self.assertNotEqual(result, instance)
+
+class SchedulerV3PassthroughTestCase(test.TestCase):
+    def setUp(self):
+        super(SchedulerV3PassthroughTestCase, self).setUp()
+        self.manager = manager.SchedulerManager()
+        self.proxy = manager._SchedulerManagerV3Proxy(self.manager)
+
+    def test_select_destination(self):
+        with mock.patch.object(self.manager, 'select_destinations'
+                ) as select_destinations:
+            self.proxy.select_destinations(None, None, None)
+            select_destinations.assert_called_once()
+
+    def test_run_instance(self):
+        with mock.patch.object(self.manager, 'run_instance'
+                ) as run_instance:
+            self.proxy.run_instance(None, None, None, None, None, None, None,
+                    None)
+            run_instance.assert_called_once()
+
+    def test_prep_resize(self):
+        with mock.patch.object(self.manager, 'prep_resize'
+                ) as prep_resize:
+            self.proxy.prep_resize(None, None, None, None, None, None, None)
+            prep_resize.assert_called_once()

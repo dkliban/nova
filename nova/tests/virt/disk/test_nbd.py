@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 Michael Still and Canonical Inc
 # All Rights Reserved.
 #
@@ -18,7 +16,9 @@
 
 import os
 import tempfile
+import time
 
+import eventlet
 import fixtures
 
 from nova import test
@@ -60,7 +60,7 @@ def _fake_noop(*args, **kwargs):
     return
 
 
-class NbdTestCase(test.TestCase):
+class NbdTestCase(test.NoDBTestCase):
     def setUp(self):
         super(NbdTestCase, self).setUp()
         self.stubs.Set(nbd.NbdMount, '_detect_nbd_devices',
@@ -73,14 +73,14 @@ class NbdTestCase(test.TestCase):
         self.stubs.Set(nbd.NbdMount, '_detect_nbd_devices',
                        _fake_detect_nbd_devices_none)
         n = nbd.NbdMount(None, tempdir)
-        self.assertEquals(None, n._allocate_nbd())
+        self.assertIsNone(n._allocate_nbd())
 
     def test_nbd_no_free_devices(self):
         tempdir = self.useFixture(fixtures.TempDir()).path
         n = nbd.NbdMount(None, tempdir)
         self.useFixture(fixtures.MonkeyPatch('os.path.exists',
                                              _fake_exists_all_used))
-        self.assertEquals(None, n._allocate_nbd())
+        self.assertIsNone(n._allocate_nbd())
 
     def test_nbd_not_loaded(self):
         tempdir = self.useFixture(fixtures.TempDir()).path
@@ -96,8 +96,8 @@ class NbdTestCase(test.TestCase):
         # This should fail, as we don't have the module "loaded"
         # TODO(mikal): work out how to force english as the gettext language
         # so that the error check always passes
-        self.assertEquals(None, n._allocate_nbd())
-        self.assertEquals('nbd unavailable: module not loaded', n.error)
+        self.assertIsNone(n._allocate_nbd())
+        self.assertEqual('nbd unavailable: module not loaded', n.error)
 
     def test_nbd_allocation(self):
         tempdir = self.useFixture(fixtures.TempDir()).path
@@ -107,7 +107,7 @@ class NbdTestCase(test.TestCase):
         self.useFixture(fixtures.MonkeyPatch('random.shuffle', _fake_noop))
 
         # Allocate a nbd device
-        self.assertEquals('/dev/nbd0', n._allocate_nbd())
+        self.assertEqual('/dev/nbd0', n._allocate_nbd())
 
     def test_nbd_allocation_one_in_use(self):
         tempdir = self.useFixture(fixtures.TempDir()).path
@@ -129,7 +129,7 @@ class NbdTestCase(test.TestCase):
         # TODO(mikal): Note that there is a leak here, as the in use nbd device
         # is removed from the list, but not returned so it will never be
         # re-added. I will fix this in a later patch.
-        self.assertEquals('/dev/nbd1', n._allocate_nbd())
+        self.assertEqual('/dev/nbd1', n._allocate_nbd())
 
     def test_inner_get_dev_no_devices(self):
         tempdir = self.useFixture(fixtures.TempDir()).path
@@ -206,14 +206,14 @@ class NbdTestCase(test.TestCase):
         # No error logged, device consumed
         self.assertTrue(n._inner_get_dev())
         self.assertTrue(n.linked)
-        self.assertEquals('', n.error)
-        self.assertEquals('/dev/nbd0', n.device)
+        self.assertEqual('', n.error)
+        self.assertEqual('/dev/nbd0', n.device)
 
         # Free
         n.unget_dev()
         self.assertFalse(n.linked)
-        self.assertEquals('', n.error)
-        self.assertEquals(None, n.device)
+        self.assertEqual('', n.error)
+        self.assertIsNone(n.device)
 
     def test_unget_dev_simple(self):
         # This test is just checking we don't get an exception when we unget
@@ -236,14 +236,14 @@ class NbdTestCase(test.TestCase):
         # No error logged, device consumed
         self.assertTrue(n.get_dev())
         self.assertTrue(n.linked)
-        self.assertEquals('', n.error)
-        self.assertEquals('/dev/nbd0', n.device)
+        self.assertEqual('', n.error)
+        self.assertEqual('/dev/nbd0', n.device)
 
         # Free
         n.unget_dev()
         self.assertFalse(n.linked)
-        self.assertEquals('', n.error)
-        self.assertEquals(None, n.device)
+        self.assertEqual('', n.error)
+        self.assertIsNone(n.device)
 
     def test_get_dev_timeout(self):
         # Always fail to get a device
@@ -284,3 +284,48 @@ class NbdTestCase(test.TestCase):
         mount.map_dev = fake_returns_true
 
         self.assertFalse(mount.do_mount())
+
+    def test_device_creation_race(self):
+        # Make sure that even if two threads create instances at the same time
+        # they cannot choose the same nbd number (see bug 1207422)
+
+        tempdir = self.useFixture(fixtures.TempDir()).path
+        free_devices = _fake_detect_nbd_devices(None)[:]
+        chosen_devices = []
+
+        def fake_find_unused(self):
+            return os.path.join('/dev', free_devices[-1])
+
+        def delay_and_remove_device(*args, **kwargs):
+            # Ensure that context switch happens before the device is marked
+            # as used. This will cause a failure without nbd-allocation-lock
+            # in place.
+            time.sleep(0.1)
+
+            # We always choose the top device in find_unused - remove it now.
+            free_devices.pop()
+
+            return '', ''
+
+        def pid_exists(pidfile):
+            return pidfile not in [os.path.join('/sys/block', dev, 'pid')
+                                   for dev in free_devices]
+
+        self.stubs.Set(nbd.NbdMount, '_allocate_nbd', fake_find_unused)
+        self.useFixture(fixtures.MonkeyPatch('nova.utils.trycmd',
+                                             delay_and_remove_device))
+        self.useFixture(fixtures.MonkeyPatch('os.path.exists',
+                                             pid_exists))
+
+        def get_a_device():
+            n = nbd.NbdMount(None, tempdir)
+            n.get_dev()
+            chosen_devices.append(n.device)
+
+        thread1 = eventlet.spawn(get_a_device)
+        thread2 = eventlet.spawn(get_a_device)
+        thread1.wait()
+        thread2.wait()
+
+        self.assertEqual(2, len(chosen_devices))
+        self.assertNotEqual(chosen_devices[0], chosen_devices[1])

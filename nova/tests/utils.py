@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-#
 #    Copyright 2011 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -17,6 +15,7 @@
 import errno
 import platform
 import socket
+import sys
 
 from oslo.config import cfg
 
@@ -27,6 +26,7 @@ from nova import exception
 from nova.image import glance
 from nova.network import minidns
 from nova.network import model as network_model
+from nova.objects import instance as instance_obj
 
 CONF = cfg.CONF
 CONF.import_opt('use_ipv6', 'nova.netconf')
@@ -46,35 +46,37 @@ def get_test_image_info(context, instance_ref):
     return image_service.show(context, image_id)
 
 
-def get_test_instance_type(context=None):
+def get_test_flavor(context=None, options=None):
+    options = options or {}
     if not context:
         context = get_test_admin_context()
 
-    test_instance_type = {'name': 'kinda.big',
-                          'flavorid': 'someid',
-                          'memory_mb': 2048,
-                          'vcpus': 4,
-                          'root_gb': 40,
-                          'ephemeral_gb': 80,
-                          'swap': 1024}
+    test_flavor = {'name': 'kinda.big',
+                   'flavorid': 'someid',
+                   'memory_mb': 2048,
+                   'vcpus': 4,
+                   'root_gb': 40,
+                   'ephemeral_gb': 80,
+                   'swap': 1024}
+
+    test_flavor.update(options)
+
     try:
-        instance_type_ref = nova.db.flavor_create(context,
-                                                         test_instance_type)
-    except (exception.InstanceTypeExists, exception.InstanceTypeIdExists):
-        instance_type_ref = nova.db.flavor_get_by_name(context,
-                                                              'kinda.big')
-    return instance_type_ref
+        flavor_ref = nova.db.flavor_create(context, test_flavor)
+    except (exception.FlavorExists, exception.FlavorIdExists):
+        flavor_ref = nova.db.flavor_get_by_name(context, 'kinda.big')
+    return flavor_ref
 
 
-def get_test_instance(context=None, instance_type=None):
+def get_test_instance(context=None, flavor=None, obj=False):
     if not context:
         context = get_test_admin_context()
 
-    if not instance_type:
-        instance_type = get_test_instance_type(context)
+    if not flavor:
+        flavor = get_test_flavor(context)
 
     metadata = {}
-    flavors.save_flavor_info(metadata, instance_type, '')
+    flavors.save_flavor_info(metadata, flavor, '')
 
     test_instance = {'memory_kb': '2048000',
                      'basepath': '/some/path',
@@ -86,46 +88,28 @@ def get_test_instance(context=None, instance_type=None):
                      'image_ref': 'cedef40a-ed67-4d10-800e-17455edce175',
                      'instance_type_id': '5',
                      'system_metadata': metadata,
-                     'extra_specs': {}}
+                     'extra_specs': {},
+                     'user_id': context.user_id,
+                     'project_id': context.project_id,
+                     }
 
-    instance_ref = nova.db.instance_create(context, test_instance)
-    return instance_ref
+    if obj:
+        instance = instance_obj.Instance(context, **test_instance)
+        instance.create()
+    else:
+        instance = nova.db.instance_create(context, test_instance)
+    return instance
 
 
-def get_test_network_info(count=1, legacy_model=True):
+def get_test_network_info(count=1):
     ipv6 = CONF.use_ipv6
     fake = 'fake'
-    fake_ip = '0.0.0.0/0'
-    fake_ip_2 = '0.0.0.1/0'
-    fake_ip_3 = '0.0.0.1/0'
+    fake_ip = '0.0.0.0'
     fake_netmask = '255.255.255.255'
     fake_vlan = 100
     fake_bridge_interface = 'eth0'
 
-    def legacy():
-        network = {'bridge': fake,
-                   'cidr': fake_ip,
-                   'cidr_v6': fake_ip,
-                   'vlan': fake_vlan,
-                   'bridge_interface': fake_bridge_interface,
-                   'injected': False}
-        mapping = {'mac': fake,
-                   'vif_type': network_model.VIF_TYPE_BRIDGE,
-                   'vif_uuid': 'vif-xxx-yyy-zzz',
-                   'dhcp_server': fake,
-                   'dns': ['fake1', 'fake2'],
-                   'gateway': fake,
-                   'gateway_v6': fake,
-                   'ips': [{'ip': fake_ip, 'netmask': fake_netmask},
-                           {'ip': fake_ip, 'netmask': fake_netmask}]}
-        if ipv6:
-            mapping['ip6s'] = [{'ip': fake_ip, 'netmask': fake_netmask},
-                               {'ip': fake_ip_2},
-                               {'ip': fake_ip_3}]
-        return network, mapping
-
     def current():
-        fake_ip = '0.0.0.0'
         subnet_4 = network_model.Subnet(cidr=fake_ip,
                                         dns=[network_model.IP(fake_ip),
                                              network_model.IP(fake_ip)],
@@ -160,10 +144,7 @@ def get_test_network_info(count=1, legacy_model=True):
 
         return vif
 
-    if legacy_model:
-        return [legacy() for x in xrange(0, count)]
-    else:
-        return network_model.NetworkInfo([current() for x in xrange(0, count)])
+    return network_model.NetworkInfo([current() for x in xrange(0, count)])
 
 
 def is_osx():
@@ -205,12 +186,23 @@ def killer_xml_body():
 
 
 def is_ipv6_supported():
-    has_ipv6_support = True
+    has_ipv6_support = socket.has_ipv6
     try:
         s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        s.close()
     except socket.error as e:
         if e.errno == errno.EAFNOSUPPORT:
             has_ipv6_support = False
         else:
             raise
+
+    # check if there is at least one interface with ipv6
+    if has_ipv6_support and sys.platform.startswith('linux'):
+        try:
+            with open('/proc/net/if_inet6') as f:
+                if not f.read():
+                    has_ipv6_support = False
+        except IOError:
+            has_ipv6_support = False
+
     return has_ipv6_support

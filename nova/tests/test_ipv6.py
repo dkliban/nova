@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #    Copyright (c) 2011 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -20,7 +18,7 @@ from nova import ipv6
 from nova import test
 
 
-class IPv6RFC2462TestCase(test.TestCase):
+class IPv6RFC2462TestCase(test.NoDBTestCase):
     """Unit tests for IPv6 rfc2462 backend operations."""
     def setUp(self):
         super(IPv6RFC2462TestCase, self).setUp()
@@ -29,11 +27,11 @@ class IPv6RFC2462TestCase(test.TestCase):
 
     def test_to_global(self):
         addr = ipv6.to_global('2001:db8::', '02:16:3e:33:44:55', 'test')
-        self.assertEquals(addr, '2001:db8::16:3eff:fe33:4455')
+        self.assertEqual(addr, '2001:db8::16:3eff:fe33:4455')
 
     def test_to_mac(self):
         mac = ipv6.to_mac('2001:db8::216:3eff:fe33:4455')
-        self.assertEquals(mac, '00:16:3e:33:44:55')
+        self.assertEqual(mac, '00:16:3e:33:44:55')
 
     def test_to_global_with_bad_mac(self):
         bad_mac = '02:16:3e:33:44:5Z'
@@ -55,7 +53,7 @@ class IPv6RFC2462TestCase(test.TestCase):
                                     bad_project)
 
 
-class IPv6AccountIdentiferTestCase(test.TestCase):
+class IPv6AccountIdentiferTestCase(test.NoDBTestCase):
     """Unit tests for IPv6 account_identifier backend operations."""
     def setUp(self):
         super(IPv6AccountIdentiferTestCase, self).setUp()
@@ -64,11 +62,11 @@ class IPv6AccountIdentiferTestCase(test.TestCase):
 
     def test_to_global(self):
         addr = ipv6.to_global('2001:db8::', '02:16:3e:33:44:55', 'test')
-        self.assertEquals(addr, '2001:db8::a94a:8fe5:ff33:4455')
+        self.assertEqual(addr, '2001:db8::a94a:8fe5:ff33:4455')
 
     def test_to_mac(self):
         mac = ipv6.to_mac('2001:db8::a94a:8fe5:ff33:4455')
-        self.assertEquals(mac, '02:16:3e:33:44:55')
+        self.assertEqual(mac, '02:16:3e:33:44:55')
 
     def test_to_global_with_bad_mac(self):
         bad_mac = '02:16:3e:33:44:5X'

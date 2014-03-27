@@ -15,82 +15,82 @@
 
 import copy
 
-from lxml import etree
 from webob import exc
 
 from nova.api.openstack.compute.plugins.v3 import cells as cells_ext
-from nova.api.openstack import xmlutil
-from nova.cells import rpc_driver
 from nova.cells import rpcapi as cells_rpcapi
 from nova import context
 from nova import exception
 from nova.openstack.common import timeutils
+from nova import rpc
 from nova import test
 from nova.tests.api.openstack import fakes
-from nova.tests import utils
 
 
-FAKE_CELLS = [
-        dict(id=1, name='cell1', is_parent=True,
-                weight_scale=1.0, weight_offset=0.0,
-                transport_url='rabbit://bob:xxxx@r1.example.org/'),
-        dict(id=2, name='cell2', is_parent=False,
-                weight_scale=1.0, weight_offset=0.0,
-                transport_url='rabbit://alice:qwerty@r2.example.org/')]
-
-
-FAKE_CAPABILITIES = [
-        {'cap1': '0,1', 'cap2': '2,3'},
-        {'cap3': '4,5', 'cap4': '5,6'}]
-
-
-def fake_cell_get(self, context, cell_name):
-    for cell in FAKE_CELLS:
-        if cell_name == cell['name']:
-            return cell
-    else:
-        raise exception.CellNotFound(cell_name=cell_name)
-
-
-def fake_cell_create(self, context, values):
-    cell = dict(id=1)
-    cell.update(values)
-    return cell
-
-
-def fake_cell_update(self, context, cell_id, values):
-    cell = fake_cell_get(self, context, cell_id)
-    cell.update(values)
-    return cell
-
-
-def insecure_transport_url(url):
-    transport = rpc_driver.parse_transport_url(url)
-    return rpc_driver.unparse_transport_url(transport, False)
-
-
-def fake_cells_api_get_all_cell_info(*args):
-    cells = copy.deepcopy(FAKE_CELLS)
-    cells[0]['transport_url'] = insecure_transport_url(
-        cells[0]['transport_url'])
-    cells[1]['transport_url'] = insecure_transport_url(
-        cells[1]['transport_url'])
-    for i, cell in enumerate(cells):
-        cell['capabilities'] = FAKE_CAPABILITIES[i]
-    return cells
-
-
-class CellsTest(test.TestCase):
+class BaseCellsTest(test.NoDBTestCase):
     def setUp(self):
-        super(CellsTest, self).setUp()
+        super(BaseCellsTest, self).setUp()
+
+        self.fake_cells = [
+                dict(id=1, name='cell1', is_parent=True,
+                     weight_scale=1.0, weight_offset=0.0,
+                     transport_url='rabbit://bob:xxxx@r1.example.org/'),
+                dict(id=2, name='cell2', is_parent=False,
+                     weight_scale=1.0, weight_offset=0.0,
+                     transport_url='rabbit://alice:qwerty@r2.example.org/')]
+
+        self.fake_capabilities = [
+                {'cap1': '0,1', 'cap2': '2,3'},
+                {'cap3': '4,5', 'cap4': '5,6'}]
+
+        def fake_cell_get(_self, context, cell_name):
+            for cell in self.fake_cells:
+                if cell_name == cell['name']:
+                    return cell
+            else:
+                raise exception.CellNotFound(cell_name=cell_name)
+
+        def fake_cell_create(_self, context, values):
+            cell = dict(id=1)
+            cell.update(values)
+            return cell
+
+        def fake_cell_update(_self, context, cell_id, values):
+            cell = fake_cell_get(_self, context, cell_id)
+            cell.update(values)
+            return cell
+
+        def fake_cells_api_get_all_cell_info(*args):
+            return self._get_all_cell_info(*args)
+
         self.stubs.Set(cells_rpcapi.CellsAPI, 'cell_get', fake_cell_get)
         self.stubs.Set(cells_rpcapi.CellsAPI, 'cell_update', fake_cell_update)
         self.stubs.Set(cells_rpcapi.CellsAPI, 'cell_create', fake_cell_create)
         self.stubs.Set(cells_rpcapi.CellsAPI, 'get_cell_info_for_neighbors',
                 fake_cells_api_get_all_cell_info)
 
+    def _get_all_cell_info(self, *args):
+        def insecure_transport_url(url):
+            transport_url = rpc.get_transport_url(url)
+            transport_url.hosts[0].password = None
+            return str(transport_url)
+
+        cells = copy.deepcopy(self.fake_cells)
+        cells[0]['transport_url'] = insecure_transport_url(
+                cells[0]['transport_url'])
+        cells[1]['transport_url'] = insecure_transport_url(
+                cells[1]['transport_url'])
+        for i, cell in enumerate(cells):
+                cell['capabilities'] = self.fake_capabilities[i]
+        return cells
+
+
+class CellsTest(BaseCellsTest):
+    def setUp(self):
+        super(CellsTest, self).setUp()
         self.controller = cells_ext.CellsController()
         self.context = context.get_admin_context()
+        self.flags(enable=True, group='cells')
 
     def _get_request(self, resource):
         return fakes.HTTPRequestV3.blank('/' + resource)
@@ -101,7 +101,7 @@ class CellsTest(test.TestCase):
 
         self.assertEqual(len(res_dict['cells']), 2)
         for i, cell in enumerate(res_dict['cells']):
-            self.assertEqual(cell['name'], FAKE_CELLS[i]['name'])
+            self.assertEqual(cell['name'], self.fake_cells[i]['name'])
             self.assertNotIn('capabilitiles', cell)
             self.assertNotIn('password', cell)
 
@@ -111,8 +111,8 @@ class CellsTest(test.TestCase):
 
         self.assertEqual(len(res_dict['cells']), 2)
         for i, cell in enumerate(res_dict['cells']):
-            self.assertEqual(cell['name'], FAKE_CELLS[i]['name'])
-            self.assertEqual(cell['capabilities'], FAKE_CAPABILITIES[i])
+            self.assertEqual(cell['name'], self.fake_cells[i]['name'])
+            self.assertEqual(cell['capabilities'], self.fake_capabilities[i])
             self.assertNotIn('password', cell)
 
     def test_show_bogus_cell_raises(self):
@@ -164,7 +164,7 @@ class CellsTest(test.TestCase):
         req = self._get_request("cells")
         res_dict = self.controller.create(req, body)
         cell = res_dict['cell']
-
+        self.assertEqual(self.controller.create.wsgi_code, 201)
         self.assertEqual(cell['name'], 'meow')
         self.assertEqual(cell['username'], 'fred')
         self.assertEqual(cell['rpc_host'], 'r3.example.org')
@@ -182,7 +182,7 @@ class CellsTest(test.TestCase):
         req = self._get_request("cells")
         res_dict = self.controller.create(req, body)
         cell = res_dict['cell']
-
+        self.assertEqual(self.controller.create.wsgi_code, 201)
         self.assertEqual(cell['name'], 'meow')
         self.assertEqual(cell['username'], 'fred')
         self.assertEqual(cell['rpc_host'], 'r3.example.org')
@@ -275,6 +275,40 @@ class CellsTest(test.TestCase):
         self.assertRaises(exc.HTTPBadRequest,
             self.controller.update, req, 'cell1', body)
 
+    def test_cell_update_without_type_specified(self):
+        body = {'cell': {'username': 'wingwj'}}
+
+        req = self._get_request("cells/cell1")
+        res_dict = self.controller.update(req, 'cell1', body)
+        cell = res_dict['cell']
+
+        self.assertEqual(cell['name'], 'cell1')
+        self.assertEqual(cell['rpc_host'], 'r1.example.org')
+        self.assertEqual(cell['username'], 'wingwj')
+        self.assertEqual(cell['type'], 'parent')
+
+    def test_cell_update_with_type_specified(self):
+        body1 = {'cell': {'username': 'wingwj', 'type': 'child'}}
+        body2 = {'cell': {'username': 'wingwj', 'type': 'parent'}}
+
+        req1 = self._get_request("cells/cell1")
+        res_dict1 = self.controller.update(req1, 'cell1', body1)
+        cell1 = res_dict1['cell']
+
+        req2 = self._get_request("cells/cell2")
+        res_dict2 = self.controller.update(req2, 'cell2', body2)
+        cell2 = res_dict2['cell']
+
+        self.assertEqual(cell1['name'], 'cell1')
+        self.assertEqual(cell1['rpc_host'], 'r1.example.org')
+        self.assertEqual(cell1['username'], 'wingwj')
+        self.assertEqual(cell1['type'], 'child')
+
+        self.assertEqual(cell2['name'], 'cell2')
+        self.assertEqual(cell2['rpc_host'], 'r2.example.org')
+        self.assertEqual(cell2['username'], 'wingwj')
+        self.assertEqual(cell2['type'], 'parent')
+
     def test_cell_info(self):
         caps = ['cap1=a;b', 'cap2=c;d']
         self.flags(name='darksecret', capabilities=caps, group='cells')
@@ -358,19 +392,20 @@ class CellsTest(test.TestCase):
         def sync_instances(self, context, **kwargs):
             call_info['project_id'] = kwargs.get('project_id')
             call_info['updated_since'] = kwargs.get('updated_since')
+            call_info['deleted'] = kwargs.get('deleted')
 
         self.stubs.Set(cells_rpcapi.CellsAPI, 'sync_instances', sync_instances)
 
         req = self._get_request("cells/sync_instances")
         body = {}
         self.controller.sync_instances(req, body=body)
-        self.assertEqual(call_info['project_id'], None)
-        self.assertEqual(call_info['updated_since'], None)
+        self.assertIsNone(call_info['project_id'])
+        self.assertIsNone(call_info['updated_since'])
 
         body = {'project_id': 'test-project'}
         self.controller.sync_instances(req, body=body)
         self.assertEqual(call_info['project_id'], 'test-project')
-        self.assertEqual(call_info['updated_since'], None)
+        self.assertIsNone(call_info['updated_since'])
 
         expected = timeutils.utcnow().isoformat()
         if not expected.endswith("+00:00"):
@@ -378,10 +413,32 @@ class CellsTest(test.TestCase):
 
         body = {'updated_since': expected}
         self.controller.sync_instances(req, body=body)
-        self.assertEqual(call_info['project_id'], None)
+        self.assertIsNone(call_info['project_id'])
         self.assertEqual(call_info['updated_since'], expected)
 
         body = {'updated_since': 'skjdfkjsdkf'}
+        self.assertRaises(exc.HTTPBadRequest,
+                self.controller.sync_instances, req, body=body)
+
+        body = {'deleted': False}
+        self.controller.sync_instances(req, body=body)
+        self.assertIsNone(call_info['project_id'])
+        self.assertIsNone(call_info['updated_since'])
+        self.assertEqual(call_info['deleted'], False)
+
+        body = {'deleted': 'False'}
+        self.controller.sync_instances(req, body=body)
+        self.assertIsNone(call_info['project_id'])
+        self.assertIsNone(call_info['updated_since'])
+        self.assertEqual(call_info['deleted'], False)
+
+        body = {'deleted': 'True'}
+        self.controller.sync_instances(req, body=body)
+        self.assertIsNone(call_info['project_id'])
+        self.assertIsNone(call_info['updated_since'])
+        self.assertEqual(call_info['deleted'], True)
+
+        body = {'deleted': 'foo'}
         self.assertRaises(exc.HTTPBadRequest,
                 self.controller.sync_instances, req, body=body)
 
@@ -389,87 +446,32 @@ class CellsTest(test.TestCase):
         self.assertRaises(exc.HTTPBadRequest,
                 self.controller.sync_instances, req, body=body)
 
+    def test_cells_disabled(self):
+        self.flags(enable=False, group='cells')
 
-class TestCellsXMLSerializer(test.TestCase):
-    def test_multiple_cells(self):
-        fixture = {'cells': fake_cells_api_get_all_cell_info()}
+        req = self._get_request("cells")
+        self.assertRaises(exc.HTTPNotImplemented,
+                self.controller.index, req)
 
-        serializer = cells_ext.CellsTemplate()
-        output = serializer.serialize(fixture)
-        res_tree = etree.XML(output)
+        req = self._get_request("cells/detail")
+        self.assertRaises(exc.HTTPNotImplemented,
+                self.controller.detail, req)
 
-        self.assertEqual(res_tree.tag, '{%s}cells' % xmlutil.XMLNS_V10)
-        self.assertEqual(len(res_tree), 2)
-        self.assertEqual(res_tree[0].tag, '{%s}cell' % xmlutil.XMLNS_V10)
-        self.assertEqual(res_tree[1].tag, '{%s}cell' % xmlutil.XMLNS_V10)
+        req = self._get_request("cells/cell1")
+        self.assertRaises(exc.HTTPNotImplemented,
+                self.controller.show, req)
 
-    def test_single_cell_with_caps(self):
-        cell = {'id': 1,
-                'name': 'darksecret',
-                'username': 'meow',
-                'capabilities': {'cap1': 'a;b',
-                                 'cap2': 'c;d'}}
-        fixture = {'cell': cell}
+        self.assertRaises(exc.HTTPNotImplemented,
+                self.controller.delete, req, 'cell999')
 
-        serializer = cells_ext.CellTemplate()
-        output = serializer.serialize(fixture)
-        res_tree = etree.XML(output)
+        req = self._get_request("cells/cells")
+        self.assertRaises(exc.HTTPNotImplemented,
+                self.controller.create, req, {})
 
-        self.assertEqual(res_tree.tag, '{%s}cell' % xmlutil.XMLNS_V10)
-        self.assertEqual(res_tree.get('name'), 'darksecret')
-        self.assertEqual(res_tree.get('username'), 'meow')
-        self.assertEqual(res_tree.get('password'), None)
-        self.assertEqual(len(res_tree), 1)
+        req = self._get_request("cells/capacities")
+        self.assertRaises(exc.HTTPNotImplemented,
+                self.controller.capacities, req)
 
-        child = res_tree[0]
-        self.assertEqual(child.tag,
-                '{%s}capabilities' % xmlutil.XMLNS_V10)
-        for elem in child:
-            self.assertIn(elem.tag, ('{%s}cap1' % xmlutil.XMLNS_V10,
-                                      '{%s}cap2' % xmlutil.XMLNS_V10))
-            if elem.tag == '{%s}cap1' % xmlutil.XMLNS_V10:
-                self.assertEqual(elem.text, 'a;b')
-            elif elem.tag == '{%s}cap2' % xmlutil.XMLNS_V10:
-                self.assertEqual(elem.text, 'c;d')
-
-    def test_single_cell_without_caps(self):
-        cell = {'id': 1,
-                'username': 'woof',
-                'name': 'darksecret'}
-        fixture = {'cell': cell}
-
-        serializer = cells_ext.CellTemplate()
-        output = serializer.serialize(fixture)
-        res_tree = etree.XML(output)
-
-        self.assertEqual(res_tree.tag, '{%s}cell' % xmlutil.XMLNS_V10)
-        self.assertEqual(res_tree.get('name'), 'darksecret')
-        self.assertEqual(res_tree.get('username'), 'woof')
-        self.assertEqual(res_tree.get('password'), None)
-        self.assertEqual(len(res_tree), 0)
-
-
-class TestCellsXMLDeserializer(test.TestCase):
-    def test_cell_deserializer(self):
-        caps_dict = {'cap1': 'a;b',
-                             'cap2': 'c;d'}
-        caps_xml = ("<capabilities><cap1>a;b</cap1>"
-                "<cap2>c;d</cap2></capabilities>")
-        expected = {'cell': {'name': 'testcell1',
-                             'type': 'child',
-                             'rpc_host': 'localhost',
-                             'capabilities': caps_dict}}
-        intext = ("<?xml version='1.0' encoding='UTF-8'?>\n"
-                "<cell><name>testcell1</name><type>child</type>"
-                        "<rpc_host>localhost</rpc_host>"
-                        "%s</cell>") % caps_xml
-        deserializer = cells_ext.CellDeserializer()
-        result = deserializer.deserialize(intext)
-        self.assertEqual(dict(body=expected), result)
-
-    def test_with_corrupt_xml(self):
-        deserializer = cells_ext.CellDeserializer()
-        self.assertRaises(
-                exception.MalformedRequestBody,
-                deserializer.deserialize,
-                utils.killer_xml_body())
+        req = self._get_request("cells/sync_instances")
+        self.assertRaises(exc.HTTPNotImplemented,
+                self.controller.sync_instances, req, {})

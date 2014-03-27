@@ -22,7 +22,7 @@ from nova.scheduler import filters
 LOG = logging.getLogger(__name__)
 
 disk_allocation_ratio_opt = cfg.FloatOpt("disk_allocation_ratio", default=1.0,
-                         help="virtual disk to physical disk allocation ratio")
+                         help="Virtual disk to physical disk allocation ratio")
 
 CONF = cfg.CONF
 CONF.register_opt(disk_allocation_ratio_opt)
@@ -34,8 +34,9 @@ class DiskFilter(filters.BaseHostFilter):
     def host_passes(self, host_state, filter_properties):
         """Filter based on disk usage."""
         instance_type = filter_properties.get('instance_type')
-        requested_disk = 1024 * (instance_type['root_gb'] +
-                                 instance_type['ephemeral_gb'])
+        requested_disk = (1024 * (instance_type['root_gb'] +
+                                 instance_type['ephemeral_gb']) +
+                         instance_type['swap'])
 
         free_disk_mb = host_state.free_disk_mb
         total_usable_disk_mb = host_state.total_usable_disk_gb * 1024

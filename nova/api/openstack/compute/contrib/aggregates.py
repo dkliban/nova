@@ -15,6 +15,8 @@
 
 """The Aggregate admin API extension."""
 
+import datetime
+
 from webob import exc
 
 from nova.api.openstack import extensions
@@ -22,6 +24,7 @@ from nova.compute import api as compute_api
 from nova import exception
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
+from nova import utils
 
 LOG = logging.getLogger(__name__)
 authorize = extensions.extension_authorizer('compute', 'aggregates')
@@ -52,10 +55,13 @@ class AggregateController(object):
         context = _get_context(req)
         authorize(context)
         aggregates = self.api.get_aggregate_list(context)
-        return {'aggregates': aggregates}
+        return {'aggregates': [self._marshall_aggregate(a)['aggregate']
+                               for a in aggregates]}
 
     def create(self, req, body):
-        """Creates an aggregate, given its name and availability_zone."""
+        """Creates an aggregate, given its name and
+        optional availability zone.
+        """
         context = _get_context(req)
         authorize(context)
 
@@ -64,15 +70,13 @@ class AggregateController(object):
         try:
             host_aggregate = body["aggregate"]
             name = host_aggregate["name"]
-            avail_zone = host_aggregate["availability_zone"]
         except KeyError:
             raise exc.HTTPBadRequest()
-
-        if len(name) == 0:
-            raise exc.HTTPBadRequest()
-
-        if len(host_aggregate) != 2:
-            raise exc.HTTPBadRequest()
+        avail_zone = host_aggregate.get("availability_zone")
+        try:
+            utils.check_string_length(name, "Aggregate name", 1, 255)
+        except exception.InvalidInput as e:
+            raise exc.HTTPBadRequest(explanation=e.format_message())
 
         try:
             aggregate = self.api.create_aggregate(context, name, avail_zone)
@@ -114,11 +118,22 @@ class AggregateController(object):
             if key not in ["name", "availability_zone"]:
                 raise exc.HTTPBadRequest()
 
+        if 'name' in updates:
+            try:
+                utils.check_string_length(updates['name'], "Aggregate name", 1,
+                                          255)
+            except exception.InvalidInput as e:
+                raise exc.HTTPBadRequest(explanation=e.format_message())
+
         try:
             aggregate = self.api.update_aggregate(context, id, updates)
+        except exception.AggregateNameExists as e:
+            raise exc.HTTPConflict(explanation=e.format_message())
         except exception.AggregateNotFound:
             LOG.info(_('Cannot update aggregate: %s'), id)
             raise exc.HTTPNotFound()
+        except exception.InvalidAggregateAction as e:
+            raise exc.HTTPBadRequest(explanation=e.format_message())
 
         return self._marshall_aggregate(aggregate)
 
@@ -139,11 +154,10 @@ class AggregateController(object):
             'set_metadata': self._set_metadata,
         }
         for action, data in body.iteritems():
-            try:
-                return _actions[action](req, id, data)
-            except KeyError:
+            if action not in _actions.keys():
                 msg = _('Aggregates does not have %s action') % action
                 raise exc.HTTPBadRequest(explanation=msg)
+            return _actions[action](req, id, data)
 
         raise exc.HTTPBadRequest(explanation=_("Invalid request body"))
 
@@ -201,11 +215,19 @@ class AggregateController(object):
             LOG.info(_('Cannot set metadata %(metadata)s in aggregate %(id)s'),
                      {'metadata': metadata, 'id': id})
             raise exc.HTTPNotFound()
+        except exception.InvalidAggregateAction as e:
+            raise exc.HTTPBadRequest(explanation=e.format_message())
 
         return self._marshall_aggregate(aggregate)
 
     def _marshall_aggregate(self, aggregate):
-        return {"aggregate": aggregate}
+        _aggregate = {}
+        for key, value in aggregate.items():
+            # NOTE(danms): The original API specified non-TZ-aware timestamps
+            if isinstance(value, datetime.datetime):
+                value = value.replace(tzinfo=None)
+            _aggregate[key] = value
+        return {"aggregate": _aggregate}
 
 
 class Aggregates(extensions.ExtensionDescriptor):
@@ -215,9 +237,6 @@ class Aggregates(extensions.ExtensionDescriptor):
     alias = "os-aggregates"
     namespace = "http://docs.openstack.org/compute/ext/aggregates/api/v1.1"
     updated = "2012-01-12T00:00:00+00:00"
-
-    def __init__(self, ext_mgr):
-        ext_mgr.register(self)
 
     def get_resources(self):
         resources = []

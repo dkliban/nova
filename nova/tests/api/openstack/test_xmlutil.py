@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -24,7 +22,7 @@ from nova import test
 from nova.tests import utils as tests_utils
 
 
-class SelectorTest(test.TestCase):
+class SelectorTest(test.NoDBTestCase):
     obj_for_test = {
         'test': {
             'name': 'test',
@@ -81,7 +79,7 @@ class SelectorTest(test.TestCase):
 
     def test_missing_key_selector(self):
         sel = xmlutil.Selector('test2', 'attrs')
-        self.assertEqual(sel(self.obj_for_test), None)
+        self.assertIsNone(sel(self.obj_for_test))
         self.assertRaises(KeyError, sel, self.obj_for_test, True)
 
     def test_constant_selector(self):
@@ -91,7 +89,7 @@ class SelectorTest(test.TestCase):
         self.assertEqual(repr(sel), "'Foobar'")
 
 
-class TemplateElementTest(test.TestCase):
+class TemplateElementTest(test.NoDBTestCase):
     def test_element_initial_attributes(self):
         # Create a template element with some attributes
         elem = xmlutil.TemplateElement('test', attrib=dict(a=1, b=2, c=3),
@@ -182,7 +180,7 @@ class TemplateElementTest(test.TestCase):
         # Create a template element with no subselector
         elem = xmlutil.TemplateElement('test')
 
-        self.assertEqual(elem.subselector, None)
+        self.assertIsNone(elem.subselector)
 
     def test_element_subselector_string(self):
         # Create a template element with a string subselector
@@ -215,7 +213,7 @@ class TemplateElementTest(test.TestCase):
         # Verify that the child was added
         self.assertEqual(len(elem), 1)
         self.assertEqual(elem[0], child)
-        self.assertEqual('child' in elem, True)
+        self.assertIn('child', elem)
         self.assertEqual(elem['child'], child)
 
         # Ensure that multiple children of the same name are rejected
@@ -243,7 +241,7 @@ class TemplateElementTest(test.TestCase):
         self.assertEqual(len(elem), 3)
         for idx in range(len(elem)):
             self.assertEqual(children[idx], elem[idx])
-            self.assertEqual(children[idx].tag in elem, True)
+            self.assertIn(children[idx].tag, elem)
             self.assertEqual(elem[children[idx].tag], children[idx])
 
         # Ensure that multiple children of the same name are rejected
@@ -285,7 +283,7 @@ class TemplateElementTest(test.TestCase):
         children.insert(1, child)
         for idx in range(len(elem)):
             self.assertEqual(children[idx], elem[idx])
-            self.assertEqual(children[idx].tag in elem, True)
+            self.assertIn(children[idx].tag, elem)
             self.assertEqual(elem[children[idx].tag], children[idx])
 
         # Ensure that multiple children of the same name are rejected
@@ -337,7 +335,7 @@ class TemplateElementTest(test.TestCase):
         elem = xmlutil.TemplateElement('test')
 
         # Ensure that it has no text
-        self.assertEqual(elem.text, None)
+        self.assertIsNone(elem.text)
 
         # Try setting it to a string and ensure it becomes a selector
         elem.text = 'test'
@@ -347,7 +345,7 @@ class TemplateElementTest(test.TestCase):
 
         # Try resetting the text to None
         elem.text = None
-        self.assertEqual(elem.text, None)
+        self.assertIsNone(elem.text)
 
         # Now make up a selector and try setting the text to that
         sel = xmlutil.Selector()
@@ -356,7 +354,7 @@ class TemplateElementTest(test.TestCase):
 
         # Finally, try deleting the text and see what happens
         del elem.text
-        self.assertEqual(elem.text, None)
+        self.assertIsNone(elem.text)
 
     def test_apply_attrs(self):
         # Create a template element
@@ -518,7 +516,7 @@ class TemplateElementTest(test.TestCase):
                          "<child !selector=Selector()/></test2>")
 
 
-class TemplateTest(test.TestCase):
+class TemplateTest(test.NoDBTestCase):
     def test_tree(self):
         elem = xmlutil.TemplateElement('test')
         tmpl = xmlutil.Template(elem)
@@ -708,6 +706,48 @@ class TemplateTest(test.TestCase):
         templ = xmlutil.Template(None)
         self.assertEqual(templ.serialize(None), '')
 
+    def test_serialize_with_colon_tagname_support(self):
+        # Our test object to serialize
+        obj = {'extra_specs': {'foo:bar': '999'}}
+        expected_xml = (("<?xml version='1.0' encoding='UTF-8'?>\n"
+                    '<extra_specs><foo:bar xmlns:foo="foo">999</foo:bar>'
+                    '</extra_specs>'))
+        # Set up our master template
+        root = xmlutil.TemplateElement('extra_specs', selector='extra_specs',
+                                       colon_ns=True)
+        value = xmlutil.SubTemplateElement(root, 'foo:bar', selector='foo:bar',
+                                           colon_ns=True)
+        value.text = xmlutil.Selector()
+        master = xmlutil.MasterTemplate(root, 1)
+        result = master.serialize(obj)
+        self.assertEqual(expected_xml, result)
+
+    def test__serialize_with_empty_datum_selector(self):
+        # Our test object to serialize
+        obj = {
+            'test': {
+                'name': 'foobar',
+                'image': ''
+                },
+            }
+
+        root = xmlutil.TemplateElement('test', selector='test',
+                                       name='name')
+        master = xmlutil.MasterTemplate(root, 1)
+        root_slave = xmlutil.TemplateElement('test', selector='test')
+        image = xmlutil.SubTemplateElement(root_slave, 'image',
+                                           selector='image')
+        image.set('id')
+        xmlutil.make_links(image, 'links')
+        slave = xmlutil.SlaveTemplate(root_slave, 1)
+        master.attach(slave)
+
+        siblings = master._siblings()
+        result = master._serialize(None, obj, siblings)
+        self.assertEqual(result.tag, 'test')
+        self.assertEqual(result[0].tag, 'image')
+        self.assertEqual(result[0].get('id'), str(obj['test']['image']))
+
 
 class MasterTemplateBuilder(xmlutil.TemplateBuilder):
     def construct(self):
@@ -721,16 +761,16 @@ class SlaveTemplateBuilder(xmlutil.TemplateBuilder):
         return xmlutil.SlaveTemplate(elem, 1)
 
 
-class TemplateBuilderTest(test.TestCase):
+class TemplateBuilderTest(test.NoDBTestCase):
     def test_master_template_builder(self):
         # Make sure the template hasn't been built yet
-        self.assertEqual(MasterTemplateBuilder._tmpl, None)
+        self.assertIsNone(MasterTemplateBuilder._tmpl)
 
         # Now, construct the template
         tmpl1 = MasterTemplateBuilder()
 
         # Make sure that there is a template cached...
-        self.assertNotEqual(MasterTemplateBuilder._tmpl, None)
+        self.assertIsNotNone(MasterTemplateBuilder._tmpl)
 
         # Make sure it wasn't what was returned...
         self.assertNotEqual(MasterTemplateBuilder._tmpl, tmpl1)
@@ -749,13 +789,13 @@ class TemplateBuilderTest(test.TestCase):
 
     def test_slave_template_builder(self):
         # Make sure the template hasn't been built yet
-        self.assertEqual(SlaveTemplateBuilder._tmpl, None)
+        self.assertIsNone(SlaveTemplateBuilder._tmpl)
 
         # Now, construct the template
         tmpl1 = SlaveTemplateBuilder()
 
         # Make sure there is a template cached...
-        self.assertNotEqual(SlaveTemplateBuilder._tmpl, None)
+        self.assertIsNotNone(SlaveTemplateBuilder._tmpl)
 
         # Make sure it was what was returned...
         self.assertEqual(SlaveTemplateBuilder._tmpl, tmpl1)
@@ -768,7 +808,7 @@ class TemplateBuilderTest(test.TestCase):
         self.assertEqual(tmpl1, tmpl2)
 
 
-class MiscellaneousXMLUtilTests(test.TestCase):
+class MiscellaneousXMLUtilTests(test.NoDBTestCase):
     def test_validate_schema(self):
         xml = '''<?xml version='1.0' encoding='UTF-8'?>
 <metadata xmlns="http://docs.openstack.org/compute/api/v1.1">
@@ -800,6 +840,54 @@ class MiscellaneousXMLUtilTests(test.TestCase):
         result = tmpl.serialize(dict(wrapper=dict(a='foo', b='bar')))
         self.assertEqual(result, expected_xml)
 
+    def test_make_flat_dict_with_colon_tagname_support(self):
+        # Our test object to serialize
+        obj = {'extra_specs': {'foo:bar': '999'}}
+        expected_xml = (("<?xml version='1.0' encoding='UTF-8'?>\n"
+                    '<extra_specs><foo:bar xmlns:foo="foo">999</foo:bar>'
+                    '</extra_specs>'))
+        # Set up our master template
+        root = xmlutil.make_flat_dict('extra_specs', colon_ns=True)
+        master = xmlutil.MasterTemplate(root, 1)
+        result = master.serialize(obj)
+        self.assertEqual(expected_xml, result)
+
+    def test_make_flat_dict_with_parent(self):
+        # Our test object to serialize
+        obj = {"device": {"id": 1,
+                          "extra_info": {"key1": "value1",
+                                         "key2": "value2"}}}
+
+        expected_xml = (("<?xml version='1.0' encoding='UTF-8'?>\n"
+                    '<device id="1"><extra_info><key2>value2</key2>'
+                    '<key1>value1</key1></extra_info></device>'))
+
+        root = xmlutil.TemplateElement('device', selector='device')
+        root.set('id')
+        extra = xmlutil.make_flat_dict('extra_info', root=root)
+        root.append(extra)
+        master = xmlutil.MasterTemplate(root, 1)
+        result = master.serialize(obj)
+        self.assertEqual(expected_xml, result)
+
+    def test_make_flat_dict_with_dicts(self):
+        # Our test object to serialize
+        obj = {"device": {"id": 1,
+                          "extra_info": {"key1": "value1",
+                                         "key2": "value2"}}}
+
+        expected_xml = (("<?xml version='1.0' encoding='UTF-8'?>\n"
+                    '<device><id>1</id><extra_info><key2>value2</key2>'
+                    '<key1>value1</key1></extra_info></device>'))
+
+        root = xmlutil.make_flat_dict('device', selector='device',
+                                      ignore_sub_dicts=True)
+        extra = xmlutil.make_flat_dict('extra_info', selector='extra_info')
+        root.append(extra)
+        master = xmlutil.MasterTemplate(root, 1)
+        result = master.serialize(obj)
+        self.assertEqual(expected_xml, result)
+
     def test_safe_parse_xml(self):
 
         normal_body = ('<?xml version="1.0" ?>'
@@ -815,7 +903,7 @@ class MiscellaneousXMLUtilTests(test.TestCase):
                           tests_utils.killer_xml_body())
 
 
-class SafeParserTestCase(test.TestCase):
+class SafeParserTestCase(test.NoDBTestCase):
     def test_external_dtd(self):
         xml_string = ("""<?xml version="1.0" encoding="utf-8"?>
                 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"

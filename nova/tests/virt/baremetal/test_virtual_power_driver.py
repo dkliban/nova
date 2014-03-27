@@ -1,4 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
 # coding=utf-8
 
 # Copyright 2012 Hewlett-Packard Development Company, L.P.
@@ -27,9 +26,9 @@ from nova.tests.image import fake as fake_image
 from nova.tests import utils
 from nova.tests.virt.baremetal.db import base as bm_db_base
 from nova.tests.virt.baremetal.db import utils as bm_db_utils
+from nova.virt.baremetal import common as connection
 from nova.virt.baremetal import db
 from nova.virt.baremetal import virtual_power_driver
-import nova.virt.powervm.common as connection
 
 CONF = cfg.CONF
 
@@ -40,7 +39,7 @@ COMMON_FLAGS = dict(
 
 BAREMETAL_FLAGS = dict(
     driver='nova.virt.baremetal.pxe.PXE',
-    instance_type_extra_specs=['cpu_arch:test', 'test_spec:test_value'],
+    flavor_extra_specs=['cpu_arch:test', 'test_spec:test_value'],
     power_manager=
         'nova.virt.baremetal.virtual_power_driver.VirtualPowerManager',
     vif_driver='nova.virt.baremetal.fake.FakeVifDriver',
@@ -139,7 +138,7 @@ class VPDClassMethodsTestCase(BareMetalVPDTestCase):
         self.assertEqual(self.pm.connection_data.host, '127.0.0.1')
         self.assertEqual(self.pm.connection_data.username, 'user')
         self.assertEqual(self.pm.connection_data.password, 'password')
-        self.assertEqual(self.pm.connection_data.keyfile, None)
+        self.assertIsNone(self.pm.connection_data.keyfile)
         self.mox.VerifyAll()
 
     def test_get_conn_success_key(self):
@@ -318,14 +317,9 @@ class VPDClassMethodsTestCase(BareMetalVPDTestCase):
         self._create_pm()
 
         self.mox.StubOutWithMock(self.pm, '_check_for_node')
-        self.mox.StubOutWithMock(self.pm, '_run_command')
-        self.pm._check_for_node().AndReturn(['"NotFoundNode"'])
-        self.pm._run_command(self.pm._vp_cmd.list_running_cmd).\
-                AndReturn(['"NotFoundNode"'])
-        self.pm._matched_name = 'testNode'
+        self.pm._check_for_node().AndReturn(None)
         self.mox.ReplayAll()
-        state = self.pm.is_power_on()
-        self.assertEqual(state, False)
+        self.assertRaises(exception.NodeNotFound, self.pm.is_power_on)
         self.mox.VerifyAll()
 
     def test_is_power_on_match_subname(self):

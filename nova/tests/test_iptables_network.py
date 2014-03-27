@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -21,7 +19,7 @@ from nova.network import linux_net
 from nova import test
 
 
-class IptablesManagerTestCase(test.TestCase):
+class IptablesManagerTestCase(test.NoDBTestCase):
 
     binary_name = linux_net.get_binary_name()
 

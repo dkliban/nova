@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 Cloudbase Solutions Srl
 # All Rights Reserved.
 #
@@ -59,7 +57,7 @@ class SnapshotOps(object):
         export_dir = None
 
         try:
-            src_vhd_path = self._pathutils.get_vhd_path(instance_name)
+            src_vhd_path = self._pathutils.lookup_root_vhd_path(instance_name)
 
             LOG.debug(_("Getting info for VHD %s"), src_vhd_path)
             src_base_disk_path = self._vhdutils.get_vhd_parent_path(
@@ -104,7 +102,7 @@ class SnapshotOps(object):
 
             LOG.debug(_("Updating Glance image %(name)s with content from "
                         "merged disk %(image_vhd_path)s"),
-                      {'image_id': name, 'image_vhd_path': image_vhd_path})
+                      {'name': name, 'image_vhd_path': image_vhd_path})
             update_task_state(task_state=task_states.IMAGE_UPLOADING,
                               expected_state=task_states.IMAGE_PENDING_UPLOAD)
             self._save_glance_image(context, name, image_vhd_path)

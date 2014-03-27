@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -15,12 +13,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import urlparse
+import six.moves.urllib.parse as urlparse
 import webob
 
 from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
-from nova.api.openstack import xmlutil
 import nova.context
 from nova import db
 from nova import exception
@@ -28,32 +25,25 @@ from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova.openstack.common import strutils
 from nova import quota
+from nova import utils
 
 
 ALIAS = "os-quota-sets"
 QUOTAS = quota.QUOTAS
 LOG = logging.getLogger(__name__)
+FILTERED_QUOTAS = ['injected_files', 'injected_file_content_bytes',
+                   'injected_file_path_bytes']
 authorize_update = extensions.extension_authorizer('compute',
                                                    'v3:%s:update' % ALIAS)
 authorize_show = extensions.extension_authorizer('compute',
                                                  'v3:%s:show' % ALIAS)
 authorize_delete = extensions.extension_authorizer('compute',
                                                    'v3:%s:delete' % ALIAS)
+authorize_detail = extensions.extension_authorizer('compute',
+                                                   'v3:%s:detail' % ALIAS)
 
 
-class QuotaTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('quota_set', selector='quota_set')
-        root.set('id')
-
-        for resource in QUOTAS.resources:
-            elem = xmlutil.SubTemplateElement(root, resource)
-            elem.text = resource
-
-        return xmlutil.MasterTemplate(root, 1)
-
-
-class QuotaSetsController(object):
+class QuotaSetsController(wsgi.Controller):
 
     def _format_quota_set(self, project_id, quota_set):
         """Convert the quota object to a result dict."""
@@ -67,10 +57,10 @@ class QuotaSetsController(object):
             raise webob.exc.HTTPBadRequest(explanation=msg)
         if ((limit < minimum) and
            (maximum != -1 or (maximum == -1 and limit != -1))):
-            msg = _("Quota limit must greater than %s.") % minimum
+            msg = _("Quota limit must be greater than %s.") % minimum
             raise webob.exc.HTTPBadRequest(explanation=msg)
         if maximum != -1 and limit > maximum:
-            msg = _("Quota limit must less than %s.") % maximum
+            msg = _("Quota limit must be less than %s.") % maximum
             raise webob.exc.HTTPBadRequest(explanation=msg)
 
     def _get_quotas(self, context, id, user_id=None, usages=False):
@@ -79,6 +69,8 @@ class QuotaSetsController(object):
                                             usages=usages)
         else:
             values = QUOTAS.get_project_quotas(context, id, usages=usages)
+        values = dict((k, v) for k, v in values.items() if k not in
+                      FILTERED_QUOTAS)
 
         if usages:
             return values
@@ -86,7 +78,6 @@ class QuotaSetsController(object):
             return dict((k, v['limit']) for k, v in values.items())
 
     @extensions.expected_errors(403)
-    @wsgi.serializers(xml=QuotaTemplate)
     def show(self, req, id):
         context = req.environ['nova.context']
         authorize_show(context)
@@ -99,8 +90,20 @@ class QuotaSetsController(object):
         except exception.NotAuthorized:
             raise webob.exc.HTTPForbidden()
 
+    @extensions.expected_errors(403)
+    def detail(self, req, id):
+        context = req.environ['nova.context']
+        authorize_detail(context)
+        user_id = req.GET.get('user_id', None)
+        try:
+            nova.context.authorize_project_context(context, id)
+            return self._format_quota_set(id, self._get_quotas(context, id,
+                                                               user_id=user_id,
+                                                               usages=True))
+        except exception.NotAuthorized:
+            raise webob.exc.HTTPForbidden()
+
     @extensions.expected_errors((400, 403))
-    @wsgi.serializers(xml=QuotaTemplate)
     def update(self, req, id, body):
         context = req.environ['nova.context']
         authorize_update(context)
@@ -111,20 +114,26 @@ class QuotaSetsController(object):
         bad_keys = []
         force_update = False
 
-        for key, value in body['quota_set'].items():
-            if key not in QUOTAS and key != 'force':
+        if not self.is_valid_body(body, 'quota_set'):
+            msg = _("quota_set not specified")
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+        quota_set = body['quota_set']
+
+        for key, value in quota_set.items():
+            if ((key not in QUOTAS or key in FILTERED_QUOTAS)
+                 and key != 'force'):
                 bad_keys.append(key)
                 continue
             if key == 'force':
                 force_update = strutils.bool_from_string(value)
             elif key != 'force' and value:
                 try:
-                    value = int(value)
-                except (ValueError, TypeError):
-                    msg = _("Quota '%(value)s' for %(key)s should be "
-                            "integer.") % {'value': value, 'key': key}
-                    LOG.warn(msg)
-                    raise webob.exc.HTTPBadRequest(explanation=msg)
+                    value = utils.validate_integer(
+                        value, key)
+                except exception.InvalidInput as e:
+                    LOG.warn(e.format_message())
+                    raise webob.exc.HTTPBadRequest(
+                        explanation=e.format_message())
 
         if len(bad_keys) > 0:
             msg = _("Bad key(s) %s in quota_set") % ",".join(bad_keys)
@@ -145,7 +154,7 @@ class QuotaSetsController(object):
         LOG.debug(_("Force update quotas: %s"), force_update)
 
         for key, value in body['quota_set'].iteritems():
-            if key == 'force' or not value:
+            if key == 'force' or (not value and value != 0):
                 continue
             # validate whether already used and reserved exceeds the new
             # quota, this check will be ignored if admin want to force
@@ -162,7 +171,7 @@ class QuotaSetsController(object):
                                'value': value})
                     if quota_used > value:
                         msg = (_("Quota value %(value)s for %(key)s are "
-                                "greater than already used and reserved "
+                                "less than already used and reserved "
                                 "%(quota_used)s") %
                                 {'value': value, 'key': key,
                                  'quota_used': quota_used})
@@ -183,11 +192,13 @@ class QuotaSetsController(object):
                                                            user_id=user_id))
 
     @extensions.expected_errors(())
-    @wsgi.serializers(xml=QuotaTemplate)
     def defaults(self, req, id):
         context = req.environ['nova.context']
         authorize_show(context)
-        return self._format_quota_set(id, QUOTAS.get_defaults(context))
+        values = QUOTAS.get_defaults(context)
+        values = dict((k, v) for k, v in values.items() if k not in
+                      FILTERED_QUOTAS)
+        return self._format_quota_set(id, values)
 
     @extensions.expected_errors(403)
     @wsgi.response(204)
@@ -212,7 +223,6 @@ class QuotaSets(extensions.V3APIExtensionBase):
 
     name = "Quotas"
     alias = ALIAS
-    namespace = "http://docs.openstack.org/compute/ext/os-quotas-sets/api/v3"
     version = 1
 
     def get_resources(self):
@@ -220,7 +230,8 @@ class QuotaSets(extensions.V3APIExtensionBase):
 
         res = extensions.ResourceExtension(ALIAS,
                                             QuotaSetsController(),
-                                            member_actions={'defaults': 'GET'})
+                                            member_actions={'defaults': 'GET',
+                                                            'detail': 'GET'})
         resources.append(res)
 
         return resources

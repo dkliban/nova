@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # Copyright 2011 Grid Dynamics
 # Copyright 2011 Eldar Nugaev, Kirill Shileev, Ilya Alekseyev
@@ -43,7 +41,8 @@ class ConsoleOutputController(wsgi.Controller):
         try:
             instance = self.compute_api.get(context, id)
         except exception.NotFound:
-            raise webob.exc.HTTPNotFound(_('Instance not found'))
+            msg = _('Instance not found')
+            raise webob.exc.HTTPNotFound(explanation=msg)
 
         try:
             length = body['os-getConsoleOutput'].get('length')
@@ -67,9 +66,13 @@ class ConsoleOutputController(wsgi.Controller):
                                                          instance,
                                                          length)
         except exception.NotFound:
-            raise webob.exc.HTTPNotFound(_('Unable to get console'))
+            msg = _('Unable to get console')
+            raise webob.exc.HTTPNotFound(explanation=msg)
         except exception.InstanceNotReady as e:
             raise webob.exc.HTTPConflict(explanation=e.format_message())
+        except NotImplementedError:
+            msg = _("Unable to get console log, functionality not implemented")
+            raise webob.exc.HTTPNotImplemented(explanation=msg)
 
         # XML output is not correctly escaped, so remove invalid characters
         remove_re = re.compile('[\x00-\x08\x0B-\x1F]')

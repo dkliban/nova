@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -18,6 +16,7 @@
 import uuid
 
 from oslo.config import cfg
+import six
 import webob
 
 from nova.api.openstack.compute import server_metadata
@@ -25,6 +24,7 @@ from nova.compute import rpcapi as compute_rpcapi
 from nova.compute import vm_states
 import nova.db
 from nova import exception
+from nova.objects import instance as instance_obj
 from nova.openstack.common import jsonutils
 from nova.openstack.common import timeutils
 from nova import test
@@ -43,8 +43,13 @@ def return_create_instance_metadata(context, server_id, metadata, delete):
     return stub_server_metadata()
 
 
+def fake_instance_save(inst, **kwargs):
+    inst.metadata = stub_server_metadata()
+    inst.obj_reset_changes()
+
+
 def return_server_metadata(context, server_id):
-    if not isinstance(server_id, str) or not len(server_id) == 36:
+    if not isinstance(server_id, six.string_types) or not len(server_id) == 36:
         msg = 'id %s must be a uuid in return server metadata' % server_id
         raise Exception(msg)
     return stub_server_metadata()
@@ -84,17 +89,20 @@ def return_server(context, server_id, columns_to_join=None):
            'vm_state': vm_states.ACTIVE})
 
 
-def return_server_by_uuid(context, server_uuid, columns_to_join=None):
+def return_server_by_uuid(context, server_uuid,
+                          columns_to_join=None, use_slave=False):
     return fake_instance.fake_db_instance(
         **{'id': 1,
            'uuid': '0cc3346e-9fef-4445-abe6-5d2b2690ec64',
            'name': 'fake',
            'locked': False,
            'launched_at': timeutils.utcnow(),
+           'metadata': stub_server_metadata(),
            'vm_state': vm_states.ACTIVE})
 
 
-def return_server_nonexistent(context, server_id, columns_to_join=None):
+def return_server_nonexistent(context, server_id,
+        columns_to_join=None, use_slave=False):
     raise exception.InstanceNotFound(instance_id=server_id)
 
 
@@ -180,7 +188,7 @@ class ServerMetaDataTest(BaseTest):
         req.method = 'DELETE'
         res = self.controller.delete(req, self.uuid, 'key2')
 
-        self.assertEqual(None, res)
+        self.assertIsNone(res)
 
     def test_delete_nonexistent_server(self):
         self.stubs.Set(nova.db, 'instance_get_by_uuid',
@@ -199,10 +207,7 @@ class ServerMetaDataTest(BaseTest):
                           self.controller.delete, req, self.uuid, 'key6')
 
     def test_create(self):
-        self.stubs.Set(nova.db, 'instance_metadata_get',
-                       return_server_metadata)
-        self.stubs.Set(nova.db, 'instance_metadata_update',
-                       return_create_instance_metadata)
+        self.stubs.Set(instance_obj.Instance, 'save', fake_instance_save)
         req = fakes.HTTPRequest.blank(self.url)
         req.method = 'POST'
         req.content_type = "application/json"
@@ -265,8 +270,7 @@ class ServerMetaDataTest(BaseTest):
                           self.controller.create, req, self.uuid, body)
 
     def test_update_metadata(self):
-        self.stubs.Set(nova.db, 'instance_metadata_update',
-                       return_create_instance_metadata)
+        self.stubs.Set(instance_obj.Instance, 'save', fake_instance_save)
         req = fakes.HTTPRequest.blank(self.url)
         req.method = 'POST'
         req.content_type = 'application/json'
@@ -281,8 +285,7 @@ class ServerMetaDataTest(BaseTest):
         self.assertEqual(expected, response)
 
     def test_update_all(self):
-        self.stubs.Set(nova.db, 'instance_metadata_update',
-                       return_create_instance_metadata)
+        self.stubs.Set(instance_obj.Instance, 'save', fake_instance_save)
         req = fakes.HTTPRequest.blank(self.url)
         req.method = 'PUT'
         req.content_type = "application/json"
@@ -298,8 +301,7 @@ class ServerMetaDataTest(BaseTest):
         self.assertEqual(expected, res_dict)
 
     def test_update_all_empty_container(self):
-        self.stubs.Set(nova.db, 'instance_metadata_update',
-                       return_create_instance_metadata)
+        self.stubs.Set(instance_obj.Instance, 'save', fake_instance_save)
         req = fakes.HTTPRequest.blank(self.url)
         req.method = 'PUT'
         req.content_type = "application/json"
@@ -345,8 +347,7 @@ class ServerMetaDataTest(BaseTest):
                           self.controller.update_all, req, '100', body)
 
     def test_update_item(self):
-        self.stubs.Set(nova.db, 'instance_metadata_update',
-                       return_create_instance_metadata)
+        self.stubs.Set(instance_obj.Instance, 'save', fake_instance_save)
         req = fakes.HTTPRequest.blank(self.url + '/key1')
         req.method = 'PUT'
         body = {"meta": {"key1": "value1"}}
@@ -496,6 +497,8 @@ class ServerMetaDataTest(BaseTest):
     def test_invalid_metadata_items_on_update_item(self):
         self.stubs.Set(nova.db, 'instance_metadata_update',
                        return_create_instance_metadata)
+        self.stubs.Set(nova.db, 'instance_metadata_update',
+                       return_create_instance_metadata)
         data = {"metadata": {}}
         for num in range(CONF.quota_metadata_items + 1):
             data['metadata']['key%i' % num] = "blah"
@@ -565,7 +568,7 @@ class BadStateServerMetaDataTest(BaseTest):
                'vm_state': vm_states.BUILDING})
 
     def _return_server_in_build_by_uuid(self, context, server_uuid,
-                                        columns_to_join=None):
+                                        columns_to_join=None, use_slave=False):
         return fake_instance.fake_db_instance(
             **{'id': 1,
                'uuid': '0cc3346e-9fef-4445-abe6-5d2b2690ec64',

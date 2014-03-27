@@ -105,6 +105,14 @@
             "updated": "%(timestamp)s"
         },
         {
+            "alias": "os-console-auth-tokens",
+            "description": "%(text)s",
+            "links": [],
+            "name": "ConsoleAuthTokens",
+            "namespace": "http://docs.openstack.org/compute/ext/consoles-auth-tokens/api/v2",
+            "updated": "%(timestamp)s"
+        },
+        {
             "alias": "OS-SCH-HNT",
             "description": "%(text)s",
             "links": [],
@@ -134,6 +142,14 @@
             "links": [],
             "name": "Agents",
             "namespace": "http://docs.openstack.org/compute/ext/agents/api/v2",
+            "updated": "%(timestamp)s"
+        },
+        {
+            "alias": "os-assisted-volume-snapshots",
+            "description": "%(text)s",
+            "links": [],
+            "name": "AssistedVolumeSnapshots",
+            "namespace": "http://docs.openstack.org/compute/ext/assisted-volume-snapshots/api/v2",
             "updated": "%(timestamp)s"
         },
         {
@@ -230,14 +246,6 @@
             "links": [],
             "name": "Consoles",
             "namespace": "http://docs.openstack.org/compute/ext/os-consoles/api/v2",
-            "updated": "%(timestamp)s"
-        },
-        {
-            "alias": "os-coverage",
-            "description": "%(text)s",
-            "links": [],
-            "name": "Coverage",
-            "namespace": "http://docs.openstack.org/compute/ext/coverage/api/v2",
             "updated": "%(timestamp)s"
         },
         {
@@ -401,6 +409,22 @@
             "updated": "%(timestamp)s"
         },
         {
+            "alias": "os-extended-hypervisors",
+            "description": "%(text)s",
+            "links": [],
+            "name": "ExtendedHypervisors",
+            "namespace": "http://docs.openstack.org/compute/ext/extended_hypervisors/api/v1.1",
+            "updated": "%(timestamp)s"
+        },
+        {
+            "alias": "os-server-external-events",
+            "description": "%(text)s",
+            "links": [],
+            "name": "ServerExternalEvents",
+            "namespace": "http://docs.openstack.org/compute/ext/server-external-events/api/v2",
+            "updated": "%(timestamp)s"
+        },
+        {
             "alias": "os-instance_usage_audit_log",
             "description": "%(text)s",
             "links": [],
@@ -446,14 +470,6 @@
             "links": [],
             "name": "NetworkAssociationSupport",
             "namespace": "http://docs.openstack.org/compute/ext/networks_associate/api/v2",
-            "updated": "%(timestamp)s"
-        },
-        {
-            "alias": "os-quota-class-sets",
-            "description": "%(text)s",
-            "links": [],
-            "name": "QuotaClasses",
-            "namespace": "http://docs.openstack.org/compute/ext/quota-classes-sets/api/v1.1",
             "updated": "%(timestamp)s"
         },
         {
@@ -606,6 +622,38 @@
             "links": [],
             "name": "Migrations",
             "namespace": "http://docs.openstack.org/compute/ext/migrations/api/v2.0",
+            "updated": "%(timestamp)s"
+        },
+        {
+            "alias": "os-baremetal-ext-status",
+            "description": "%(text)s",
+            "links": [],
+            "name": "BareMetalExtStatus",
+            "namespace": "http://docs.openstack.org/compute/ext/baremetal_ext_status/api/v2",
+            "updated": "%(timestamp)s"
+        },
+        {
+            "alias": "os-preserve-ephemeral-rebuild",
+            "description": "%(text)s",
+            "links": [],
+            "name": "PreserveEphemeralOnRebuild",
+            "namespace": "http://docs.openstack.org/compute/ext/preserve_ephemeral_rebuild/api/v2",
+            "updated": "%(timestamp)s"
+        },
+        {
+            "alias": "os-extended-services-delete",
+            "description": "%(text)s",
+            "links": [],
+            "name": "ExtendedServicesDelete",
+            "namespace": "http://docs.openstack.org/compute/ext/extended_services_delete/api/v2",
+            "updated": "%(timestamp)s"
+        },
+        {
+            "alias": "os-server-groups",
+            "description": "%(text)s",
+            "links": [],
+            "name": "ServerGroups",
+            "namespace": "http://docs.openstack.org/compute/ext/servergroups/api/v2",
             "updated": "%(timestamp)s"
         }
     ]

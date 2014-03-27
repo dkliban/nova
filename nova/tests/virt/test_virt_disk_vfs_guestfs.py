@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-#
 #    Copyright (C) 2012 Red Hat, Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -23,7 +21,7 @@ from nova.tests import fakeguestfs
 from nova.virt.disk.vfs import guestfs as vfsimpl
 
 
-class VirtDiskVFSGuestFSTest(test.TestCase):
+class VirtDiskVFSGuestFSTest(test.NoDBTestCase):
 
     def setUp(self):
         super(VirtDiskVFSGuestFSTest, self).setUp()
@@ -37,17 +35,20 @@ class VirtDiskVFSGuestFSTest(test.TestCase):
         vfs.setup()
 
         self.assertEqual(vfs.handle.running, True)
-        self.assertEqual(len(vfs.handle.mounts), 2)
+        self.assertEqual(len(vfs.handle.mounts), 3)
         self.assertEqual(vfs.handle.mounts[0][1],
                          "/dev/mapper/guestvgf-lv_root")
         self.assertEqual(vfs.handle.mounts[1][1], "/dev/vda1")
+        self.assertEqual(vfs.handle.mounts[2][1],
+                         "/dev/mapper/guestvgf-lv_home")
         self.assertEqual(vfs.handle.mounts[0][2], "/")
         self.assertEqual(vfs.handle.mounts[1][2], "/boot")
+        self.assertEqual(vfs.handle.mounts[2][2], "/home")
 
         handle = vfs.handle
         vfs.teardown()
 
-        self.assertEqual(vfs.handle, None)
+        self.assertIsNone(vfs.handle)
         self.assertEqual(handle.running, False)
         self.assertEqual(handle.closed, True)
         self.assertEqual(len(handle.mounts), 0)
@@ -92,7 +93,7 @@ class VirtDiskVFSGuestFSTest(test.TestCase):
         handle = vfs.handle
         vfs.teardown()
 
-        self.assertEqual(vfs.handle, None)
+        self.assertIsNone(vfs.handle)
         self.assertEqual(handle.running, False)
         self.assertEqual(handle.closed, True)
         self.assertEqual(len(handle.mounts), 0)
@@ -111,7 +112,7 @@ class VirtDiskVFSGuestFSTest(test.TestCase):
         handle = vfs.handle
         vfs.teardown()
 
-        self.assertEqual(vfs.handle, None)
+        self.assertIsNone(vfs.handle)
         self.assertEqual(handle.running, False)
         self.assertEqual(handle.closed, True)
         self.assertEqual(len(handle.mounts), 0)
@@ -122,8 +123,8 @@ class VirtDiskVFSGuestFSTest(test.TestCase):
         vfs.make_path("/some/dir")
         vfs.make_path("/other/dir")
 
-        self.assertTrue("/some/dir" in vfs.handle.files)
-        self.assertTrue("/other/dir" in vfs.handle.files)
+        self.assertIn("/some/dir", vfs.handle.files)
+        self.assertIn("/other/dir", vfs.handle.files)
         self.assertTrue(vfs.handle.files["/some/dir"]["isdir"])
         self.assertTrue(vfs.handle.files["/other/dir"]["isdir"])
 
@@ -134,7 +135,7 @@ class VirtDiskVFSGuestFSTest(test.TestCase):
         vfs.setup()
         vfs.append_file("/some/file", " Goodbye")
 
-        self.assertTrue("/some/file" in vfs.handle.files)
+        self.assertIn("/some/file", vfs.handle.files)
         self.assertEqual(vfs.handle.files["/some/file"]["content"],
                          "Hello World Goodbye")
 
@@ -145,7 +146,7 @@ class VirtDiskVFSGuestFSTest(test.TestCase):
         vfs.setup()
         vfs.replace_file("/some/file", "Goodbye")
 
-        self.assertTrue("/some/file" in vfs.handle.files)
+        self.assertIn("/some/file", vfs.handle.files)
         self.assertEqual(vfs.handle.files["/some/file"]["content"],
                          "Goodbye")
 
@@ -173,10 +174,10 @@ class VirtDiskVFSGuestFSTest(test.TestCase):
         vfs.setup()
         vfs.read_file("/some/file")
 
-        self.assertEquals(vfs.handle.files["/some/file"]["mode"], 0o700)
+        self.assertEqual(vfs.handle.files["/some/file"]["mode"], 0o700)
 
         vfs.set_permissions("/some/file", 0o7777)
-        self.assertEquals(vfs.handle.files["/some/file"]["mode"], 0o7777)
+        self.assertEqual(vfs.handle.files["/some/file"]["mode"], 0o7777)
 
         vfs.teardown()
 
@@ -185,19 +186,30 @@ class VirtDiskVFSGuestFSTest(test.TestCase):
         vfs.setup()
         vfs.read_file("/some/file")
 
-        self.assertEquals(vfs.handle.files["/some/file"]["uid"], 100)
-        self.assertEquals(vfs.handle.files["/some/file"]["gid"], 100)
+        self.assertEqual(vfs.handle.files["/some/file"]["uid"], 100)
+        self.assertEqual(vfs.handle.files["/some/file"]["gid"], 100)
 
         vfs.set_ownership("/some/file", "fred", None)
-        self.assertEquals(vfs.handle.files["/some/file"]["uid"], 105)
-        self.assertEquals(vfs.handle.files["/some/file"]["gid"], 100)
+        self.assertEqual(vfs.handle.files["/some/file"]["uid"], 105)
+        self.assertEqual(vfs.handle.files["/some/file"]["gid"], 100)
 
         vfs.set_ownership("/some/file", None, "users")
-        self.assertEquals(vfs.handle.files["/some/file"]["uid"], 105)
-        self.assertEquals(vfs.handle.files["/some/file"]["gid"], 500)
+        self.assertEqual(vfs.handle.files["/some/file"]["uid"], 105)
+        self.assertEqual(vfs.handle.files["/some/file"]["gid"], 500)
 
         vfs.set_ownership("/some/file", "joe", "admins")
-        self.assertEquals(vfs.handle.files["/some/file"]["uid"], 110)
-        self.assertEquals(vfs.handle.files["/some/file"]["gid"], 600)
+        self.assertEqual(vfs.handle.files["/some/file"]["uid"], 110)
+        self.assertEqual(vfs.handle.files["/some/file"]["gid"], 600)
 
+        vfs.teardown()
+
+    def test_close_on_error(self):
+        vfs = vfsimpl.VFSGuestFS(imgfile="/dummy.qcow2", imgfmt="qcow2")
+        vfs.setup()
+        self.assertFalse(vfs.handle.kwargs['close_on_exit'])
+        vfs.teardown()
+        self.stubs.Set(fakeguestfs.GuestFS, 'SUPPORT_CLOSE_ON_EXIT', False)
+        vfs = vfsimpl.VFSGuestFS(imgfile="/dummy.qcow2", imgfmt="qcow2")
+        vfs.setup()
+        self.assertNotIn('close_on_exit', vfs.handle.kwargs)
         vfs.teardown()
