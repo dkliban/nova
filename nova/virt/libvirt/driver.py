@@ -645,9 +645,9 @@ class LibvirtDriver(driver.ComputeDriver):
                         {'type': CONF.libvirt.virt_type, 'arch': arch})
 
     def init_host(self, host):
-        self._do_quality_warnings()
         libvirt.registerErrorHandler(libvirt_error_handler, None)
         libvirt.virEventRegisterDefaultImpl()
+        self._do_quality_warnings()
 
         if not self.has_min_version(MIN_LIBVIRT_VERSION):
             major = MIN_LIBVIRT_VERSION[0]
