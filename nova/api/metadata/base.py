@@ -30,11 +30,9 @@ from nova.compute import flavors
 from nova import conductor
 from nova import context
 from nova import network
+from nova import objects
 from nova.objects import base as obj_base
-from nova.objects import block_device as block_device_obj
-from nova.objects import instance as instance_obj
 from nova.objects import security_group as secgroup_obj
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
 from nova.openstack.common import timeutils
@@ -85,6 +83,8 @@ MD_JSON_NAME = "meta_data.json"
 VD_JSON_NAME = "vendor_data.json"
 UD_NAME = "user_data"
 PASS_NAME = "password"
+MIME_TYPE_TEXT_PLAIN = "text/plain"
+MIME_TYPE_APPLICATION_JSON = "application/json"
 
 LOG = logging.getLogger(__name__)
 
@@ -115,11 +115,16 @@ class InstanceMetadata():
         ctxt = context.get_admin_context()
 
         # NOTE(danms): This should be removed after bp:compute-manager-objects
-        if not isinstance(instance, instance_obj.Instance):
-            instance = instance_obj.Instance._from_db_object(
-                ctxt, instance_obj.Instance(), instance,
-                expected_attrs=['metadata', 'system_metadata'])
+        if not isinstance(instance, obj_base.NovaObject):
+            expected = ['metadata', 'system_metadata']
+            if 'info_cache' in instance:
+                expected.append('info_cache')
+            instance = objects.Instance._from_db_object(
+                ctxt, objects.Instance(), instance,
+                expected_attrs=expected)
 
+        # The default value of mimeType is set to MIME_TYPE_TEXT_PLAIN
+        self.set_mimetype(MIME_TYPE_TEXT_PLAIN)
         self.instance = instance
         self.extra_md = extra_md
 
@@ -158,8 +163,7 @@ class InstanceMetadata():
 
         # get network info, and the rendered network template
         if network_info is None:
-            network_info = network.API().get_instance_nw_info(ctxt,
-                                                              instance)
+            network_info = instance.info_cache.network_info
 
         self.ip_info = \
                 ec2utils.get_ip_info_for_instance_from_nw_info(network_info)
@@ -174,7 +178,7 @@ class InstanceMetadata():
                 'content_path': "/%s/%s" % (CONTENT_DIR, key)}
 
         # 'content' is passed in from the configdrive code in
-        # nova/virt/libvirt/driver.py.  Thats how we get the injected files
+        # nova/virt/libvirt/driver.py.  That's how we get the injected files
         # (personalities) in. AFAIK they're not stored in the db at all,
         # so are not available later (web service metadata time).
         for (path, contents) in content:
@@ -206,6 +210,12 @@ class InstanceMetadata():
 
         self.route_configuration = RouteConfiguration(path_handlers)
         return self.route_configuration
+
+    def set_mimetype(self, mime_type):
+        self.md_mimetype = mime_type
+
+    def get_mimetype(self):
+        return self.md_mimetype
 
     def get_ec2_metadata(self, version):
         if version == "latest":
@@ -317,6 +327,7 @@ class InstanceMetadata():
         if self._check_os_version(GRIZZLY, version):
             metadata['random_seed'] = base64.b64encode(os.urandom(512))
 
+        self.set_mimetype(MIME_TYPE_APPLICATION_JSON)
         return json.dumps(metadata)
 
     def _handle_content(self, path_tokens):
@@ -350,6 +361,7 @@ class InstanceMetadata():
 
     def _vendor_data(self, version, path):
         if self._check_os_version(HAVANA, version):
+            self.set_mimetype(MIME_TYPE_APPLICATION_JSON)
             return json.dumps(self.vddriver.get())
         raise KeyError(path)
 
@@ -370,6 +382,9 @@ class InstanceMetadata():
         else:
             path = posixpath.normpath(path)
 
+        # Set default mimeType. It will be modified only if there is a change
+        self.set_mimetype(MIME_TYPE_TEXT_PLAIN)
+
         # fix up requests, prepending /ec2 to anything that does not match
         path_tokens = path.split('/')[1:]
         if path_tokens[0] not in ("ec2", "openstack"):
@@ -389,7 +404,7 @@ class InstanceMetadata():
                 today = timeutils.utcnow().strftime("%Y-%m-%d")
                 versions = [v for v in OPENSTACK_VERSIONS if v <= today]
                 if OPENSTACK_VERSIONS != versions:
-                    LOG.debug(_("future versions %s hidden in version list"),
+                    LOG.debug("future versions %s hidden in version list",
                               [v for v in OPENSTACK_VERSIONS
                                if v not in versions])
                 versions += ["latest"]
@@ -503,12 +518,12 @@ def get_metadata_by_address(conductor_api, address):
 def get_metadata_by_instance_id(conductor_api, instance_id, address,
                                 ctxt=None):
     ctxt = ctxt or context.get_admin_context()
-    instance = instance_obj.Instance.get_by_uuid(ctxt, instance_id)
+    instance = objects.Instance.get_by_uuid(ctxt, instance_id)
     return InstanceMetadata(instance, address)
 
 
 def _format_instance_mapping(ctxt, instance):
-    bdms = block_device_obj.BlockDeviceMappingList.get_by_instance_uuid(
+    bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
             ctxt, instance.uuid)
     return block_device.instance_block_mapping(instance, bdms)
 

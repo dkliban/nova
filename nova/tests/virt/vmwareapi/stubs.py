@@ -51,31 +51,37 @@ def fake_temp_session_exception():
 
 def fake_session_file_exception():
     fault_list = [error_util.FILE_ALREADY_EXISTS]
-    raise error_util.VimFaultException(fault_list,
-                                       Exception('fake'))
+    raise error_util.VimFaultException(fault_list, 'fake')
+
+
+def fake_session_permission_exception():
+    fault_list = [error_util.NO_PERMISSION]
+    fault_string = 'Permission to perform this operation was denied.'
+    details = {'privilegeId': 'Resource.AssignVMToPool', 'object': 'domain-c7'}
+    raise error_util.VimFaultException(fault_list, fault_string, details)
 
 
 def set_stubs(stubs):
     """Set the stubs."""
     stubs.Set(network_util, 'get_network_with_the_name',
               fake.fake_get_network)
-    stubs.Set(vmware_images, 'fetch_image', fake.fake_fetch_image)
     stubs.Set(vmware_images, 'get_vmdk_size_and_properties',
               fake.fake_get_vmdk_size_and_properties)
-    stubs.Set(vmware_images, 'upload_image', fake.fake_upload_image)
     stubs.Set(driver.VMwareAPISession, "_get_vim_object",
               fake_get_vim_object)
     stubs.Set(driver.VMwareAPISession, "_is_vim_object",
               fake_is_vim_object)
 
 
-def fake_suds_context(calls={}):
+def fake_suds_context(calls=None):
     """Generate a suds client which automatically mocks all SOAP method calls.
 
     Calls are stored in <calls>, indexed by the name of the call. If you need
     to mock the behaviour of specific API calls you can pre-populate <calls>
     with appropriate Mock objects.
     """
+
+    calls = calls or {}
 
     class fake_factory:
         def create(self, name):

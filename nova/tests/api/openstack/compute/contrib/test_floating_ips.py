@@ -17,6 +17,7 @@
 import uuid
 
 from lxml import etree
+import mock
 import webob
 
 from nova.api.openstack.compute.contrib import floating_ips
@@ -368,7 +369,6 @@ class FloatingIpTest(test.TestCase):
         self.assertTrue(rsp.status_int == 202)
 
     def test_floating_ip_associate_invalid_instance(self):
-        fixed_address = '192.168.1.100'
 
         def fake_get(self, context, id, expected_attrs=None,
                      want_objects=False):
@@ -406,7 +406,8 @@ class FloatingIpTest(test.TestCase):
         def fake_associate_floating_ip(self, context, instance,
                               floating_address, fixed_address,
                               affect_auto_assigned=False):
-            raise exception.NotAuthorized()
+            raise exception.FloatingIpNotFoundForAddress(
+                address=floating_address)
         self.stubs.Set(network.api.API, "associate_floating_ip",
                        fake_associate_floating_ip)
         floating_ip = '10.10.10.11'
@@ -420,6 +421,15 @@ class FloatingIpTest(test.TestCase):
         self.assertEqual(resp.status_int, 404)
         self.assertEqual(res_dict['itemNotFound']['message'],
                        "floating ip not found")
+
+    @mock.patch.object(network.api.API, 'associate_floating_ip',
+                       side_effect=exception.Forbidden)
+    def test_associate_floating_ip_forbidden(self, associate_mock):
+        body = dict(addFloatingIp=dict(address='10.10.10.11'))
+        req = fakes.HTTPRequest.blank('/v2/fake/servers/test_inst/action')
+        self.assertRaises(webob.exc.HTTPForbidden,
+                          self.manager._add_floating_ip, req, 'test_inst',
+                          body)
 
     def test_floating_ip_disassociate(self):
         def get_instance_by_floating_ip_addr(self, context, address):
@@ -544,7 +554,7 @@ class FloatingIpTest(test.TestCase):
                 return 'test_inst'
 
         def network_api_disassociate(self, context, instance, address):
-            raise exception.NotAuthorized()
+            raise exception.Forbidden()
 
         self.stubs.Set(network.api.API, "get_floating_ip_by_address",
                        fake_get_floating_ip_addr_auto_assigned)

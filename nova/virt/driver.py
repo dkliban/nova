@@ -186,10 +186,10 @@ class ComputeDriver(object):
         """
         return len(self.list_instances())
 
-    def instance_exists(self, instance_id):
+    def instance_exists(self, instance):
         """Checks existence of an instance on the host.
 
-        :param instance_id: The ID / name of the instance to lookup
+        :param instance: The instance to lookup
 
         Returns True if an instance with the supplied ID exists on
         the host, False otherwise.
@@ -201,7 +201,10 @@ class ComputeDriver(object):
             encouraged to override this method with something more
             efficient.
         """
-        return instance_id in self.list_instances()
+        try:
+            return instance.uuid in self.list_instance_uuids()
+        except NotImplementedError:
+            return instance.name in self.list_instances()
 
     def estimate_instance_overhead(self, instance_info):
         """Estimate the virtualization overhead required to build an instance
@@ -645,10 +648,10 @@ class ComputeDriver(object):
         :param dest: destination host
         :param post_method:
             post operation method.
-            expected nova.compute.manager.post_live_migration.
+            expected nova.compute.manager._post_live_migration.
         :param recover_method:
             recovery method when any exception occurs.
-            expected nova.compute.manager.recover_live_migration.
+            expected nova.compute.manager._rollback_live_migration.
         :param block_migration: if true, migrate VM disk.
         :param migrate_data: implementation specific params.
 
@@ -1196,7 +1199,7 @@ class ComputeDriver(object):
         """
 
         if not self._compute_event_callback:
-            LOG.debug(_("Discarding event %s") % str(event))
+            LOG.debug("Discarding event %s", str(event))
             return
 
         if not isinstance(event, virtevent.Event):
@@ -1204,7 +1207,7 @@ class ComputeDriver(object):
                 _("Event must be an instance of nova.virt.event.Event"))
 
         try:
-            LOG.debug(_("Emitting event %s") % str(event))
+            LOG.debug("Emitting event %s", str(event))
             self._compute_event_callback(event)
         except Exception as ex:
             LOG.error(_("Exception dispatching event %(event)s: %(ex)s"),
@@ -1222,7 +1225,7 @@ class ComputeDriver(object):
     def need_legacy_block_device_info(self):
         """Tell the caller if the driver requires legacy block device info.
 
-        Tell the caller weather we expect the legacy format of block
+        Tell the caller whether we expect the legacy format of block
         device info to be passed in to methods that expect it.
         """
         return True

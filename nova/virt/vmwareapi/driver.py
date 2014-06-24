@@ -48,6 +48,9 @@ vmwareapi_opts = [
     cfg.StrOpt('host_ip',
                help='Hostname or IP address for connection to VMware ESX/VC '
                     'host.'),
+    cfg.IntOpt('host_port',
+               default=443,
+               help='Port for connection to VMware ESX/VC host.'),
     cfg.StrOpt('host_username',
                help='Username for connection to VMware ESX/VC host.'),
     cfg.StrOpt('host_password',
@@ -157,8 +160,7 @@ class VMwareESXDriver(driver.ComputeDriver):
         try:
             vim.client.service.Logout(session_manager)
         except suds.WebFault:
-            LOG.debug(_("No vSphere session was open during cleanup_host."))
-            pass
+            LOG.debug("No vSphere session was open during cleanup_host.")
 
     def list_instances(self):
         """List VM instances."""
@@ -182,6 +184,13 @@ class VMwareESXDriver(driver.ComputeDriver):
     def destroy(self, context, instance, network_info, block_device_info=None,
                 destroy_disks=True):
         """Destroy VM instance."""
+
+        # Destroy gets triggered when Resource Claim in resource_tracker
+        # is not successful. When resource claim is not successful,
+        # node is not set in instance. Perform destroy only if node is set
+        if not instance['node']:
+            return
+
         self._vmops.destroy(instance, network_info, destroy_disks)
 
     def cleanup(self, context, instance, network_info, block_device_info=None,
@@ -221,7 +230,7 @@ class VMwareESXDriver(driver.ComputeDriver):
     def power_on(self, context, instance, network_info,
                  block_device_info=None):
         """Power on the specified instance."""
-        self._vmops._power_on(instance)
+        self._vmops.power_on(instance)
 
     def resume_state_on_host_boot(self, context, instance, network_info,
                                   block_device_info=None):
@@ -473,7 +482,7 @@ class VMwareVCDriver(VMwareESXDriver):
         # In specific, vCenter does not actually run the VNC service
         # itself. You must talk to the VNC host underneath vCenter.
         _vmops = self._get_vmops_for_compute_node(instance['node'])
-        return _vmops.get_vnc_console_vcenter(instance)
+        return _vmops.get_vnc_console(instance)
 
     def _update_resources(self):
         """This method creates a dictionary of VMOps, VolumeOps and VCState.
@@ -600,7 +609,7 @@ class VMwareVCDriver(VMwareESXDriver):
             nodename = self._create_nodename(node,
                                           self.dict_mors.get(node)['name'])
             node_list.append(nodename)
-        LOG.debug(_("The available nodes are: %s") % node_list)
+        LOG.debug("The available nodes are: %s", node_list)
         return node_list
 
     def get_host_stats(self, refresh=True):
@@ -653,6 +662,13 @@ class VMwareVCDriver(VMwareESXDriver):
     def destroy(self, context, instance, network_info, block_device_info=None,
                 destroy_disks=True):
         """Destroy VM instance."""
+
+        # Destroy gets triggered when Resource Claim in resource_tracker
+        # is not successful. When resource claim is not successful,
+        # node is not set in instance. Perform destroy only if node is set
+        if not instance['node']:
+            return
+
         _vmops = self._get_vmops_for_compute_node(instance['node'])
         _vmops.destroy(instance, network_info, destroy_disks)
 
@@ -696,7 +712,7 @@ class VMwareVCDriver(VMwareESXDriver):
                  block_device_info=None):
         """Power on the specified instance."""
         _vmops = self._get_vmops_for_compute_node(instance['node'])
-        _vmops._power_on(instance)
+        _vmops.power_on(instance)
 
     def poll_rebooting_instances(self, timeout, instances):
         """Poll for rebooting instances."""
@@ -735,6 +751,14 @@ class VMwareVCDriver(VMwareESXDriver):
         """
         raise NotImplementedError()
 
+    def get_host_uptime(self, host):
+        """Host uptime operation not supported by VC driver."""
+
+        msg = _("Multiple hosts may be managed by the VMWare "
+                "vCenter driver; therefore we do not return "
+                "uptime for just one host.")
+        raise NotImplementedError(msg)
+
     def inject_network_info(self, instance, network_info):
         """inject network info for specified instance."""
         _vmops = self._get_vmops_for_compute_node(instance['node'])
@@ -766,11 +790,13 @@ class VMwareAPISession(object):
     """
 
     def __init__(self, host_ip=CONF.vmware.host_ip,
+                 host_port=CONF.vmware.host_port,
                  username=CONF.vmware.host_username,
                  password=CONF.vmware.host_password,
                  retry_count=CONF.vmware.api_retry_count,
                  scheme="https"):
         self._host_ip = host_ip
+        self._host_port = host_port
         self._host_username = username
         self._host_password = password
         self._api_retry_count = retry_count
@@ -781,7 +807,8 @@ class VMwareAPISession(object):
 
     def _get_vim_object(self):
         """Create the VIM Object instance."""
-        return vim.Vim(protocol=self._scheme, host=self._host_ip)
+        return vim.Vim(protocol=self._scheme, host=self._host_ip,
+                       port=self._host_port)
 
     def _create_session(self):
         """Creates a session with the VC/ESX host."""
@@ -837,7 +864,7 @@ class VMwareAPISession(object):
         except Exception as e:
             LOG.warning(_("Unable to validate session %s!"),
                         self._session.key)
-            LOG.debug(_("Exception: %(ex)s"), {'ex': e})
+            LOG.debug("Exception: %(ex)s", {'ex': e})
         return active
 
     def _call_method(self, module, method, *args, **kwargs):
@@ -885,7 +912,8 @@ class VMwareAPISession(object):
                     # errors. e.g, InvalidArgument fault.
                     # Raise specific exceptions here if possible
                     if excep.fault_list:
-                        raise error_util.get_fault_class(excep.fault_list[0])
+                        fault = excep.fault_list[0]
+                        raise error_util.get_fault_class(fault)(str(excep))
                     break
             except error_util.SessionOverLoadException as excep:
                 # For exceptions which may come because of session overload,
@@ -902,13 +930,13 @@ class VMwareAPISession(object):
                 exc = excep
                 break
 
-            LOG.debug(_("_call_method(session=%(key)s) failed. "
-                        "Module: %(module)s. "
-                        "Method: %(method)s. "
-                        "args: %(args)s. "
-                        "kwargs: %(kwargs)s. "
-                        "Iteration: %(n)s. "
-                        "Exception: %(ex)s. "),
+            LOG.debug("_call_method(session=%(key)s) failed. "
+                      "Module: %(module)s. "
+                      "Method: %(method)s. "
+                      "args: %(args)s. "
+                      "kwargs: %(kwargs)s. "
+                      "Iteration: %(n)s. "
+                      "Exception: %(ex)s. ",
                       {'key': self._session.key,
                        'module': module,
                        'method': method,
@@ -946,8 +974,6 @@ class VMwareAPISession(object):
         loop.start(CONF.vmware.task_poll_interval)
         try:
             ret_val = done.wait()
-        except Exception:
-            raise
         finally:
             self._stop_loop(loop)
         return ret_val
@@ -963,8 +989,8 @@ class VMwareAPISession(object):
             if task_info.state in ['queued', 'running']:
                 return
             elif task_info.state == 'success':
-                LOG.debug(_("Task [%(task_name)s] %(task_ref)s "
-                            "status: success"),
+                LOG.debug("Task [%(task_name)s] %(task_ref)s "
+                          "status: success",
                           {'task_name': task_name, 'task_ref': task_ref})
                 done.send(task_info)
             else:

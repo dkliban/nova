@@ -21,6 +21,7 @@ import string
 
 import mock
 from oslo.config import cfg
+import testtools
 
 from nova.compute import flavors
 from nova.compute import power_state
@@ -31,17 +32,19 @@ from nova import db
 from nova import exception
 from nova.image import glance
 from nova.network import api as network_api
+from nova import objects
 from nova.objects import block_device as block_device_obj
 from nova.objects import instance as instance_obj
 from nova.openstack.common import importutils
 from nova.openstack.common import jsonutils
+from nova.openstack.common import periodic_task
 from nova import rpc
 from nova import test
 from nova.tests import fake_block_device
 from nova.tests import fake_instance
-from nova.tests import fake_instance_actions
 from nova.tests import fake_network
 from nova.tests import fake_notifier
+from nova.tests import fake_server_actions
 import nova.tests.image.fake
 from nova.tests import matchers
 from nova.virt import driver
@@ -95,7 +98,7 @@ class ComputeValidateDeviceTestCase(test.TestCase):
                                             self.flavor.items()]
 
     def _validate_device(self, device=None):
-        bdms = block_device_obj.BlockDeviceMappingList.get_by_instance_uuid(
+        bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
                 self.context, self.instance['uuid'])
         return compute_utils.get_device_name_for_instance(
                 self.context, self.instance, bdms, device)
@@ -293,7 +296,7 @@ class DefaultDeviceNamesForInstanceTestCase(test.NoDBTestCase):
 
         self.patchers = []
         self.patchers.append(
-                mock.patch.object(block_device_obj.BlockDeviceMapping, 'save'))
+                mock.patch.object(objects.BlockDeviceMapping, 'save'))
         self.patchers.append(
                 mock.patch.object(
                     flavors, 'extract_flavor',
@@ -412,10 +415,11 @@ class UsageInfoTestCase(test.TestCase):
         self.stubs.Set(nova.tests.image.fake._FakeImageService,
                        'show', fake_show)
         fake_network.set_stub_network_methods(self.stubs)
-        fake_instance_actions.stub_out_action_events(self.stubs)
+        fake_server_actions.stub_out_action_events(self.stubs)
 
-    def _create_instance(self, params={}):
+    def _create_instance(self, params=None):
         """Create a test instance."""
+        params = params or {}
         flavor = flavors.get_flavor_by_name('m1.tiny')
         sys_meta = flavors.save_flavor_info({}, flavor)
         inst = {}
@@ -428,13 +432,14 @@ class UsageInfoTestCase(test.TestCase):
         inst['ami_launch_index'] = 0
         inst['root_gb'] = 0
         inst['ephemeral_gb'] = 0
+        inst['info_cache'] = {'network_info': '[]'}
         inst.update(params)
         return db.instance_create(self.context, inst)['id']
 
     def test_notify_usage_exists(self):
         # Ensure 'exists' notification generates appropriate usage data.
         instance_id = self._create_instance()
-        instance = instance_obj.Instance.get_by_id(self.context, instance_id)
+        instance = objects.Instance.get_by_id(self.context, instance_id)
         # Set some system metadata
         sys_metadata = {'image_md_key1': 'val1',
                         'image_md_key2': 'val2',
@@ -471,8 +476,8 @@ class UsageInfoTestCase(test.TestCase):
     def test_notify_usage_exists_deleted_instance(self):
         # Ensure 'exists' notification generates appropriate usage data.
         instance_id = self._create_instance()
-        instance = instance_obj.Instance.get_by_id(self.context, instance_id,
-                expected_attrs=['metadata', 'system_metadata'])
+        instance = objects.Instance.get_by_id(self.context, instance_id,
+                expected_attrs=['metadata', 'system_metadata', 'info_cache'])
         # Set some system metadata
         sys_metadata = {'image_md_key1': 'val1',
                         'image_md_key2': 'val2',
@@ -480,7 +485,7 @@ class UsageInfoTestCase(test.TestCase):
         instance.system_metadata.update(sys_metadata)
         instance.save()
         self.compute.terminate_instance(self.context, instance, [], [])
-        instance = instance_obj.Instance.get_by_id(
+        instance = objects.Instance.get_by_id(
                 self.context.elevated(read_deleted='yes'), instance_id,
                 expected_attrs=['system_metadata'])
         compute_utils.notify_usage_exists(
@@ -511,7 +516,7 @@ class UsageInfoTestCase(test.TestCase):
     def test_notify_usage_exists_instance_not_found(self):
         # Ensure 'exists' notification generates appropriate usage data.
         instance_id = self._create_instance()
-        instance = instance_obj.Instance.get_by_id(self.context, instance_id,
+        instance = objects.Instance.get_by_id(self.context, instance_id,
                 expected_attrs=['metadata', 'system_metadata', 'info_cache'])
         self.compute.terminate_instance(self.context, instance, [], [])
         compute_utils.notify_usage_exists(
@@ -540,7 +545,7 @@ class UsageInfoTestCase(test.TestCase):
 
     def test_notify_about_instance_usage(self):
         instance_id = self._create_instance()
-        instance = instance_obj.Instance.get_by_id(self.context, instance_id,
+        instance = objects.Instance.get_by_id(self.context, instance_id,
                 expected_attrs=['metadata', 'system_metadata', 'info_cache'])
         # Set some system metadata
         sys_metadata = {'image_md_key1': 'val1',
@@ -625,8 +630,8 @@ class ComputeGetImageMetadataTestCase(test.TestCase):
             "properties": {},
         }
 
-        self.image_service = nova.tests.image.fake._FakeImageService()
-        self.stubs.Set(self.image_service, 'show', self._fake_show)
+        self.mock_image_api = mock.Mock()
+        self.mock_image_api.get.return_value = self.image
 
         self.ctx = context.RequestContext('fake', 'fake')
 
@@ -653,28 +658,22 @@ class ComputeGetImageMetadataTestCase(test.TestCase):
 
     @property
     def instance_obj(self):
-        return instance_obj.Instance._from_db_object(
-            self.ctx, instance_obj.Instance(), self.instance,
+        return objects.Instance._from_db_object(
+            self.ctx, objects.Instance(), self.instance,
             expected_attrs=instance_obj.INSTANCE_DEFAULT_FIELDS)
-
-    def _fake_show(self, ctx, image_id):
-        return self.image
 
     def test_get_image_meta(self):
         image_meta = compute_utils.get_image_metadata(
-            self.ctx, self.image_service, 'fake-image', self.instance_obj)
+            self.ctx, self.mock_image_api, 'fake-image', self.instance_obj)
 
         self.image['properties'] = 'DONTCARE'
         self.assertThat(self.image, matchers.DictMatches(image_meta))
 
-    def test_get_image_meta_no_image(self):
-        def fake_show(ctx, image_id):
-            raise exception.ImageNotFound(image_id='fake-image')
-
-        self.stubs.Set(self.image_service, 'show', fake_show)
+    def _test_get_image_meta_exception(self, error):
+        self.mock_image_api.get.side_effect = error
 
         image_meta = compute_utils.get_image_metadata(
-            self.ctx, self.image_service, 'fake-image', self.instance_obj)
+            self.ctx, self.mock_image_api, 'fake-image', self.instance_obj)
 
         self.image['properties'] = 'DONTCARE'
         # NOTE(danms): The trip through system_metadata will stringify things
@@ -682,29 +681,44 @@ class ComputeGetImageMetadataTestCase(test.TestCase):
             self.image[key] = str(self.image[key])
         self.assertThat(self.image, matchers.DictMatches(image_meta))
 
+    def test_get_image_meta_no_image(self):
+        error = exception.ImageNotFound(image_id='fake-image')
+        self._test_get_image_meta_exception(error)
+
+    def test_get_image_meta_not_authorized(self):
+        error = exception.ImageNotAuthorized(image_id='fake-image')
+        self._test_get_image_meta_exception(error)
+
+    def test_get_image_meta_bad_request(self):
+        error = exception.Invalid()
+        self._test_get_image_meta_exception(error)
+
+    def test_get_image_meta_unexpected_exception(self):
+        error = test.TestingException()
+        with testtools.ExpectedException(test.TestingException):
+            self._test_get_image_meta_exception(error)
+
     def test_get_image_meta_no_image_system_meta(self):
         for k in self.instance['system_metadata'].keys():
             if k.startswith('image_'):
                 del self.instance['system_metadata'][k]
 
         image_meta = compute_utils.get_image_metadata(
-            self.ctx, self.image_service, 'fake-image', self.instance_obj)
+            self.ctx, self.mock_image_api, 'fake-image', self.instance_obj)
 
         self.image['properties'] = 'DONTCARE'
         self.assertThat(self.image, matchers.DictMatches(image_meta))
 
     def test_get_image_meta_no_image_no_image_system_meta(self):
-        def fake_show(ctx, image_id):
-            raise exception.ImageNotFound(image_id='fake-image')
-
-        self.stubs.Set(self.image_service, 'show', fake_show)
+        e = exception.ImageNotFound(image_id='fake-image')
+        self.mock_image_api.get.side_effect = e
 
         for k in self.instance['system_metadata'].keys():
             if k.startswith('image_'):
                 del self.instance['system_metadata'][k]
 
         image_meta = compute_utils.get_image_metadata(
-            self.ctx, self.image_service, 'fake-image', self.instance_obj)
+            self.ctx, self.mock_image_api, 'fake-image', self.instance_obj)
 
         expected = {'properties': 'DONTCARE'}
         self.assertThat(expected, matchers.DictMatches(image_meta))
@@ -747,3 +761,62 @@ class ComputeUtilsGetRebootTypes(test.TestCase):
     def test_get_reboot_not_running_hard(self):
         reboot_type = compute_utils.get_reboot_type('foo', 'bar')
         self.assertEqual(reboot_type, 'HARD')
+
+
+class ComputeUtilsPeriodicTaskSpacingWarning(test.NoDBTestCase):
+
+    @mock.patch.object(compute_utils, 'LOG')
+    def test_periodic_task_spacing_warning_no_op(self, mock_log):
+
+        @compute_utils.periodic_task_spacing_warn("config_value")
+        def not_a_periodic_task():
+            return "something"
+
+        self.assertEqual("something", not_a_periodic_task())
+        self.assertFalse(mock_log.warning.called)
+        self.assertFalse(mock_log.warn.called)
+
+    @mock.patch.object(compute_utils, 'LOG')
+    def test_periodic_task_spacing_warning_nonzero_spacing(self, mock_log):
+
+        @compute_utils.periodic_task_spacing_warn("config_value")
+        @periodic_task.periodic_task(spacing=10)
+        def a_periodic_task():
+            return "something"
+
+        self.assertEqual("something", a_periodic_task())
+        self.assertFalse(mock_log.warning.called)
+        self.assertFalse(mock_log.warn.called)
+
+    @mock.patch.object(compute_utils, 'LOG')
+    def test_periodic_task_spacing_warning_zero_spacing(self, mock_log):
+
+        @compute_utils.periodic_task_spacing_warn("config_value")
+        @periodic_task.periodic_task(spacing=0)
+        def zero_spacing_periodic_task():
+            return "something"
+
+        self.assertEqual("something", zero_spacing_periodic_task())
+        mock_log.warning.assert_called_with(mock.ANY, "config_value")
+
+    @mock.patch.object(compute_utils, 'LOG')
+    def test_periodic_task_spacing_warning_none_spacing(self, mock_log):
+
+        @compute_utils.periodic_task_spacing_warn("config_value")
+        @periodic_task.periodic_task(spacing=None)
+        def none_spacing_periodic_task():
+            return "something"
+
+        self.assertEqual("something", none_spacing_periodic_task())
+        mock_log.warning.assert_called_with(mock.ANY, "config_value")
+
+    @mock.patch.object(compute_utils, 'LOG')
+    def test_periodic_task_spacing_warning_default_spacing(self, mock_log):
+
+        @compute_utils.periodic_task_spacing_warn("config_value")
+        @periodic_task.periodic_task
+        def default_spacing_periodic_task():
+            return "something"
+
+        self.assertEqual("something", default_spacing_periodic_task())
+        mock_log.warning.assert_called_with(mock.ANY, "config_value")

@@ -241,6 +241,21 @@ class ComputeAPI(object):
         3.21 - Made rebuild take new-world BDM objects
         3.22 - Made terminate_instance take new-world BDM objects
         3.23 - Added external_instance_event()
+             - build_and_run_instance was added in Havana and not used or
+               documented.
+
+        ... Icehouse supports message version 3.23.  So, any changes to
+        existing methods in 3.x after that point should be done such that they
+        can handle the version_cap being set to 3.23.
+
+        3.24 - Update rescue_instance() to take optional rescue_image_ref
+        3.25 - Make detach_volume take an object
+        3.26 - Make live_migration() and
+               rollback_live_migration_at_destination() take an object
+        ...  - Removed run_instance()
+        3.27 - Make run_instance() accept a new-world object
+        3.28 - Update get_console_output() to accept a new-world object
+        3.29 - Make check_instance_shared_storage accept a new-world object
     '''
 
     VERSION_ALIASES = {
@@ -250,6 +265,7 @@ class ComputeAPI(object):
         # both havana and icehouse.  Later, 'icehouse' will be added that lists
         # the maximum version supported by icehouse.
         'icehouse-compat': '3.0',
+        'icehouse': '3.23',
     }
 
     def __init__(self):
@@ -369,13 +385,16 @@ class ComputeAPI(object):
                           dest_check_data=dest_check_data)
 
     def check_instance_shared_storage(self, ctxt, instance, data):
-        # NOTE(russellb) Havana compat
-        version = self._get_compat_version('3.0', '2.28')
-        instance_p = jsonutils.to_primitive(instance)
+        if self.client.can_send_version('3.29'):
+            version = '3.29'
+        else:
+            # NOTE(russellb) Havana compat
+            version = self._get_compat_version('3.0', '2.28')
+            instance = jsonutils.to_primitive(instance)
         cctxt = self.client.prepare(server=_compute_host(None, instance),
                 version=version)
         return cctxt.call(ctxt, 'check_instance_shared_storage',
-                          instance=instance_p,
+                          instance=instance,
                           data=data)
 
     def confirm_resize(self, ctxt, instance, migration, host,
@@ -402,13 +421,16 @@ class ComputeAPI(object):
                    instance=instance, port_id=port_id)
 
     def detach_volume(self, ctxt, instance, volume_id):
-        # NOTE(russellb) Havana compat
-        version = self._get_compat_version('3.0', '2.0')
-        instance_p = jsonutils.to_primitive(instance)
+        if self.client.can_send_version('3.25'):
+            version = '3.25'
+        else:
+            # NOTE(russellb) Havana compat
+            version = self._get_compat_version('3.0', '2.0')
+            instance = jsonutils.to_primitive(instance)
         cctxt = self.client.prepare(server=_compute_host(None, instance),
                 version=version)
         cctxt.cast(ctxt, 'detach_volume',
-                   instance=instance_p, volume_id=volume_id)
+                   instance=instance, volume_id=volume_id)
 
     def finish_resize(self, ctxt, instance, migration, image, disk_info,
             host, reservations=None):
@@ -429,13 +451,16 @@ class ComputeAPI(object):
                    reservations=reservations)
 
     def get_console_output(self, ctxt, instance, tail_length):
-        # NOTE(russellb) Havana compat
-        version = self._get_compat_version('3.0', '2.0')
-        instance_p = jsonutils.to_primitive(instance)
+        if self.client.can_send_version('3.28'):
+            version = '3.28'
+        else:
+            # NOTE(russellb) Havana compat
+            version = self._get_compat_version('3.0', '2.0')
+            instance = jsonutils.to_primitive(instance)
         cctxt = self.client.prepare(server=_compute_host(None, instance),
                 version=version)
         return cctxt.call(ctxt, 'get_console_output',
-                          instance=instance_p, tail_length=tail_length)
+                          instance=instance, tail_length=tail_length)
 
     def get_console_pool_info(self, ctxt, console_type, host):
         # NOTE(russellb) Havana compat
@@ -535,11 +560,14 @@ class ComputeAPI(object):
 
     def live_migration(self, ctxt, instance, dest, block_migration, host,
                        migrate_data=None):
-        # NOTE(russellb) Havana compat
-        version = self._get_compat_version('3.0', '2.0')
-        instance_p = jsonutils.to_primitive(instance)
+        if self.client.can_send_version('3.26'):
+            version = '3.26'
+        else:
+            # NOTE(russellb) Havana compat
+            version = self._get_compat_version('3.0', '2.0')
+            instance = jsonutils.to_primitive(instance)
         cctxt = self.client.prepare(server=host, version=version)
-        cctxt.cast(ctxt, 'live_migration', instance=instance_p,
+        cctxt.cast(ctxt, 'live_migration', instance=instance,
                    dest=dest, block_migration=block_migration,
                    migrate_data=migrate_data)
 
@@ -686,17 +714,21 @@ class ComputeAPI(object):
         return cctxt.call(ctxt, 'remove_volume_connection',
                           instance=instance_p, volume_id=volume_id)
 
-    def rescue_instance(self, ctxt, instance, rescue_password):
-        if self.client.can_send_version('3.9'):
+    def rescue_instance(self, ctxt, instance, rescue_password,
+                        rescue_image_ref=None):
+        instance = jsonutils.to_primitive(instance)
+        msg_args = {'rescue_password': rescue_password, 'instance': instance}
+        if self.client.can_send_version('3.24'):
+            version = '3.24'
+            msg_args['rescue_image_ref'] = rescue_image_ref
+        elif self.client.can_send_version('3.9'):
             version = '3.9'
         else:
             # NOTE(russellb) Havana compat
             version = self._get_compat_version('3.0', '2.44')
-            instance = jsonutils.to_primitive(instance)
         cctxt = self.client.prepare(server=_compute_host(None, instance),
                 version=version)
-        cctxt.cast(ctxt, 'rescue_instance', instance=instance,
-                   rescue_password=rescue_password)
+        cctxt.cast(ctxt, 'rescue_instance', **msg_args)
 
     def reset_network(self, ctxt, instance):
         # NOTE(russellb) Havana compat
@@ -735,13 +767,18 @@ class ComputeAPI(object):
                    reservations=reservations)
 
     def rollback_live_migration_at_destination(self, ctxt, instance, host):
-        # NOTE(russellb) Havana compat
-        version = self._get_compat_version('3.0', '2.0')
-        instance_p = jsonutils.to_primitive(instance)
+        if self.client.can_send_version('3.26'):
+            version = '3.26'
+        else:
+            # NOTE(russellb) Havana compat
+            version = self._get_compat_version('3.0', '2.0')
+            instance = jsonutils.to_primitive(instance)
         cctxt = self.client.prepare(server=host, version=version)
         cctxt.cast(ctxt, 'rollback_live_migration_at_destination',
-                   instance=instance_p)
+                   instance=instance)
 
+    # NOTE(alaski): Remove this method when the scheduler rpc interface is
+    # bumped to 4.x as the only callers of this method will be removed.
     def run_instance(self, ctxt, instance, host, request_spec,
                      filter_properties, requested_networks,
                      injected_files, admin_password,
@@ -967,6 +1004,21 @@ class ComputeAPI(object):
             version='3.23')
         cctxt.cast(ctxt, 'external_instance_event', instances=instances,
                    events=events)
+
+    def build_and_run_instance(self, ctxt, instance, host, image, request_spec,
+            filter_properties, admin_password=None, injected_files=None,
+            requested_networks=None, security_groups=None,
+            block_device_mapping=None, node=None, limits=None):
+        cctxt = self.client.prepare(server=host, version='3.23')
+        cctxt.cast(ctxt, 'build_and_run_instance', instance=instance,
+                image=image, request_spec=request_spec,
+                filter_properties=filter_properties,
+                admin_password=admin_password,
+                injected_files=injected_files,
+                requested_networks=requested_networks,
+                security_groups=security_groups,
+                block_device_mapping=block_device_mapping, node=node,
+                limits=limits)
 
 
 class SecurityGroupAPI(object):

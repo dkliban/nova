@@ -20,6 +20,7 @@ import base64
 import hashlib
 import hmac
 import json
+import mock
 import re
 
 try:
@@ -27,7 +28,6 @@ try:
 except ImportError:
     import pickle
 
-import mox
 from oslo.config import cfg
 import webob
 
@@ -47,6 +47,7 @@ from nova import test
 from nova.tests import fake_block_device
 from nova.tests import fake_instance
 from nova.tests import fake_network
+from nova.tests.objects import test_instance_info_cache
 from nova.tests.objects import test_security_group
 from nova.virt import netutils
 
@@ -71,7 +72,7 @@ INSTANCE = fake_instance.fake_db_instance(**
      'vcpus': 1,
      'fixed_ips': [],
      'root_device_name': '/dev/sda1',
-     'info_cache': {'network_info': []},
+     'info_cache': test_instance_info_cache.fake_info_cache,
      'hostname': 'test.novadomain',
      'display_name': 'my_displayname',
      'metadata': {},
@@ -82,7 +83,8 @@ INSTANCE = fake_instance.fake_db_instance(**
 def fake_inst_obj(context):
     return instance_obj.Instance._from_db_object(
         context, instance_obj.Instance(), INSTANCE,
-        expected_attrs=['metadata', 'system_metadata'])
+        expected_attrs=['metadata', 'system_metadata',
+                        'info_cache'])
 
 
 def get_default_sys_meta():
@@ -95,9 +97,10 @@ def return_non_existing_address(*args, **kwarg):
 
 
 def fake_InstanceMetadata(stubs, inst_data, address=None,
-                          sgroups=None, content=[], extra_md={},
+                          sgroups=None, content=None, extra_md=None,
                           vd_driver=None, network_info=None):
-
+    content = content or []
+    extra_md = extra_md or {}
     if sgroups is None:
         sgroups = [dict(test_security_group.fake_secgroup,
                         name='default')]
@@ -238,7 +241,7 @@ class MetadataTestCase(test.TestCase):
                     'swap': '/dev/sdc',
                     'ebs0': '/dev/sdh'}
 
-        capi = conductor_api.LocalAPI()
+        conductor_api.LocalAPI()
 
         self.assertEqual(base._format_instance_mapping(ctxt,
                          instance_ref0), block_device._DEFAULT_MAPPINGS)
@@ -309,12 +312,6 @@ class MetadataTestCase(test.TestCase):
 
     def test_InstanceMetadata_queries_network_API_when_needed(self):
         network_info_from_api = []
-
-        self.mox.StubOutWithMock(network_api.API, "get_instance_nw_info")
-
-        network_api.API.get_instance_nw_info(
-            mox.IgnoreArg(),
-            mox.IgnoreArg()).AndReturn(network_info_from_api)
 
         self.mox.StubOutWithMock(netutils, "get_injected_network_template")
 
@@ -505,7 +502,7 @@ class OpenStackMetadataTestCase(test.TestCase):
 
         self.assertEqual([], [k for k in mdjson.keys() if k.find("-") != -1])
 
-    def test_vendor_data_presense(self):
+    def test_vendor_data_presence(self):
         inst = self.instance.obj_clone()
         mdinst = fake_InstanceMetadata(self.stubs, inst)
 
@@ -596,10 +593,23 @@ class MetadataHandlerTestCase(test.TestCase):
 
     def test_version_root(self):
         response = fake_request(self.stubs, self.mdinst, "/2009-04-04")
+        response_ctype = response.headers['Content-Type']
+        self.assertTrue(response_ctype.startswith("text/plain"))
         self.assertEqual(response.body, 'meta-data/\nuser-data')
 
         response = fake_request(self.stubs, self.mdinst, "/9999-99-99")
         self.assertEqual(response.status_int, 404)
+
+    def test_json_data(self):
+        response = fake_request(self.stubs, self.mdinst,
+                                "/openstack/latest/meta_data.json")
+        response_ctype = response.headers['Content-Type']
+        self.assertTrue(response_ctype.startswith("application/json"))
+
+        response = fake_request(self.stubs, self.mdinst,
+                                "/openstack/latest/vendor_data.json")
+        response_ctype = response.headers['Content-Type']
+        self.assertTrue(response_ctype.startswith("application/json"))
 
     def test_user_data_non_existing_fixed_address(self):
         self.stubs.Set(network_api.API, 'get_fixed_ip_by_address',
@@ -636,6 +646,8 @@ class MetadataHandlerTestCase(test.TestCase):
                                 headers={'X-Forwarded-For': expected_addr})
 
         self.assertEqual(response.status_int, 200)
+        response_ctype = response.headers['Content-Type']
+        self.assertTrue(response_ctype.startswith("text/plain"))
         self.assertEqual(response.body,
                          base64.b64decode(self.instance['user_data']))
 
@@ -687,6 +699,8 @@ class MetadataHandlerTestCase(test.TestCase):
                      'X-Instance-ID-Signature': signed})
 
         self.assertEqual(response.status_int, 200)
+        response_ctype = response.headers['Content-Type']
+        self.assertTrue(response_ctype.startswith("text/plain"))
         self.assertEqual(response.body,
                          base64.b64decode(self.instance['user_data']))
 
@@ -782,21 +796,18 @@ class MetadataPasswordTestCase(test.TestCase):
         self.assertRaises(webob.exc.HTTPBadRequest,
                           password.handle_password, request, self.mdinst)
 
-    def _try_set_password(self, val='bar'):
+    @mock.patch('nova.objects.Instance.get_by_uuid')
+    def _try_set_password(self, get_by_uuid, val='bar'):
         request = webob.Request.blank('')
         request.method = 'POST'
         request.body = val
-        self.stubs.Set(db, 'instance_get_by_uuid',
-                       lambda *a, **kw: {'system_metadata': []})
+        get_by_uuid.return_value = self.instance
 
-        def fake_instance_update(context, uuid, updates):
-            self.assertIn('system_metadata', updates)
-            self.assertIn('password_0', updates['system_metadata'])
-            return self.instance, self.instance
+        with mock.patch.object(self.instance, 'save') as save:
+            password.handle_password(request, self.mdinst)
+            save.assert_called_once_with()
 
-        self.stubs.Set(db, 'instance_update_and_get_original',
-                       fake_instance_update)
-        password.handle_password(request, self.mdinst)
+        self.assertIn('password_0', self.instance.system_metadata)
 
     def test_set_password(self):
         self.mdinst.password = ''
@@ -811,4 +822,4 @@ class MetadataPasswordTestCase(test.TestCase):
         self.mdinst.password = ''
         self.assertRaises(webob.exc.HTTPBadRequest,
                           self._try_set_password,
-                          'a' * (password.MAX_SIZE + 1))
+                          val=('a' * (password.MAX_SIZE + 1)))

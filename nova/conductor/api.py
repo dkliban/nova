@@ -66,52 +66,20 @@ class LocalAPI(object):
         return self._manager.instance_update(context, instance_uuid,
                                              updates, 'compute')
 
-    def instance_get_by_uuid(self, context, instance_uuid,
-                             columns_to_join=None):
-        return self._manager.instance_get_by_uuid(context, instance_uuid,
-                columns_to_join)
-
-    def instance_destroy(self, context, instance):
-        return self._manager.instance_destroy(context, instance)
-
     def instance_get_all_by_host(self, context, host, columns_to_join=None):
         return self._manager.instance_get_all_by_host(
-            context, host, columns_to_join=columns_to_join)
+            context, host, None, columns_to_join=columns_to_join)
 
     def instance_get_all_by_host_and_node(self, context, host, node):
-        return self._manager.instance_get_all_by_host(context, host, node)
-
-    def instance_get_all_by_filters(self, context, filters,
-                                    sort_key='created_at',
-                                    sort_dir='desc',
-                                    columns_to_join=None, use_slave=False):
-        return self._manager.instance_get_all_by_filters(context,
-                                                         filters,
-                                                         sort_key,
-                                                         sort_dir,
-                                                         columns_to_join,
-                                                         use_slave)
-
-    def instance_get_active_by_window_joined(self, context, begin, end=None,
-                                             project_id=None, host=None):
-        return self._manager.instance_get_active_by_window_joined(
-            context, begin, end, project_id, host)
+        return self._manager.instance_get_all_by_host(context, host, node,
+                None)
 
     def instance_info_cache_delete(self, context, instance):
         return self._manager.instance_info_cache_delete(context, instance)
 
-    def instance_fault_create(self, context, values):
-        return self._manager.instance_fault_create(context, values)
-
     def migration_get_in_progress_by_host_and_node(self, context, host, node):
         return self._manager.migration_get_in_progress_by_host_and_node(
             context, host, node)
-
-    def aggregate_host_add(self, context, aggregate, host):
-        return self._manager.aggregate_host_add(context, aggregate, host)
-
-    def aggregate_host_delete(self, context, aggregate, host):
-        return self._manager.aggregate_host_delete(context, aggregate, host)
 
     def aggregate_metadata_get_by_host(self, context, host,
                                        key='availability_zone'):
@@ -120,7 +88,8 @@ class LocalAPI(object):
                                                             key)
 
     def bw_usage_get(self, context, uuid, start_period, mac):
-        return self._manager.bw_usage_update(context, uuid, mac, start_period)
+        return self._manager.bw_usage_update(context, uuid, mac, start_period,
+                None, None, None, None, None, False)
 
     def bw_usage_update(self, context, uuid, mac, start_period,
                         bw_in, bw_out, last_ctr_in, last_ctr_out,
@@ -151,7 +120,8 @@ class LocalAPI(object):
 
     def block_device_mapping_update_or_create(self, context, values):
         return self._manager.block_device_mapping_update_or_create(context,
-                                                                   values)
+                                                                   values,
+                                                                   create=None)
 
     def block_device_mapping_get_all_by_instance(self, context, instance,
                                                  legacy=True):
@@ -171,32 +141,31 @@ class LocalAPI(object):
                                               update_totals)
 
     def service_get_all(self, context):
-        return self._manager.service_get_all_by(context)
+        return self._manager.service_get_all_by(context, host=None, topic=None,
+                binary=None)
 
     def service_get_all_by_topic(self, context, topic):
-        return self._manager.service_get_all_by(context, topic=topic)
+        return self._manager.service_get_all_by(context, topic=topic,
+                host=None, binary=None)
 
     def service_get_all_by_host(self, context, host):
-        return self._manager.service_get_all_by(context, host=host)
+        return self._manager.service_get_all_by(context, host=host, topic=None,
+                binary=None)
 
     def service_get_by_host_and_topic(self, context, host, topic):
-        return self._manager.service_get_all_by(context, topic, host)
+        return self._manager.service_get_all_by(context, topic, host,
+                binary=None)
 
     def service_get_by_compute_host(self, context, host):
-        result = self._manager.service_get_all_by(context, 'compute', host)
+        result = self._manager.service_get_all_by(context, 'compute', host,
+                binary=None)
         # FIXME(comstud): A major revision bump to 2.0 should return a
         # single entry, so we should just return 'result' at that point.
         return result[0]
 
     def service_get_by_args(self, context, host, binary):
         return self._manager.service_get_all_by(context, host=host,
-                                                binary=binary)
-
-    def action_event_start(self, context, values):
-        return self._manager.action_event_start(context, values)
-
-    def action_event_finish(self, context, values):
-        return self._manager.action_event_finish(context, values)
+                                                binary=binary, topic=None)
 
     def service_create(self, context, values):
         return self._manager.service_create(context, values)
@@ -248,33 +217,8 @@ class LocalAPI(object):
         return self._manager.security_groups_trigger_members_refresh(context,
                                                                      group_ids)
 
-    def network_migrate_instance_start(self, context, instance, migration):
-        return self._manager.network_migrate_instance_start(context,
-                                                            instance,
-                                                            migration)
-
-    def network_migrate_instance_finish(self, context, instance, migration):
-        return self._manager.network_migrate_instance_finish(context,
-                                                             instance,
-                                                             migration)
-
-    def quota_commit(self, context, reservations, project_id=None,
-                     user_id=None):
-        return self._manager.quota_commit(context, reservations,
-                                          project_id=project_id,
-                                          user_id=user_id)
-
-    def quota_rollback(self, context, reservations, project_id=None,
-                       user_id=None):
-        return self._manager.quota_rollback(context, reservations,
-                                            project_id=project_id,
-                                            user_id=user_id)
-
     def get_ec2_ids(self, context, instance):
         return self._manager.get_ec2_ids(context, instance)
-
-    def compute_unrescue(self, context, instance):
-        return self._manager.compute_unrescue(context, instance)
 
     def object_backport(self, context, objinst, target_version):
         return self._manager.object_backport(context, objinst, target_version)

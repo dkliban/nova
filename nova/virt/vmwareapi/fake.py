@@ -43,7 +43,7 @@ LOG = logging.getLogger(__name__)
 
 def log_db_contents(msg=None):
     """Log DB Contents."""
-    LOG.debug(_("%(text)s: _db_content => %(content)s"),
+    LOG.debug("%(text)s: _db_content => %(content)s",
               {'text': msg or "", 'content': pprint.pformat(_db_content)})
 
 
@@ -265,7 +265,7 @@ class DataObject(object):
 
 
 class HostInternetScsiHba(DataObject):
-    """iSCSI Host Bus Adapter"""
+    """iSCSI Host Bus Adapter."""
 
     def __init__(self):
         super(HostInternetScsiHba, self).__init__()
@@ -441,6 +441,21 @@ class VirtualMachine(ManagedObject):
         """Called to reconfigure the VM. Actually customizes the property
         setting of the Virtual Machine object.
         """
+
+        if hasattr(val, 'name') and val.name:
+            self.set("name", val.name)
+
+        if hasattr(val, 'extraConfig'):
+            extraConfigs = _merge_extraconfig(
+                                    self.get("config.extraConfig").OptionValue,
+                                    val.extraConfig)
+            self.get("config.extraConfig").OptionValue = extraConfigs
+
+        if hasattr(val, 'instanceUuid') and val.instanceUuid is not None:
+            if val.instanceUuid == "":
+                val.instanceUuid = uuidutils.generate_uuid()
+            self.set("summary.config.instanceUuid", val.instanceUuid)
+
         try:
             if not hasattr(val, 'deviceChange'):
                 return
@@ -466,8 +481,7 @@ class VirtualMachine(ManagedObject):
             self.set("config.hardware.device", [disk, controller,
                                                   self.device[0]])
         except AttributeError:
-            # Case of Reconfig of VM to set extra params
-            self.set("config.extraConfig", val.extraConfig)
+            pass
 
 
 class Network(ManagedObject):
@@ -640,7 +654,8 @@ class HostStorageSystem(ManagedObject):
 class HostSystem(ManagedObject):
     """Host System class."""
 
-    def __init__(self, name="ha-host", connected=True, ds_ref=None):
+    def __init__(self, name="ha-host", connected=True, ds_ref=None,
+                 maintenance_mode=False):
         super(HostSystem, self).__init__("host")
         self.set("name", name)
         if _db_content.get("HostNetworkSystem", None) is None:
@@ -675,6 +690,9 @@ class HostSystem(ManagedObject):
             runtime.connectionState = "connected"
         else:
             runtime.connectionState = "disconnected"
+
+        runtime.inMaintenanceMode = maintenance_mode
+
         summary.runtime = runtime
 
         quickstats = DataObject()
@@ -695,7 +713,6 @@ class HostSystem(ManagedObject):
 
         self.set("summary", summary)
         self.set("capability.maxHostSupportedVcpus", 600)
-        self.set("summary.runtime.inMaintenanceMode", False)
         self.set("summary.hardware", hardware)
         self.set("summary.runtime", runtime)
         self.set("config.network.pnic", net_info_pnic)
@@ -810,8 +827,11 @@ class Datacenter(ManagedObject):
         network_do = DataObject()
         network_do.ManagedObjectReference = [net_ref]
         self.set("network", network_do)
-        datastore = DataObject()
-        datastore.ManagedObjectReference = [ds_ref]
+        if ds_ref:
+            datastore = DataObject()
+            datastore.ManagedObjectReference = [ds_ref]
+        else:
+            datastore = None
         self.set("datastore", datastore)
 
 
@@ -929,14 +949,6 @@ def get_file(file_path):
     return file_path in _db_content.get("files")
 
 
-def fake_fetch_image(context, image, instance, **kwargs):
-    """Fakes fetch image call. Just adds a reference to the db for the file."""
-    ds_name = kwargs.get("datastore_name")
-    file_path = kwargs.get("file_path")
-    ds_file_path = "[" + ds_name + "] " + file_path
-    _add_file(ds_file_path)
-
-
 def fake_upload_image(context, image, instance, **kwargs):
     """Fakes the upload of an image."""
     pass
@@ -957,6 +969,19 @@ def _get_vm_mdo(vm_ref):
         raise exception.NotFound(_("Virtual Machine with ref %s is not "
                         "there") % vm_ref)
     return _db_content.get("VirtualMachine")[vm_ref]
+
+
+def _merge_extraconfig(existing, changes):
+    """Imposes the changes in extraConfig over the existing extraConfig."""
+    existing = existing or []
+    if (changes):
+        for c in changes:
+            if len([x for x in existing if x.key == c.key]) > 0:
+                extraConf = [x for x in existing if x.key == c.key][0]
+                extraConf.value = c.value
+            else:
+                existing.append(c)
+    return existing
 
 
 class FakeFactory(object):
@@ -1039,7 +1064,7 @@ class FakeVim(object):
         """Checks if the session is active."""
         if (self._session is None or self._session not in
                  _db_content['session']):
-            LOG.debug(_("Session is faulty"))
+            LOG.debug("Session is faulty")
             raise error_util.VimFaultException(
                                [error_util.NOT_AUTHENTICATED],
                                _("Session Invalid"))
@@ -1071,7 +1096,7 @@ class FakeVim(object):
         _create_object("VirtualMachine", virtual_machine)
         res_pool = _get_object(pool)
         res_pool.vm.ManagedObjectReference.append(virtual_machine.obj)
-        task_mdo = create_task(method, "success")
+        task_mdo = create_task(method, "success", result=virtual_machine.obj)
         return task_mdo.obj
 
     def _reconfig_vm(self, method, *args, **kwargs):
@@ -1142,7 +1167,37 @@ class FakeVim(object):
 
     def _clone_vm(self, method, *args, **kwargs):
         """Fakes a VM clone."""
-        return self._just_return_task(method)
+        """Creates and registers a VM object with the Host System."""
+        source_vmref = args[0]
+        source_vm_mdo = _get_vm_mdo(source_vmref)
+        clone_spec = kwargs.get("spec")
+        vm_dict = {
+         "name": kwargs.get("name"),
+         "ds": source_vm_mdo.get("datastore"),
+         "runtime_host": source_vm_mdo.get("runtime.host"),
+         "powerstate": source_vm_mdo.get("runtime.powerState"),
+         "vmPathName": source_vm_mdo.get("config.files.vmPathName"),
+         "numCpu": source_vm_mdo.get("summary.config.numCpu"),
+         "mem": source_vm_mdo.get("summary.config.memorySizeMB"),
+         "extra_config": source_vm_mdo.get("config.extraConfig").OptionValue,
+         "virtual_device": source_vm_mdo.get("config.hardware.device"),
+         "instanceUuid": source_vm_mdo.get("summary.config.instanceUuid")}
+
+        if clone_spec.config is not None:
+            # Impose the config changes specified in the config property
+            if (hasattr(clone_spec.config, 'instanceUuid') and
+               clone_spec.config.instanceUuid is not None):
+                vm_dict["instanceUuid"] = clone_spec.config.instanceUuid
+
+            if hasattr(clone_spec.config, 'extraConfig'):
+                extraConfigs = _merge_extraconfig(vm_dict["extra_config"],
+                                                clone_spec.config.extraConfig)
+                vm_dict["extra_config"] = extraConfigs
+
+        virtual_machine = VirtualMachine(**vm_dict)
+        _create_object("VirtualMachine", virtual_machine)
+        task_mdo = create_task(method, "success")
+        return task_mdo.obj
 
     def _unregister_vm(self, method, *args, **kwargs):
         """Unregisters a VM from the Host System."""
@@ -1210,6 +1265,13 @@ class FakeVim(object):
         task_mdo = create_task(method, "success")
         return task_mdo.obj
 
+    def fake_transfer_file(self, ds_name, file_path):
+        """Fakes fetch image call.
+        Just adds a reference to the db for the file.
+        """
+        ds_file_path = "[" + ds_name + "] " + file_path
+        _add_file(ds_file_path)
+
     def _make_dir(self, method, *args, **kwargs):
         """Creates a directory in the datastore."""
         ds_path = kwargs.get("name")
@@ -1243,7 +1305,7 @@ class FakeVim(object):
     def _retrieve_properties(self, method, *args, **kwargs):
         """Retrieves properties based on the type."""
         spec_set = kwargs.get("specSet")[0]
-        type = spec_set.propSet[0].type
+        spec_type = spec_set.propSet[0].type
         properties = spec_set.propSet[0].pathSet
         if not isinstance(properties, list):
             properties = properties.split()
@@ -1256,8 +1318,8 @@ class FakeVim(object):
                     # This means that we are retrieving props for all managed
                     # data objects of the specified 'type' in the entire
                     # inventory. This gets invoked by vim_util.get_objects.
-                    mdo_refs = _db_content[type]
-                elif obj_ref.type != type:
+                    mdo_refs = _db_content[spec_type]
+                elif obj_ref.type != spec_type:
                     # This means that we are retrieving props for the managed
                     # data objects in the parent object's 'path' property.
                     # This gets invoked by vim_util.get_inner_objects
@@ -1276,7 +1338,7 @@ class FakeVim(object):
                     mdo_refs = [obj_ref]
 
                 for mdo_ref in mdo_refs:
-                    mdo = _db_content[type][mdo_ref]
+                    mdo = _db_content[spec_type][mdo_ref]
                     prop_list = []
                     for prop_name in properties:
                         prop = Prop(prop_name, mdo.get(prop_name))

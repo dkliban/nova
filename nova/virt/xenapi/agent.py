@@ -25,7 +25,6 @@ from oslo.config import cfg
 
 from nova.api.metadata import password
 from nova.compute import utils as compute_utils
-from nova import conductor
 from nova import context
 from nova import crypto
 from nova import exception
@@ -49,25 +48,17 @@ LOG = logging.getLogger(__name__)
 xenapi_agent_opts = [
     cfg.IntOpt('agent_timeout',
                default=30,
-               deprecated_name='agent_timeout',
-               deprecated_group='DEFAULT',
                help='Number of seconds to wait for agent reply'),
     cfg.IntOpt('agent_version_timeout',
                default=300,
-               deprecated_name='agent_version_timeout',
-               deprecated_group='DEFAULT',
                help='Number of seconds to wait for agent '
                     'to be fully operational'),
     cfg.IntOpt('agent_resetnetwork_timeout',
-               deprecated_name='agent_resetnetwork_timeout',
-               deprecated_group='DEFAULT',
                default=60,
                help='Number of seconds to wait for agent reply '
                     'to resetnetwork request'),
     cfg.StrOpt('agent_path',
                default='usr/sbin/xe-update-networking',
-               deprecated_name='xenapi_agent_path',
-               deprecated_group='DEFAULT',
                help='Specifies the path in which the XenAPI guest agent '
                     'should be located. If the agent is present, network '
                     'configuration is not injected into the image. '
@@ -75,14 +66,10 @@ xenapi_agent_opts = [
                     'flat_injected=True'),
     cfg.BoolOpt('disable_agent',
                 default=False,
-                deprecated_name='xenapi_disable_agent',
-                deprecated_group='DEFAULT',
                 help='Disables the use of the XenAPI agent in any image '
                      'regardless of what image properties are present.'),
     cfg.BoolOpt('use_agent_default',
                 default=False,
-                deprecated_name='xenapi_use_agent_default',
-                deprecated_group='DEFAULT',
                 help='Determines if the XenAPI agent should be used when '
                      'the image used does not contain a hint to declare if '
                      'the agent is present or not. '
@@ -93,7 +80,6 @@ xenapi_agent_opts = [
 ]
 
 CONF = cfg.CONF
-# xenapi_agent options in the DEFAULT group were deprecated in Icehouse
 CONF.register_opts(xenapi_agent_opts, 'xenserver')
 
 
@@ -155,8 +141,8 @@ def _call_agent(session, instance, vm_ref, method, addl_args=None,
                   instance=instance)
         raise exception.AgentError(method=method)
 
-    LOG.debug(_('The agent call to %(method)s was successful: '
-                '%(ret)r. args=%(args)r'),
+    LOG.debug('The agent call to %(method)s was successful: '
+              '%(ret)r. args=%(args)r',
               {'method': method, 'ret': ret, 'args': args},
               instance=instance)
 
@@ -186,11 +172,10 @@ class XenAPIBasedAgent(object):
                     instance=self.instance, exc_info=True)
         try:
             ctxt = context.get_admin_context()
-            capi = conductor.API()
             compute_utils.add_instance_fault_from_exc(
-                    ctxt, capi, self.instance, error, exc_info=exc_info)
+                    ctxt, self.instance, error, exc_info=exc_info)
         except Exception:
-            pass
+            LOG.debug("Error setting instance fault.", exc_info=True)
 
     def _call_agent(self, method, addl_args=None, timeout=None,
                     success_codes=None, ignore_errors=True):
@@ -204,7 +189,7 @@ class XenAPIBasedAgent(object):
                 raise
 
     def get_version(self):
-        LOG.debug(_('Querying agent version'), instance=self.instance)
+        LOG.debug('Querying agent version', instance=self.instance)
 
         # The agent can be slow to start for a variety of reasons. On Windows,
         # it will generally perform a setup process on first boot that can
@@ -228,11 +213,11 @@ class XenAPIBasedAgent(object):
             ctxt, 'xen', self.instance['os_type'],
             self.instance['architecture'])
         if agent_build:
-            LOG.debug(_('Latest agent build for %(hypervisor)s/%(os)s'
-                        '/%(architecture)s is %(version)s') % agent_build)
+            LOG.debug('Latest agent build for %(hypervisor)s/%(os)s'
+                      '/%(architecture)s is %(version)s', agent_build)
         else:
-            LOG.debug(_('No agent build found for %(hypervisor)s/%(os)s'
-                        '/%(architecture)s') % {
+            LOG.debug('No agent build found for %(hypervisor)s/%(os)s'
+                      '/%(architecture)s', {
                             'hypervisor': 'xen',
                             'os': self.instance['os_type'],
                             'architecture': self.instance['architecture']})
@@ -242,11 +227,11 @@ class XenAPIBasedAgent(object):
         agent_build = self._get_expected_build()
         if version and agent_build and \
                 is_upgrade_required(version, agent_build['version']):
-            LOG.debug(_('Updating agent to %s'), agent_build['version'],
+            LOG.debug('Updating agent to %s', agent_build['version'],
                       instance=self.instance)
             self._perform_update(agent_build)
         else:
-            LOG.debug(_('Skipping agent update.'), instance=self.instance)
+            LOG.debug('Skipping agent update.', instance=self.instance)
 
     def _perform_update(self, agent_build):
         args = {'url': agent_build['url'], 'md5sum': agent_build['md5hash']}
@@ -272,11 +257,9 @@ class XenAPIBasedAgent(object):
         if sshkey and sshkey.startswith("ssh-rsa"):
             ctxt = context.get_admin_context()
             enc = crypto.ssh_encrypt_text(sshkey, new_pass)
-            sys_meta = utils.instance_sys_meta(self.instance)
-            sys_meta.update(password.convert_password(ctxt,
-                                                      base64.b64encode(enc)))
-            self.virtapi.instance_update(ctxt, self.instance['uuid'],
-                                         {'system_metadata': sys_meta})
+            self.instance.system_metadata.update(
+                password.convert_password(ctxt, base64.b64encode(enc)))
+            self.instance.save()
 
     def set_admin_password(self, new_pass):
         """Set the root/admin password on the VM instance.
@@ -287,7 +270,7 @@ class XenAPIBasedAgent(object):
         We're using a simple Diffie-Hellman class instead of a more advanced
         library (such as M2Crypto) for compatibility with the agent code.
         """
-        LOG.debug(_('Setting admin password'), instance=self.instance)
+        LOG.debug('Setting admin password', instance=self.instance)
 
         try:
             dh = self._exchange_key_with_agent()
@@ -309,12 +292,12 @@ class XenAPIBasedAgent(object):
             return
 
         if self.instance['os_type'] == 'windows':
-            LOG.debug(_("Skipping setting of ssh key for Windows."),
+            LOG.debug("Skipping setting of ssh key for Windows.",
                       instance=self.instance)
             return
 
         if self._skip_ssh_key_inject():
-            LOG.debug(_("Skipping agent ssh key injection for this image."),
+            LOG.debug("Skipping agent ssh key injection for this image.",
                       instance=self.instance)
             return
 
@@ -331,14 +314,14 @@ class XenAPIBasedAgent(object):
 
     def inject_files(self, injected_files):
         if self._skip_inject_files_at_boot():
-            LOG.debug(_("Skipping agent file injection for this image."),
+            LOG.debug("Skipping agent file injection for this image.",
                       instance=self.instance)
         else:
             for path, contents in injected_files:
                 self.inject_file(path, contents)
 
     def inject_file(self, path, contents):
-        LOG.debug(_('Injecting file path: %r'), path, instance=self.instance)
+        LOG.debug('Injecting file path: %r', path, instance=self.instance)
 
         # Files/paths must be base64-encoded for transmission to agent
         b64_path = base64.b64encode(path)
@@ -348,7 +331,7 @@ class XenAPIBasedAgent(object):
         return self._call_agent('inject_file', args)
 
     def resetnetwork(self):
-        LOG.debug(_('Resetting network'), instance=self.instance)
+        LOG.debug('Resetting network', instance=self.instance)
 
         #NOTE(johngarbutt) old FreeBSD and Gentoo agents return 500 on success
         return self._call_agent('resetnetwork',

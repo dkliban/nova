@@ -442,8 +442,9 @@ def _service_get(context, service_id, with_compute_node=True, session=None):
 
 
 @require_admin_context
-def service_get(context, service_id):
-    return _service_get(context, service_id)
+def service_get(context, service_id, with_compute_node=False):
+    return _service_get(context, service_id,
+                        with_compute_node=with_compute_node)
 
 
 @require_admin_context
@@ -782,10 +783,12 @@ def floating_ip_allocate_address(context, project_id, pool,
 @require_context
 def floating_ip_bulk_create(context, ips):
     session = get_session()
+    result = []
     with session.begin():
         for ip in ips:
             model = models.FloatingIp()
             model.update(ip)
+            result.append(model)
             try:
                 # NOTE(boris-42): To get existing address we have to do each
                 #                  time session.flush()..
@@ -793,6 +796,7 @@ def floating_ip_bulk_create(context, ips):
                 session.flush()
             except db_exc.DBDuplicateEntry:
                 raise exception.FloatingIpExists(address=ip['address'])
+    return result
 
 
 def _ip_range_splitter(ips, block_size=256):
@@ -890,12 +894,24 @@ def floating_ip_fixed_ip_associate(context, floating_address,
 
 
 @require_context
+@_retry_on_deadlock
 def floating_ip_deallocate(context, address):
-    model_query(context, models.FloatingIp).\
-            filter_by(address=address).\
-            update({'project_id': None,
-                    'host': None,
-                    'auto_assigned': False})
+    session = get_session()
+
+    with session.begin():
+        floating_ip_ref = model_query(context, models.FloatingIp,
+                                      session=session).\
+                          filter_by(address=address).\
+                          filter(models.FloatingIp.project_id != None).\
+                          with_lockmode('update').\
+                          first()
+
+        if floating_ip_ref:
+            floating_ip_ref.update({'project_id': None,
+                                    'host': None,
+                                    'auto_assigned': False})
+
+    return floating_ip_ref
 
 
 @require_context
@@ -1200,7 +1216,8 @@ def fixed_ip_disassociate(context, address):
     session = get_session()
     with session.begin():
         _fixed_ip_get_by_address(context, address, session=session).\
-                                 update({'instance_uuid': None})
+                                 update({'instance_uuid': None,
+                                         'virtual_interface_id': None})
 
 
 @require_admin_context
@@ -1489,6 +1506,7 @@ def virtual_interface_get_by_instance(context, instance_uuid, use_slave=False):
     """
     vif_refs = _virtual_interface_query(context, use_slave=use_slave).\
                        filter_by(instance_uuid=instance_uuid).\
+                       order_by(asc("created_at"), asc("id")).\
                        all()
     return vif_refs
 
@@ -1850,6 +1868,10 @@ def instance_get_all_by_filters(context, filters, sort_key, sort_dir,
                          include or exclude instances whose
                          vm_state is SOFT_DELETED.
     """
+    # NOTE(mriedem): If the limit is 0 there is no point in even going
+    # to the database since nothing is going to be returned anyway.
+    if limit == 0:
+        return []
 
     sort_fn = {'desc': desc, 'asc': asc}
 
@@ -2584,12 +2606,10 @@ def network_get_all_by_uuids(context, network_uuids, project_only):
     #check if the result contains all the networks
     #we are looking for
     for network_uuid in network_uuids:
-        found = False
         for network in result:
             if network['uuid'] == network_uuid:
-                found = True
                 break
-        if not found:
+        else:
             if project_only:
                 raise exception.NetworkNotFoundForProject(
                       network_uuid=network_uuid, project_id=context.project_id)
@@ -2627,7 +2647,6 @@ def network_get_associated_fixed_ips(context, network_id, host=None):
                           models.FixedIp.leased).\
                           filter(models.FixedIp.deleted == 0).\
                           filter(models.FixedIp.network_id == network_id).\
-                          filter(models.FixedIp.allocated == True).\
                           join((models.VirtualInterface, vif_and)).\
                           join((models.Instance, inst_and)).\
                           filter(models.FixedIp.instance_uuid != None).\
@@ -3025,38 +3044,26 @@ def _reservation_create(context, uuid, usage, project_id, user_id, resource,
 # code always acquires the lock on quota_usages before acquiring the lock
 # on reservations.
 
-def _get_user_quota_usages(context, session, project_id, user_id):
-    # Broken out for testability
-    rows = model_query(context, models.QuotaUsage,
-                       read_deleted="no",
-                       session=session).\
-                   filter_by(project_id=project_id).\
-                   filter(or_(models.QuotaUsage.user_id == user_id,
-                              models.QuotaUsage.user_id == None)).\
-                   with_lockmode('update').\
-                   all()
-    return dict((row.resource, row) for row in rows)
-
-
-def _get_project_quota_usages(context, session, project_id):
+def _get_project_user_quota_usages(context, session, project_id,
+                                   user_id):
     rows = model_query(context, models.QuotaUsage,
                        read_deleted="no",
                        session=session).\
                    filter_by(project_id=project_id).\
                    with_lockmode('update').\
                    all()
-    result = dict()
+    proj_result = dict()
+    user_result = dict()
     # Get the total count of in_use,reserved
     for row in rows:
-        if row.resource in result:
-            result[row.resource]['in_use'] += row.in_use
-            result[row.resource]['reserved'] += row.reserved
-            result[row.resource]['total'] += (row.in_use + row.reserved)
-        else:
-            result[row.resource] = dict(in_use=row.in_use,
-                                        reserved=row.reserved,
-                                        total=row.in_use + row.reserved)
-    return result
+        proj_result.setdefault(row.resource,
+                               dict(in_use=0, reserved=0, total=0))
+        proj_result[row.resource]['in_use'] += row.in_use
+        proj_result[row.resource]['reserved'] += row.reserved
+        proj_result[row.resource]['total'] += (row.in_use + row.reserved)
+        if row.user_id is None or row.user_id == user_id:
+            user_result[row.resource] = row
+    return proj_result, user_result
 
 
 @require_context
@@ -3074,10 +3081,8 @@ def quota_reserve(context, resources, project_quotas, user_quotas, deltas,
             user_id = context.user_id
 
         # Get the current usages
-        user_usages = _get_user_quota_usages(context, session,
-                                             project_id, user_id)
-        project_usages = _get_project_quota_usages(context, session,
-                                                   project_id)
+        project_usages, user_usages = _get_project_user_quota_usages(
+                context, session, project_id, user_id)
 
         # Handle usage refresh
         work = set(deltas.keys())
@@ -3146,12 +3151,12 @@ def quota_reserve(context, resources, project_quotas, user_quotas, deltas,
                                                          session=session)
 
                     if user_usages[res].in_use != in_use:
-                        LOG.debug(_('quota_usages out of sync, updating. '
-                                    'project_id: %(project_id)s, '
-                                    'user_id: %(user_id)s, '
-                                    'resource: %(res)s, '
-                                    'tracked usage: %(tracked_use)s, '
-                                    'actual usage: %(in_use)s'),
+                        LOG.debug('quota_usages out of sync, updating. '
+                                  'project_id: %(project_id)s, '
+                                  'user_id: %(user_id)s, '
+                                  'resource: %(res)s, '
+                                  'tracked usage: %(tracked_use)s, '
+                                  'actual usage: %(in_use)s',
                             {'project_id': project_id,
                              'user_id': user_id,
                              'res': res,
@@ -3286,11 +3291,12 @@ def _quota_reservations_query(session, context, reservations):
 def reservation_commit(context, reservations, project_id=None, user_id=None):
     session = get_session()
     with session.begin():
-        usages = _get_user_quota_usages(context, session, project_id, user_id)
+        _project_usages, user_usages = _get_project_user_quota_usages(
+                context, session, project_id, user_id)
         reservation_query = _quota_reservations_query(session, context,
                                                       reservations)
         for reservation in reservation_query.all():
-            usage = usages[reservation.resource]
+            usage = user_usages[reservation.resource]
             if reservation.delta >= 0:
                 usage.reserved -= reservation.delta
             usage.in_use += reservation.delta
@@ -3302,11 +3308,12 @@ def reservation_commit(context, reservations, project_id=None, user_id=None):
 def reservation_rollback(context, reservations, project_id=None, user_id=None):
     session = get_session()
     with session.begin():
-        usages = _get_user_quota_usages(context, session, project_id, user_id)
+        _project_usages, user_usages = _get_project_user_quota_usages(
+                context, session, project_id, user_id)
         reservation_query = _quota_reservations_query(session, context,
                                                       reservations)
         for reservation in reservation_query.all():
-            usage = usages[reservation.resource]
+            usage = user_usages[reservation.resource]
             if reservation.delta >= 0:
                 usage.reserved -= reservation.delta
         reservation_query.soft_delete(synchronize_session=False)
@@ -3404,27 +3411,27 @@ def ec2_volume_create(context, volume_uuid, id=None):
 
 
 @require_context
-def get_ec2_volume_id_by_uuid(context, volume_id):
+def ec2_volume_get_by_uuid(context, volume_uuid):
     result = _ec2_volume_get_query(context).\
-                    filter_by(uuid=volume_id).\
+                    filter_by(uuid=volume_uuid).\
+                    first()
+
+    if not result:
+        raise exception.VolumeNotFound(volume_id=volume_uuid)
+
+    return result
+
+
+@require_context
+def ec2_volume_get_by_id(context, volume_id):
+    result = _ec2_volume_get_query(context).\
+                    filter_by(id=volume_id).\
                     first()
 
     if not result:
         raise exception.VolumeNotFound(volume_id=volume_id)
 
-    return result['id']
-
-
-@require_context
-def get_volume_uuid_by_ec2_id(context, ec2_id):
-    result = _ec2_volume_get_query(context).\
-                    filter_by(id=ec2_id).\
-                    first()
-
-    if not result:
-        raise exception.VolumeNotFound(volume_id=ec2_id)
-
-    return result['uuid']
+    return result
 
 
 @require_context
@@ -4292,8 +4299,6 @@ def flavor_get_all(context, inactive=False, filters=None,
     # should mean truly deleted, e.g. we can safely purge the record out of the
     # database.
     read_deleted = "yes" if inactive else "no"
-
-    sort_fn = {'desc': desc, 'asc': asc}
 
     query = _flavor_get_query(context, read_deleted=read_deleted)
 
@@ -5454,26 +5459,38 @@ def ec2_instance_create(context, instance_uuid, id=None):
 
 
 @require_context
-def get_ec2_instance_id_by_uuid(context, instance_id):
+def ec2_instance_get_by_uuid(context, instance_uuid):
     result = _ec2_instance_get_query(context).\
-                    filter_by(uuid=instance_id).\
+                    filter_by(uuid=instance_uuid).\
+                    first()
+
+    if not result:
+        raise exception.InstanceNotFound(instance_id=instance_uuid)
+
+    return result
+
+
+@require_context
+def get_ec2_instance_id_by_uuid(context, instance_id):
+    result = ec2_instance_get_by_uuid(context, instance_id)
+    return result['id']
+
+
+@require_context
+def ec2_instance_get_by_id(context, instance_id):
+    result = _ec2_instance_get_query(context).\
+                    filter_by(id=instance_id).\
                     first()
 
     if not result:
         raise exception.InstanceNotFound(instance_id=instance_id)
 
-    return result['id']
+    return result
 
 
 @require_context
 def get_instance_uuid_by_ec2_id(context, ec2_id):
-    result = _ec2_instance_get_query(context).\
-                    filter_by(id=ec2_id).\
-                    first()
-
-    if not result:
-        raise exception.InstanceNotFound(instance_id=ec2_id)
-
+    result = ec2_instance_get_by_id(context, ec2_id)
     return result['uuid']
 
 
@@ -5596,10 +5613,8 @@ def archive_deleted_rows_for_table(context, tablename, max_rows):
         # We have one table (dns_domains) where the key is called
         # "domain" rather than "id"
         column = table.c.domain
-        column_name = "domain"
     else:
         column = table.c.id
-        column_name = "id"
     # NOTE(guochbo): Use InsertFromSelect and DeleteFromSelect to avoid
     # database's limit of maximum parameter in one SQL statement.
     query_insert = select([table],
@@ -5609,12 +5624,13 @@ def archive_deleted_rows_for_table(context, tablename, max_rows):
                           table.c.deleted != default_deleted_value).\
                           order_by(column).limit(max_rows)
 
-    insert_statement = db_utils.InsertFromSelect(shadow_table, query_insert)
+    insert_statement = sqlalchemyutils.InsertFromSelect(
+        shadow_table, query_insert)
     delete_statement = db_utils.DeleteFromSelect(table, query_delete, column)
     try:
         # Group the insert and delete in a transaction.
         with conn.begin():
-            result_insert = conn.execute(insert_statement)
+            conn.execute(insert_statement)
             result_delete = conn.execute(delete_statement)
     except IntegrityError:
         # A foreign key constraint keeps us from deleting some of

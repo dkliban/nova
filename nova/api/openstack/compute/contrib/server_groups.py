@@ -23,11 +23,14 @@ from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
 import nova.exception
-from nova.objects import instance as instance_obj
+from nova import objects
 from nova.objects import instance_group as instance_group_obj
 from nova.openstack.common.gettextutils import _
 from nova import utils
 
+# NOTE(russellb) There is one other policy, 'legacy', but we don't allow that
+# being set via the API.  It's only used when a group gets automatically
+# created to support the legacy behavior of the 'group' scheduler hint.
 SUPPORTED_POLICIES = ['anti-affinity', 'affinity']
 
 authorize = extensions.extension_authorizer('compute', 'server_groups')
@@ -122,20 +125,6 @@ class ServerGroupXMLDeserializer(wsgi.MetadataXMLDeserializer):
                     policies.append(node.firstChild.nodeValue)
             return policies
 
-    def _extract_members(self, server_group_node):
-        """Marshal the server group members element of a parsed request."""
-        members_node = self.find_first_child_named(server_group_node,
-                                                   'members')
-        if members_node is not None:
-            member_nodes = self.find_children_named(members_node,
-                                                    'member')
-
-            members = []
-            if member_nodes is not None:
-                for node in member_nodes:
-                    members.append(node.firstChild.nodeValue)
-            return members
-
 
 class ServerGroupController(wsgi.Controller):
     """The Server group API controller for the OpenStack API."""
@@ -153,8 +142,8 @@ class ServerGroupController(wsgi.Controller):
         members = []
         if group.members:
             # Display the instances that are not deleted.
-            filters = {'uuid': group.members, 'deleted_at': None}
-            instances = instance_obj.InstanceList.get_by_filters(
+            filters = {'uuid': group.members, 'deleted': False}
+            instances = objects.InstanceList.get_by_filters(
                 context, filters=filters)
             members = [instance.uuid for instance in instances]
         server_group['members'] = members
@@ -176,6 +165,11 @@ class ServerGroupController(wsgi.Controller):
                          if policy not in SUPPORTED_POLICIES]
         if not_supported:
             msg = _("Invalid policies: %s") % ', '.join(not_supported)
+            raise nova.exception.InvalidInput(reason=msg)
+
+        # Note(wingwj): It doesn't make sense to store duplicate policies.
+        if sorted(set(policies)) != sorted(policies):
+            msg = _("Duplicate policies configured!")
             raise nova.exception.InvalidInput(reason=msg)
 
     def _validate_input_body(self, body, entity_name):
@@ -281,7 +275,7 @@ class Server_groups(extensions.ExtensionDescriptor):
     alias = "os-server-groups"
     namespace = ("http://docs.openstack.org/compute/ext/"
                  "servergroups/api/v2")
-    updated = "2013-06-20T00:00:00+00:00"
+    updated = "2013-06-20T00:00:00Z"
 
     def get_resources(self):
         resources = []

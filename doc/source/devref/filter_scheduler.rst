@@ -111,7 +111,7 @@ There are some standard filter classes to use (:mod:`nova.scheduler.filters`):
 * |DifferentHostFilter| - allows to put the instance on a different host from a
   set of instances.
 * |SameHostFilter| - puts the instance on the same host as another instance in
-  a set of of instances.
+  a set of instances.
 * |RetryFilter| - filters hosts that have been attempted for scheduling.
   Only passes hosts that have not been previously attempted.
 * |TrustedFilter| - filters hosts based on their trust.  Only passes hosts
@@ -119,10 +119,22 @@ There are some standard filter classes to use (:mod:`nova.scheduler.filters`):
 * |TypeAffinityFilter| - Only passes hosts that are not already running an
   instance of the requested type.
 * |AggregateTypeAffinityFilter| - limits instance_type by aggregate.
-* |GroupAntiAffinityFilter| - ensures that each instance in group is on a
-  different host.
-* |GroupAffinityFilter| - ensures that each instance in group is on a same
-  host with one of the instance host in a group.
+* |ServerGroupAntiAffinityFilter| - This filter implements anti-affinity for a
+  server group.  First you must create a server group with a policy of
+  'anti-affinity' via the server groups API.  Then, when you boot a new server,
+  provide a scheduler hint of 'group=<uuid>' where <uuid> is the UUID of the
+  server group you created.  This will result in the server getting added to the
+  group.  When the server gets scheduled, anti-affinity will be enforced among
+  all servers in that group.
+* |ServerGroupAffinityFilter| - This filter works the same way as
+  ServerGroupAntiAffinityFilter.  The difference is that when you create the server
+  group, you should specify a policy of 'affinity'.
+* |GroupAntiAffinityFilter| - This filter is deprecated in favor of
+  ServerGroupAntiAffinityFilter.  Note that this should not be enabled at the
+  same time as GroupAffinityFilter or neither filter will work properly.
+* |GroupAffinityFilter| - This filter is deprecated in favor of
+  ServerGroupAffinityFilter.  Note that this should not be enabled at the same
+  time as GroupAntiAffinityFilter or neither filter will work properly.
 * |AggregateMultiTenancyIsolation| - isolate tenants in specific aggregates.
 * |AggregateImagePropertiesIsolation| - isolates hosts based on image
   properties and aggregate metadata.
@@ -253,12 +265,13 @@ The default values for these settings in nova.conf are:
 ::
 
     --scheduler_available_filters=nova.scheduler.filters.standard_filters
-    --scheduler_default_filters=RamFilter,ComputeFilter,AvailabilityZoneFilter,ComputeCapabilitiesFilter,ImagePropertiesFilter
+    --scheduler_default_filters=RamFilter,ComputeFilter,AvailabilityZoneFilter,ComputeCapabilitiesFilter,ImagePropertiesFilter,ServerGroupAntiAffinityFilter,ServerGroupAffinityFilter'
 
 With this configuration, all filters in ``nova.scheduler.filters``
 would be available, and by default the |RamFilter|, |ComputeFilter|,
-|AvailabilityZoneFilter|, |ComputeCapabilitiesFilter|, and
-|ImagePropertiesFilter| would be used.
+|AvailabilityZoneFilter|, |ComputeCapabilitiesFilter|,
+|ImagePropertiesFilter|, |ServerGroupAntiAffinityFilter|,
+and |ServerGroupAffinityFilter| would be used.
 
 If you want to create **your own filter** you just need to inherit from
 |BaseHostFilter| and implement one method:
@@ -297,7 +310,7 @@ easily. Therefore the final weight for the object will be::
 
 A weigher should be a subclass of ``weights.BaseHostWeigher`` and they must
 implement the ``weight_multiplier`` and ``weight_object`` methods. If the
-``weight_objects`` method is overriden it just return a list of weights, and not
+``weight_objects`` method is overridden it just return a list of weights, and not
 modify the weight of the object directly, since final weights are normalized and
 computed by ``weight.BaseWeightHandler``.
 

@@ -38,6 +38,8 @@ from nova import utils
 
 LOG = logging.getLogger(__name__)
 CONF = cfg.CONF
+CONF.import_opt('share_dhcp_address', 'nova.objects.network')
+CONF.import_opt('network_device_mtu', 'nova.objects.network')
 
 HOST = "testhost"
 
@@ -164,6 +166,15 @@ fixed_ips = [{'id': 0,
               'leased': False,
               'virtual_interface_id': 5,
               'instance_uuid': '00000000-0000-0000-0000-0000000000000001',
+              'floating_ips': []},
+             {'id': 6,
+              'network_id': 1,
+              'address': '192.168.1.103',
+              'instance_id': 1,
+              'allocated': False,
+              'leased': True,
+              'virtual_interface_id': 6,
+              'instance_uuid': '00000000-0000-0000-0000-0000000000000001',
               'floating_ips': []}]
 
 
@@ -220,13 +231,22 @@ vifs = [{'id': 0,
          'address': 'DE:AD:BE:EF:00:05',
          'uuid': '00000000-0000-0000-0000-0000000000000005',
          'network_id': 1,
+         'instance_uuid': '00000000-0000-0000-0000-0000000000000001'},
+        {'id': 6,
+         'created_at': None,
+         'updated_at': None,
+         'deleted_at': None,
+         'deleted': 0,
+         'address': 'DE:AD:BE:EF:00:06',
+         'uuid': '00000000-0000-0000-0000-0000000000000006',
+         'network_id': 1,
          'instance_uuid': '00000000-0000-0000-0000-0000000000000001'}]
 
 
 def get_associated(context, network_id, host=None, address=None):
     result = []
     for datum in fixed_ips:
-        if (datum['network_id'] == network_id and datum['allocated']
+        if (datum['network_id'] == network_id
             and datum['instance_uuid'] is not None
                 and datum['virtual_interface_id'] is not None):
             instance = instances[datum['instance_uuid']]
@@ -424,7 +444,6 @@ class LinuxNetworkTestCase(test.NoDBTestCase):
         for lease in leases:
             lease = lease.split(' ')
             data = get_associated(self.context, 1, address=lease[2])[0]
-            self.assertTrue(data['allocated'])
             self.assertTrue(data['leased'])
             self.assertTrue(lease[0] > seconds_since_epoch)
             self.assertTrue(lease[1] == data['vif_address'])
@@ -471,8 +490,8 @@ class LinuxNetworkTestCase(test.NoDBTestCase):
         self.stubs.Set(linux_net.iptables_manager.ipv4['filter'],
                        'add_rule', verify_add_rule)
         driver = linux_net.LinuxBridgeInterfaceDriver()
-        driver.plug({"bridge": "br100", "bridge_interface": "eth0"},
-                    "fakemac")
+        driver.plug({"bridge": "br100", "bridge_interface": "eth0",
+                     "share_address": False}, "fakemac")
 
     def test_linux_ovs_driver_plug_exception(self):
         self.flags(fake_network=False)
@@ -510,6 +529,7 @@ class LinuxNetworkTestCase(test.NoDBTestCase):
         network = {
                 "bridge": "br100",
                 "bridge_interface": "base_interface",
+                "share_address": False,
                 "vlan": "fake"
         }
         self.flags(vlan_interface="")
@@ -540,6 +560,7 @@ class LinuxNetworkTestCase(test.NoDBTestCase):
         network = {
                 "bridge": "br100",
                 "bridge_interface": "base_interface",
+                "share_address": False,
         }
         driver.plug(network, "fakemac")
         self.assertEqual(info['passed_interface'], "base_interface")
@@ -576,7 +597,7 @@ class LinuxNetworkTestCase(test.NoDBTestCase):
         default_domain = CONF.dhcp_domain
         for domain in ('', default_domain):
             executes = []
-            CONF.dhcp_domain = domain
+            self.flags(dhcp_domain=domain)
             linux_net.restart_dhcp(self.context, dev, network_ref)
             expected = ['env',
             'CONFIG_FILE=%s' % jsonutils.dumps(CONF.dhcpbridge_flagfile),
@@ -657,6 +678,7 @@ class LinuxNetworkTestCase(test.NoDBTestCase):
         iface = 'eth0'
         dhcp = '192.168.1.1'
         network = {'dhcp_server': dhcp,
+                   'share_address': False,
                    'bridge': 'br100',
                    'bridge_interface': iface}
         driver.plug(network, 'fakemac')
@@ -748,6 +770,7 @@ class LinuxNetworkTestCase(test.NoDBTestCase):
         iface = 'eth0'
         dhcp = '192.168.1.1'
         network = {'dhcp_server': dhcp,
+                   'share_address': False,
                    'bridge': 'br100',
                    'bridge_interface': iface}
         driver.plug(network, 'fakemac')

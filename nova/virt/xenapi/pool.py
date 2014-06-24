@@ -32,9 +32,6 @@ LOG = logging.getLogger(__name__)
 
 xenapi_pool_opts = [
     cfg.BoolOpt('use_join_force',
-                #Deprecated in Icehouse
-                deprecated_name='use_join_force',
-                deprecated_group='DEFAULT',
                 default=True,
                 help='To use for hosts with different CPUs'),
     ]
@@ -62,7 +59,7 @@ class ResourcePool(object):
             if set_error:
                 metadata = {pool_states.KEY: pool_states.ERROR}
                 aggregate.update_metadata(metadata)
-            op(context, aggregate, host)
+            op(host)
         except Exception:
             LOG.exception(_('Aggregate %(aggregate_id)s: unrecoverable state '
                             'during operation on %(host)s'),

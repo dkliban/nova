@@ -15,6 +15,7 @@
 
 import uuid
 
+import mock
 from oslo.config import cfg
 import webob
 
@@ -23,7 +24,7 @@ from nova.compute import rpcapi as compute_rpcapi
 from nova.compute import vm_states
 import nova.db
 from nova import exception
-from nova.objects import instance as instance_obj
+from nova import objects
 from nova.openstack.common import jsonutils
 from nova.openstack.common import timeutils
 from nova import test
@@ -208,7 +209,7 @@ class ServerMetaDataTest(BaseTest):
     def test_create(self):
         self.stubs.Set(nova.db, 'instance_metadata_get',
                        return_server_metadata)
-        self.stubs.Set(instance_obj.Instance, 'save', fake_instance_save)
+        self.stubs.Set(objects.Instance, 'save', fake_instance_save)
         req = fakes.HTTPRequest.blank(self.url)
         req.method = 'POST'
         req.content_type = "application/json"
@@ -284,7 +285,7 @@ class ServerMetaDataTest(BaseTest):
                           self.controller.create, req, self.uuid, body)
 
     def test_update_metadata(self):
-        self.stubs.Set(instance_obj.Instance, 'save', fake_instance_save)
+        self.stubs.Set(objects.Instance, 'save', fake_instance_save)
         req = fakes.HTTPRequest.blank(self.url)
         req.method = 'POST'
         req.content_type = 'application/json'
@@ -299,7 +300,7 @@ class ServerMetaDataTest(BaseTest):
         self.assertEqual(expected, response)
 
     def test_update_all(self):
-        self.stubs.Set(instance_obj.Instance, 'save', fake_instance_save)
+        self.stubs.Set(objects.Instance, 'save', fake_instance_save)
         req = fakes.HTTPRequest.blank(self.url)
         req.method = 'PUT'
         req.content_type = "application/json"
@@ -315,7 +316,7 @@ class ServerMetaDataTest(BaseTest):
         self.assertEqual(expected, res_dict)
 
     def test_update_all_empty_container(self):
-        self.stubs.Set(instance_obj.Instance, 'save', fake_instance_save)
+        self.stubs.Set(objects.Instance, 'save', fake_instance_save)
         req = fakes.HTTPRequest.blank(self.url)
         req.method = 'PUT'
         req.content_type = "application/json"
@@ -361,7 +362,7 @@ class ServerMetaDataTest(BaseTest):
                           self.controller.update_all, req, '100', body)
 
     def test_update_item(self):
-        self.stubs.Set(instance_obj.Instance, 'save', fake_instance_save)
+        self.stubs.Set(objects.Instance, 'save', fake_instance_save)
         req = fakes.HTTPRequestV3.blank(self.url + '/key1')
         req.method = 'PUT'
         body = {"metadata": {"key1": "value1"}}
@@ -582,3 +583,19 @@ class BadStateServerMetaDataTest(BaseTest):
                'name': 'fake',
                'locked': False,
                'vm_state': vm_states.BUILDING})
+
+    @mock.patch.object(nova.compute.api.API, 'update_instance_metadata',
+                       side_effect=exception.InstanceIsLocked(instance_uuid=0))
+    def test_instance_lock_update_metadata(self, mock_update):
+        req = fakes.HTTPRequest.blank(self.url)
+        req.method = 'POST'
+        req.content_type = 'application/json'
+        expected = {
+            'metadata': {
+                'keydummy': 'newkey'
+            }
+        }
+
+        req.body = jsonutils.dumps(expected)
+        self.assertRaises(webob.exc.HTTPConflict, self.controller.update_all,
+            req, self.uuid, expected)

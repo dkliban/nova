@@ -25,15 +25,20 @@ import functools
 from oslo.config import cfg
 
 from nova import exception
+from nova.network import model as network_model
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova.openstack.common import units
 from nova import utils
+from nova.virt.vmwareapi import error_util
 from nova.virt.vmwareapi import vim_util
 
 CONF = cfg.CONF
 LOG = logging.getLogger(__name__)
 
+ALL_SUPPORTED_NETWORK_DEVICES = ['VirtualE1000', 'VirtualE1000e',
+                                 'VirtualPCNet32', 'VirtualSriovEthernetCard',
+                                 'VirtualVmxnet']
 DSRecord = collections.namedtuple(
     'DSRecord', ['datastore', 'name', 'capacity', 'freespace'])
 
@@ -182,6 +187,18 @@ def create_controller_spec(client_factory, key, adapter_type="lsiLogic"):
     return virtual_device_config
 
 
+def _convert_vif_model(name):
+    """Converts standard VIF_MODEL types to the internal VMware ones."""
+    if name == network_model.VIF_MODEL_E1000:
+        return 'VirtualE1000'
+    if name == network_model.VIF_MODEL_E1000E:
+        return 'VirtualE1000e'
+    if name not in ALL_SUPPORTED_NETWORK_DEVICES:
+        msg = _('%s is not supported.') % name
+        raise exception.Invalid(msg)
+    return name
+
+
 def create_network_spec(client_factory, vif_info):
     """Builds a config spec for the addition of a new network
     adapter to the VM.
@@ -190,8 +207,7 @@ def create_network_spec(client_factory, vif_info):
     network_spec.operation = "add"
 
     # Keep compatible with other Hyper vif model parameter.
-    if vif_info['vif_model'] == "e1000":
-        vif_info['vif_model'] = "VirtualE1000"
+    vif_info['vif_model'] = _convert_vif_model(vif_info['vif_model'])
 
     vif = 'ns0:' + vif_info['vif_model']
     net_device = client_factory.create(vif)
@@ -451,16 +467,6 @@ def get_vmdk_create_spec(client_factory, size_in_kb, adapter_type="lsiLogic",
     return create_vmdk_spec
 
 
-def get_rdm_create_spec(client_factory, device, adapter_type="lsiLogic",
-                        disk_type="rdmp"):
-    """Builds the RDM virtual disk create spec."""
-    create_vmdk_spec = client_factory.create('ns0:DeviceBackedVirtualDiskSpec')
-    create_vmdk_spec.adapterType = get_vmdk_adapter_type(adapter_type)
-    create_vmdk_spec.diskType = disk_type
-    create_vmdk_spec.device = device
-    return create_vmdk_spec
-
-
 def create_virtual_cdrom_spec(client_factory,
                               datastore,
                               controller_key,
@@ -570,13 +576,15 @@ def detach_virtual_disk_spec(client_factory, device, destroy_disk=False):
 
 
 def clone_vm_spec(client_factory, location,
-                  power_on=False, snapshot=None, template=False):
+                  power_on=False, snapshot=None, template=False, config=None):
     """Builds the VM clone spec."""
     clone_spec = client_factory.create('ns0:VirtualMachineCloneSpec')
     clone_spec.location = location
     clone_spec.powerOn = power_on
     if snapshot:
         clone_spec.snapshot = snapshot
+    if config is not None:
+        clone_spec.config = config
     clone_spec.template = template
     return clone_spec
 
@@ -590,38 +598,6 @@ def relocate_vm_spec(client_factory, datastore=None, host=None,
     if host:
         rel_spec.host = host
     return rel_spec
-
-
-def get_dummy_vm_create_spec(client_factory, name, data_store_name):
-    """Builds the dummy VM create spec."""
-    config_spec = client_factory.create('ns0:VirtualMachineConfigSpec')
-
-    config_spec.name = name
-    config_spec.guestId = "otherGuest"
-
-    vm_file_info = client_factory.create('ns0:VirtualMachineFileInfo')
-    vm_file_info.vmPathName = "[" + data_store_name + "]"
-    config_spec.files = vm_file_info
-
-    tools_info = client_factory.create('ns0:ToolsConfigInfo')
-    tools_info.afterPowerOn = True
-    tools_info.afterResume = True
-    tools_info.beforeGuestStandby = True
-    tools_info.beforeGuestShutdown = True
-    tools_info.beforeGuestReboot = True
-
-    config_spec.tools = tools_info
-    config_spec.numCPUs = 1
-    config_spec.memoryMB = 4
-
-    controller_key = -101
-    controller_spec = create_controller_spec(client_factory, controller_key)
-    disk_spec = create_virtual_disk_spec(client_factory, 1024, controller_key)
-
-    device_config_spec = [controller_spec, disk_spec]
-
-    config_spec.deviceChange = device_config_spec
-    return config_spec
 
 
 def get_machine_id_change_spec(client_factory, machine_id_str):
@@ -827,12 +803,24 @@ def _get_vm_ref_from_extraconfig(session, instance_uuid):
 def get_vm_ref(session, instance):
     """Get reference to the VM through uuid or vm name."""
     uuid = instance['uuid']
-    vm_ref = (_get_vm_ref_from_vm_uuid(session, uuid) or
-                  _get_vm_ref_from_extraconfig(session, uuid) or
-                  _get_vm_ref_from_uuid(session, uuid) or
-                  _get_vm_ref_from_name(session, instance['name']))
+    vm_ref = (search_vm_ref_by_identifier(session, uuid) or
+              _get_vm_ref_from_name(session, instance['name']))
     if vm_ref is None:
         raise exception.InstanceNotFound(instance_id=uuid)
+    return vm_ref
+
+
+def search_vm_ref_by_identifier(session, identifier):
+    """Searches VM reference using the identifier.
+
+    This method is primarily meant to separate out part of the logic for
+    vm_ref search that could be use directly in the special case of
+    migrating the instance. For querying VM linked to an instance always
+    use get_vm_ref instead.
+    """
+    vm_ref = (_get_vm_ref_from_vm_uuid(session, identifier) or
+              _get_vm_ref_from_extraconfig(session, identifier) or
+              _get_vm_ref_from_uuid(session, identifier))
     return vm_ref
 
 
@@ -963,7 +951,8 @@ def get_stats_from_cluster(session, cluster):
             for obj in result.objects:
                 hardware_summary = obj.propSet[0].val
                 runtime_summary = obj.propSet[1].val
-                if runtime_summary.connectionState == "connected":
+                if (runtime_summary.inMaintenanceMode == False and
+                    runtime_summary.connectionState == "connected"):
                     # Total vcpus is the sum of all pCPUs of individual hosts
                     # The overcommitment ratio is factored in by the scheduler
                     cpu_info['vcpus'] += hardware_summary.numCpuThreads
@@ -983,14 +972,6 @@ def get_stats_from_cluster(session, cluster):
                 mem_info['free'] = mem_info['total'] - consumed
     stats = {'cpu': cpu_info, 'mem': mem_info}
     return stats
-
-
-def get_cluster_ref_from_name(session, cluster_name):
-    """Get reference to the cluster with the name specified."""
-    cls = session._call_method(vim_util, "get_objects",
-                               "ClusterComputeResource", ["name"])
-    return _get_object_from_results(session, cls, cluster_name,
-                                    _get_object_for_value)
 
 
 def get_host_ref(session, cluster=None):
@@ -1142,12 +1123,12 @@ def get_available_datastores(session, cluster=None, datastore_regex=None):
     """Get the datastore list and choose the first local storage."""
     if cluster:
         mobj = cluster
-        type = "ClusterComputeResource"
+        resource_type = "ClusterComputeResource"
     else:
         mobj = get_host_ref(session)
-        type = "HostSystem"
+        resource_type = "HostSystem"
     ds = session._call_method(vim_util, "get_dynamic_property", mobj,
-                              type, "datastore")
+                              resource_type, "datastore")
     if not ds:
         return []
     data_store_mors = ds.ManagedObjectReference
@@ -1347,3 +1328,207 @@ def get_vmdk_adapter_type(adapter_type):
     else:
         vmdk_adapter_type = adapter_type
     return vmdk_adapter_type
+
+
+def create_vm(session, instance, vm_folder, config_spec, res_pool_ref):
+    """Create VM on ESX host."""
+    LOG.debug("Creating VM on the ESX host", instance=instance)
+    vm_create_task = session._call_method(
+        session._get_vim(),
+        "CreateVM_Task", vm_folder,
+        config=config_spec, pool=res_pool_ref)
+    task_info = session._wait_for_task(vm_create_task)
+    LOG.debug("Created VM on the ESX host", instance=instance)
+    return task_info.result
+
+
+def create_virtual_disk(session, dc_ref, adapter_type, disk_type,
+                        virtual_disk_path, size_in_kb):
+    # Create a Virtual Disk of the size of the flat vmdk file. This is
+    # done just to generate the meta-data file whose specifics
+    # depend on the size of the disk, thin/thick provisioning and the
+    # storage adapter type.
+    LOG.debug("Creating Virtual Disk of size  "
+              "%(vmdk_file_size_in_kb)s KB and adapter type "
+              "%(adapter_type)s on the data store",
+              {"vmdk_file_size_in_kb": size_in_kb,
+               "adapter_type": adapter_type})
+
+    vmdk_create_spec = get_vmdk_create_spec(
+            session._get_vim().client.factory,
+            size_in_kb,
+            adapter_type,
+            disk_type)
+
+    vmdk_create_task = session._call_method(
+            session._get_vim(),
+            "CreateVirtualDisk_Task",
+            session._get_vim().get_service_content().virtualDiskManager,
+            name=virtual_disk_path,
+            datacenter=dc_ref,
+            spec=vmdk_create_spec)
+
+    session._wait_for_task(vmdk_create_task)
+    LOG.debug("Created Virtual Disk of size %(vmdk_file_size_in_kb)s"
+              " KB and type %(disk_type)s",
+              {"vmdk_file_size_in_kb": size_in_kb,
+               "disk_type": disk_type})
+
+
+def copy_virtual_disk(session, dc_ref, source, dest, copy_spec=None):
+    """Copy a sparse virtual disk to a thin virtual disk. This is also
+       done to generate the meta-data file whose specifics
+       depend on the size of the disk, thin/thick provisioning and the
+       storage adapter type.
+
+    :param session: - session for connection
+    :param dc_ref: - data center reference object
+    :param source: - source datastore path
+    :param dest: - destination datastore path
+    :param copy_spec: - the copy specification
+    """
+    LOG.debug("Copying Virtual Disk %(source)s to %(dest)s",
+              {'source': source, 'dest': dest})
+    vim = session._get_vim()
+    vmdk_copy_task = session._call_method(
+            vim,
+            "CopyVirtualDisk_Task",
+            vim.get_service_content().virtualDiskManager,
+            sourceName=source,
+            sourceDatacenter=dc_ref,
+            destName=dest,
+            destSpec=copy_spec)
+    session._wait_for_task(vmdk_copy_task)
+    LOG.debug("Copied Virtual Disk %(source)s to %(dest)s",
+              {'source': source, 'dest': dest})
+
+
+def clone_vmref_for_instance(session, instance, vm_ref, host_ref, ds_ref,
+                                vmfolder_ref):
+    """Clone VM and link the cloned VM to the instance.
+
+    Clones the passed vm_ref into a new VM and links the cloned vm to
+    the passed instance.
+    """
+    if vm_ref is None:
+        LOG.warn(_("vmwareapi:vm_util:clone_vmref_for_instance, called "
+                   "with vm_ref=None"))
+        raise error_util.MissingParameter(param="vm_ref")
+    # Get the clone vm spec
+    client_factory = session._get_vim().client.factory
+    rel_spec = relocate_vm_spec(client_factory, ds_ref, host_ref)
+    extra_opts = {'nvp.vm-uuid': instance['uuid']}
+    config_spec = get_vm_extra_config_spec(client_factory, extra_opts)
+    config_spec.instanceUuid = instance['uuid']
+    clone_spec = clone_vm_spec(client_factory, rel_spec, config=config_spec)
+
+    # Clone VM on ESX host
+    LOG.debug("Cloning VM for instance %s", instance['uuid'],
+              instance=instance)
+    vm_clone_task = session._call_method(session._get_vim(), "CloneVM_Task",
+                                         vm_ref, folder=vmfolder_ref,
+                                         name=instance['uuid'],
+                                         spec=clone_spec)
+    session._wait_for_task(vm_clone_task)
+    LOG.debug("Cloned VM for instance %s", instance['uuid'],
+              instance=instance)
+    # Invalidate the cache, so that it is refetched the next time
+    vm_ref_cache_delete(instance['uuid'])
+
+
+def disassociate_vmref_from_instance(session, instance, vm_ref=None,
+                                      suffix='-orig'):
+    """Disassociates the VM linked to the instance.
+
+    Disassociates the VM linked to the instance by performing the following
+    1. Update the extraConfig property for nvp.vm-uuid to be replaced with
+    instance[uuid]+suffix
+    2. Rename the VM to be instance[uuid]+suffix instead
+    3. Reset the instanceUUID of the VM to a new generated value
+    """
+    if vm_ref is None:
+        vm_ref = get_vm_ref(session, instance)
+    extra_opts = {'nvp.vm-uuid': instance['uuid'] + suffix}
+    client_factory = session._get_vim().client.factory
+    reconfig_spec = get_vm_extra_config_spec(client_factory, extra_opts)
+    reconfig_spec.name = instance['uuid'] + suffix
+    reconfig_spec.instanceUuid = ''
+    LOG.debug("Disassociating VM from instance %s", instance['uuid'],
+              instance=instance)
+    reconfig_task = session._call_method(session._get_vim(), "ReconfigVM_Task",
+                                         vm_ref, spec=reconfig_spec)
+    session._wait_for_task(reconfig_task)
+    LOG.debug("Disassociated VM from instance %s", instance['uuid'],
+              instance=instance)
+    # Invalidate the cache, so that it is refetched the next time
+    vm_ref_cache_delete(instance['uuid'])
+
+
+def associate_vmref_for_instance(session, instance, vm_ref=None,
+                                    suffix='-orig'):
+    """Associates the VM to the instance.
+
+    Associates the VM to the instance by performing the following
+    1. Update the extraConfig property for nvp.vm-uuid to be replaced with
+    instance[uuid]
+    2. Rename the VM to be instance[uuid]
+    3. Reset the instanceUUID of the VM to be instance[uuid]
+    """
+    if vm_ref is None:
+        vm_ref = search_vm_ref_by_identifier(session,
+                                             instance['uuid'] + suffix)
+        if vm_ref is None:
+            raise exception.InstanceNotFound(instance_id=instance['uuid']
+                                            + suffix)
+    extra_opts = {'nvp.vm-uuid': instance['uuid']}
+    client_factory = session._get_vim().client.factory
+    reconfig_spec = get_vm_extra_config_spec(client_factory, extra_opts)
+    reconfig_spec.name = instance['uuid']
+    reconfig_spec.instanceUuid = instance['uuid']
+    LOG.debug("Associating VM to instance %s", instance['uuid'],
+              instance=instance)
+    reconfig_task = session._call_method(session._get_vim(), "ReconfigVM_Task",
+                                         vm_ref, spec=reconfig_spec)
+    session._wait_for_task(reconfig_task)
+    LOG.debug("Associated VM to instance %s", instance['uuid'],
+              instance=instance)
+    # Invalidate the cache, so that it is refetched the next time
+    vm_ref_cache_delete(instance['uuid'])
+
+
+def power_on_instance(session, instance, vm_ref=None):
+    """Power on the specified instance."""
+
+    if vm_ref is None:
+        vm_ref = get_vm_ref(session, instance)
+
+    LOG.debug("Powering on the VM", instance=instance)
+    try:
+        poweron_task = session._call_method(
+                                    session._get_vim(),
+                                    "PowerOnVM_Task", vm_ref)
+        session._wait_for_task(poweron_task)
+        LOG.debug("Powered on the VM", instance=instance)
+    except error_util.InvalidPowerStateException:
+        LOG.debug("VM already powered on", instance=instance)
+
+
+def get_values_from_object_properties(session, props, properties):
+    """Get the specific values from a object list.
+
+    The object values will be returned as a dictionary. The keys for the
+    dictionary will be the 'properties'.
+    """
+    dictionary = {}
+    while props:
+        for elem in props.objects:
+            propdict = propset_dict(elem.propSet)
+            dictionary.update(propdict)
+        token = _get_token(props)
+        if not token:
+            break
+
+        props = session._call_method(vim_util,
+                                     "continue_to_get_objects",
+                                     token)
+    return dictionary

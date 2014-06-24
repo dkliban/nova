@@ -27,6 +27,7 @@ from nova.image import glance
 from nova.network import minidns
 from nova.network import model as network_model
 from nova.objects import instance as instance_obj
+import nova.utils
 
 CONF = cfg.CONF
 CONF.import_opt('use_ipv6', 'nova.netconf')
@@ -105,7 +106,6 @@ def get_test_network_info(count=1):
     ipv6 = CONF.use_ipv6
     fake = 'fake'
     fake_ip = '0.0.0.0'
-    fake_netmask = '255.255.255.255'
     fake_vlan = 100
     fake_bridge_interface = 'eth0'
 
@@ -149,6 +149,11 @@ def get_test_network_info(count=1):
 
 def is_osx():
     return platform.mac_ver()[0] != ''
+
+
+def coreutils_readlink_available():
+    _out, err = nova.utils.trycmd('readlink', '-nm', '/')
+    return err == ''
 
 
 test_dns_managers = []
@@ -206,3 +211,8 @@ def is_ipv6_supported():
             has_ipv6_support = False
 
     return has_ipv6_support
+
+
+def get_api_version(request):
+    if request.path[2:3].isdigit():
+        return int(request.path[2:3])

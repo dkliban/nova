@@ -23,6 +23,7 @@ from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
 from nova import exception
+from nova import objects
 from nova.objects import flavor as flavor_obj
 from nova.objects import instance as instance_obj
 from nova.openstack.common.gettextutils import _
@@ -49,6 +50,13 @@ def make_usage(elem):
                         'started_at', 'ended_at', 'state', 'uptime'):
         subelem = xmlutil.SubTemplateElement(server_usage, subelem_tag)
         subelem.text = subelem_tag
+
+
+def parse_strtime(dstr, fmt):
+    try:
+        return timeutils.parse_strtime(dstr, fmt)
+    except (TypeError, ValueError) as e:
+        raise exception.InvalidStrTime(reason=unicode(e))
 
 
 class SimpleTenantUsageTemplate(xmlutil.TemplateBuilder):
@@ -132,7 +140,7 @@ class SimpleTenantUsageController(object):
     def _tenant_usages_for_period(self, context, period_start,
                                   period_stop, tenant_id=None, detailed=True):
 
-        instances = instance_obj.InstanceList.get_active_by_window_joined(
+        instances = objects.InstanceList.get_active_by_window_joined(
                         context, period_start, period_stop, tenant_id,
                         expected_attrs=instance_obj.INSTANCE_DEFAULT_FIELDS)
         rval = {}
@@ -145,18 +153,18 @@ class SimpleTenantUsageController(object):
                                             period_stop)
             flavor = self._get_flavor(context, instance, flavors)
             if not flavor:
-                continue
+                info['flavor'] = ''
+            else:
+                info['flavor'] = flavor.name
 
             info['instance_id'] = instance.uuid
             info['name'] = instance.display_name
 
-            info['memory_mb'] = flavor.memory_mb
-            info['local_gb'] = flavor.root_gb + flavor.ephemeral_gb
-            info['vcpus'] = flavor.vcpus
+            info['memory_mb'] = instance.memory_mb
+            info['local_gb'] = instance.root_gb + instance.ephemeral_gb
+            info['vcpus'] = instance.vcpus
 
             info['tenant_id'] = instance.project_id
-
-            info['flavor'] = flavor.name
 
             # NOTE(mriedem): We need to normalize the start/end times back
             # to timezone-naive so the response doesn't change after the
@@ -211,13 +219,17 @@ class SimpleTenantUsageController(object):
             value = timeutils.utcnow()
         elif isinstance(dtstr, datetime.datetime):
             value = dtstr
-        try:
-            value = timeutils.parse_strtime(dtstr, "%Y-%m-%dT%H:%M:%S")
-        except Exception:
+        for fmt in ["%Y-%m-%dT%H:%M:%S",
+                    "%Y-%m-%dT%H:%M:%S.%f",
+                    "%Y-%m-%d %H:%M:%S.%f"]:
             try:
-                value = timeutils.parse_strtime(dtstr, "%Y-%m-%dT%H:%M:%S.%f")
-            except Exception:
-                value = timeutils.parse_strtime(dtstr, "%Y-%m-%d %H:%M:%S.%f")
+                value = parse_strtime(dtstr, fmt)
+                break
+            except exception.InvalidStrTime:
+                pass
+        else:
+            msg = _("Datetime is in invalid format")
+            raise exception.InvalidStrTime(reason=msg)
 
         # NOTE(mriedem): Instance object DateTime fields are timezone-aware
         # so we have to force UTC timezone for comparing this datetime against
@@ -249,7 +261,12 @@ class SimpleTenantUsageController(object):
 
         authorize_list(context)
 
-        (period_start, period_stop, detailed) = self._get_datetime_range(req)
+        try:
+            (period_start, period_stop, detailed) = self._get_datetime_range(
+                req)
+        except exception.InvalidStrTime as e:
+            raise exc.HTTPBadRequest(explanation=e.format_message())
+
         now = timeutils.parse_isotime(timeutils.strtime())
         if period_stop > now:
             period_stop = now
@@ -267,7 +284,12 @@ class SimpleTenantUsageController(object):
 
         authorize_show(context, {'project_id': tenant_id})
 
-        (period_start, period_stop, ignore) = self._get_datetime_range(req)
+        try:
+            (period_start, period_stop, ignore) = self._get_datetime_range(
+                req)
+        except exception.InvalidStrTime as e:
+            raise exc.HTTPBadRequest(explanation=e.format_message())
+
         now = timeutils.parse_isotime(timeutils.strtime())
         if period_stop > now:
             period_stop = now
@@ -290,7 +312,7 @@ class Simple_tenant_usage(extensions.ExtensionDescriptor):
     alias = "os-simple-tenant-usage"
     namespace = ("http://docs.openstack.org/compute/ext/"
                  "os-simple-tenant-usage/api/v1.1")
-    updated = "2011-08-19T00:00:00+00:00"
+    updated = "2011-08-19T00:00:00Z"
 
     def get_resources(self):
         resources = []

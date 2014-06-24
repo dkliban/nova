@@ -790,6 +790,11 @@ class Network(BASE, NovaBase):
     host = Column(String(255))  # , ForeignKey('hosts.id'))
     uuid = Column(String(36))
 
+    mtu = Column(Integer)
+    dhcp_server = Column(types.IPAddress())
+    enable_dhcp = Column(Boolean, default=True)
+    share_address = Column(Boolean, default=False)
+
 
 class VirtualInterface(BASE, NovaBase):
     """Represents a virtual interface on an instance."""
@@ -1144,7 +1149,7 @@ class VolumeUsage(BASE, NovaBase):
     volume_id = Column(String(36), nullable=False)
     instance_uuid = Column(String(36))
     project_id = Column(String(36))
-    user_id = Column(String(36))
+    user_id = Column(String(64))
     availability_zone = Column(String(255))
     tot_last_refreshed = Column(DateTime)
     tot_reads = Column(BigInteger, default=0)

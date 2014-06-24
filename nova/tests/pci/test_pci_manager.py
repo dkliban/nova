@@ -21,7 +21,8 @@ from nova import context
 from nova import db
 from nova import exception
 from nova.objects import instance
-from nova.objects import pci_device
+from nova.objects import pci_device as pci_device_obj
+from nova.pci import pci_device
 from nova.pci import pci_manager
 from nova.pci import pci_request
 from nova import test
@@ -74,7 +75,7 @@ class PciDevTrackerTestCase(test.TestCase):
     def _create_fake_instance(self):
         self.inst = instance.Instance()
         self.inst.uuid = 'fake-inst-uuid'
-        self.inst.pci_devices = pci_device.PciDeviceList()
+        self.inst.pci_devices = pci_device_obj.PciDeviceList()
         self.inst.vm_state = vm_states.ACTIVE
         self.inst.task_state = None
 
@@ -244,9 +245,9 @@ class PciDevTrackerTestCase(test.TestCase):
         self.destroy_called = 0
         ctxt = context.get_admin_context()
         self.assertEqual(len(self.tracker.pci_devs), 3)
-        dev = self.tracker.pci_devs.objects[0]
+        dev = self.tracker.pci_devs[0]
         self.update_called = 0
-        dev.remove()
+        pci_device.remove(dev)
         self.tracker.save(ctxt)
         self.assertEqual(len(self.tracker.pci_devs), 2)
         self.assertEqual(self.destroy_called, 1)
@@ -269,7 +270,6 @@ class PciDevTrackerTestCase(test.TestCase):
     def test_clean_usage(self):
         inst_2 = copy.copy(self.inst)
         inst_2.uuid = 'uuid5'
-        inst = {'uuid': 'uuid1', 'vm_state': vm_states.BUILDING}
         migr = {'instance_uuid': 'uuid2', 'vm_state': vm_states.BUILDING}
         orph = {'uuid': 'uuid3', 'vm_state': vm_states.BUILDING}
 
@@ -289,7 +289,6 @@ class PciDevTrackerTestCase(test.TestCase):
     def test_clean_usage_claims(self):
         inst_2 = copy.copy(self.inst)
         inst_2.uuid = 'uuid5'
-        inst = {'uuid': 'uuid1', 'vm_state': vm_states.BUILDING}
         migr = {'instance_uuid': 'uuid2', 'vm_state': vm_states.BUILDING}
         orph = {'uuid': 'uuid3', 'vm_state': vm_states.BUILDING}
 
@@ -328,14 +327,14 @@ class PciGetInstanceDevs(test.TestCase):
         self.stubs.Set(db, 'pci_device_get_all_by_instance_uuid',
             _fake_pci_device_get_by_instance_uuid)
         self._get_by_uuid = False
-        devices = pci_manager.get_instance_pci_devs(instance)
+        pci_manager.get_instance_pci_devs(instance)
         self.assertEqual(self._get_by_uuid, True)
 
     def test_get_devs_object(self):
         def _fake_obj_load_attr(foo, attrname):
             if attrname == 'pci_devices':
                 self.load_attr_called = True
-                foo.pci_devices = pci_device.PciDeviceList()
+                foo.pci_devices = pci_device_obj.PciDeviceList()
 
         inst = fakes.stub_instance(id='1')
         ctxt = context.get_admin_context()
@@ -348,5 +347,5 @@ class PciGetInstanceDevs(test.TestCase):
             _fake_obj_load_attr)
 
         self.load_attr_called = False
-        devices = pci_manager.get_instance_pci_devs(inst)
+        pci_manager.get_instance_pci_devs(inst)
         self.assertEqual(self.load_attr_called, True)

@@ -25,6 +25,7 @@ from nova import exception
 from nova.openstack.common import excutils
 from nova.openstack.common import fileutils
 from nova.openstack.common.gettextutils import _
+from nova.openstack.common.gettextutils import _LE
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
 from nova.openstack.common import units
@@ -32,6 +33,7 @@ from nova import utils
 from nova.virt.disk import api as disk
 from nova.virt import images
 from nova.virt.libvirt import config as vconfig
+from nova.virt.libvirt import lvm
 from nova.virt.libvirt import utils as libvirt_utils
 
 
@@ -48,20 +50,14 @@ __imagebackend_opts = [
                default='default',
                help='VM Images format. Acceptable values are: raw, qcow2, lvm,'
                     ' rbd, default. If default is specified,'
-                    ' then use_cow_images flag is used instead of this one.',
-               deprecated_group='DEFAULT',
-               deprecated_name='libvirt_images_type'),
+                    ' then use_cow_images flag is used instead of this one.'),
     cfg.StrOpt('images_volume_group',
                help='LVM Volume Group that is used for VM images, when you'
-                    ' specify images_type=lvm.',
-               deprecated_group='DEFAULT',
-               deprecated_name='libvirt_images_volume_group'),
+                    ' specify images_type=lvm.'),
     cfg.BoolOpt('sparse_logical_volumes',
                 default=False,
                 help='Create sparse logical volumes (with virtualsize)'
-                     ' if this flag is set to True.',
-                deprecated_group='DEFAULT',
-                deprecated_name='libvirt_sparse_logical_volumes'),
+                     ' if this flag is set to True.'),
     cfg.StrOpt('volume_clear',
                default='zero',
                help='Method used to wipe old volumes (valid options are: '
@@ -71,14 +67,10 @@ __imagebackend_opts = [
                help='Size in MiB to wipe at start of old volumes. 0 => all'),
     cfg.StrOpt('images_rbd_pool',
                default='rbd',
-               help='The RADOS pool in which rbd volumes are stored',
-               deprecated_group='DEFAULT',
-               deprecated_name='libvirt_images_rbd_pool'),
+               help='The RADOS pool in which rbd volumes are stored'),
     cfg.StrOpt('images_rbd_ceph_conf',
                default='',  # default determined by librados
-               help='Path to the ceph configuration file to use',
-               deprecated_group='DEFAULT',
-               deprecated_name='libvirt_images_rbd_ceph_conf'),
+               help='Path to the ceph configuration file to use'),
         ]
 
 CONF = cfg.CONF
@@ -103,6 +95,11 @@ class Image(object):
         self.driver_format = driver_format
         self.is_block_dev = is_block_dev
         self.preallocate = False
+
+        # NOTE(dripton): We store lines of json (path, disk_format) in this
+        # file, for some image types, to prevent attacks based on changing the
+        # disk_format.
+        self.disk_info_path = None
 
         # NOTE(mikal): We need a lock directory which is shared along with
         # instance files, to cover the scenario where multiple compute nodes
@@ -202,9 +199,9 @@ class Image(object):
             can_fallocate = not err
             self.__class__.can_fallocate = can_fallocate
             if not can_fallocate:
-                LOG.error(_('Unable to preallocate_images=%(imgs)s at path: '
-                            '%(path)s'), {'imgs': CONF.preallocate_images,
-                                           'path': self.path})
+                LOG.error(_LE('Unable to preallocate_images=%(imgs)s at path: '
+                              '%(path)s'), {'imgs': CONF.preallocate_images,
+                                            'path': self.path})
         return can_fallocate
 
     @staticmethod
@@ -230,8 +227,8 @@ class Image(object):
             base_size = disk.get_disk_size(base)
 
         if size < base_size:
-            msg = _('%(base)s virtual size %(base_size)s '
-                    'larger than flavor root disk size %(size)s')
+            msg = _LE('%(base)s virtual size %(base_size)s '
+                      'larger than flavor root disk size %(size)s')
             LOG.error(msg % {'base': base,
                               'base_size': base_size,
                               'size': size})
@@ -239,6 +236,66 @@ class Image(object):
 
     def snapshot_extract(self, target, out_format):
         raise NotImplementedError()
+
+    def _get_driver_format(self):
+        return self.driver_format
+
+    def resolve_driver_format(self):
+        """Return the driver format for self.path.
+
+        First checks self.disk_info_path for an entry.
+        If it's not there, calls self._get_driver_format(), and then
+        stores the result in self.disk_info_path
+
+        See https://bugs.launchpad.net/nova/+bug/1221190
+        """
+        def _dict_from_line(line):
+            if not line:
+                return {}
+            try:
+                return jsonutils.loads(line)
+            except (TypeError, ValueError) as e:
+                msg = (_("Could not load line %(line)s, got error "
+                        "%(error)s") %
+                        {'line': line, 'error': unicode(e)})
+                raise exception.InvalidDiskInfo(reason=msg)
+
+        @utils.synchronized(self.disk_info_path, external=False,
+                            lock_path=self.lock_path)
+        def write_to_disk_info_file():
+            # Use os.open to create it without group or world write permission.
+            fd = os.open(self.disk_info_path, os.O_RDONLY | os.O_CREAT, 0o644)
+            with os.fdopen(fd, "r") as disk_info_file:
+                line = disk_info_file.read().rstrip()
+                dct = _dict_from_line(line)
+
+            if self.path in dct:
+                msg = _("Attempted overwrite of an existing value.")
+                raise exception.InvalidDiskInfo(reason=msg)
+            dct.update({self.path: driver_format})
+
+            tmp_path = self.disk_info_path + ".tmp"
+            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT, 0o644)
+            with os.fdopen(fd, "w") as tmp_file:
+                tmp_file.write('%s\n' % jsonutils.dumps(dct))
+            os.rename(tmp_path, self.disk_info_path)
+
+        try:
+            if (self.disk_info_path is not None and
+                        os.path.exists(self.disk_info_path)):
+                with open(self.disk_info_path) as disk_info_file:
+                    line = disk_info_file.read().rstrip()
+                    dct = _dict_from_line(line)
+                    for path, driver_format in dct.iteritems():
+                        if path == self.path:
+                            return driver_format
+            driver_format = self._get_driver_format()
+            if self.disk_info_path is not None:
+                fileutils.ensure_tree(os.path.dirname(self.disk_info_path))
+                write_to_disk_info_file()
+        except OSError as e:
+            raise exception.DiskInfoReadWriteFail(reason=unicode(e))
+        return driver_format
 
 
 class Raw(Image):
@@ -249,12 +306,17 @@ class Raw(Image):
                      os.path.join(libvirt_utils.get_instance_path(instance),
                                   disk_name))
         self.preallocate = CONF.preallocate_images != 'none'
+        self.disk_info_path = os.path.join(os.path.dirname(self.path),
+                                           'disk.info')
         self.correct_format()
+
+    def _get_driver_format(self):
+        data = images.qemu_img_info(self.path)
+        return data.file_format or 'raw'
 
     def correct_format(self):
         if os.path.exists(self.path):
-            data = images.qemu_img_info(self.path)
-            self.driver_format = data.file_format or 'raw'
+            self.driver_format = self.resolve_driver_format()
 
     def create_image(self, prepare_template, base, size, *args, **kwargs):
         filename = os.path.split(base)[-1]
@@ -293,6 +355,9 @@ class Qcow2(Image):
                      os.path.join(libvirt_utils.get_instance_path(instance),
                                   disk_name))
         self.preallocate = CONF.preallocate_images != 'none'
+        self.disk_info_path = os.path.join(os.path.dirname(self.path),
+                                           'disk.info')
+        self.resolve_driver_format()
 
     def create_image(self, prepare_template, base, size, *args, **kwargs):
         filename = os.path.split(base)[-1]
@@ -355,7 +420,7 @@ class Lvm(Image):
         super(Lvm, self).__init__("block", "raw", is_block_dev=True)
 
         if path:
-            info = libvirt_utils.logical_volume_info(path)
+            info = lvm.volume_info(path)
             self.vg = info['VG']
             self.lv = info['LV']
             self.path = path
@@ -386,8 +451,8 @@ class Lvm(Image):
             self.verify_base_size(base, size, base_size=base_size)
             resize = size > base_size
             size = size if resize else base_size
-            libvirt_utils.create_lvm_image(self.vg, self.lv,
-                                           size, sparse=self.sparse)
+            lvm.create_volume(self.vg, self.lv,
+                                         size, sparse=self.sparse)
             images.convert_image(base, self.path, 'raw', run_as_root=True)
             if resize:
                 disk.resize2fs(self.path, run_as_root=True)
@@ -396,8 +461,8 @@ class Lvm(Image):
 
         #Generate images with specified size right on volume
         if generated and size:
-            libvirt_utils.create_lvm_image(self.vg, self.lv,
-                                           size, sparse=self.sparse)
+            lvm.create_volume(self.vg, self.lv,
+                                         size, sparse=self.sparse)
             with self.remove_volume_on_error(self.path):
                 prepare_template(target=self.path, *args, **kwargs)
         else:
@@ -412,7 +477,7 @@ class Lvm(Image):
             yield
         except Exception:
             with excutils.save_and_reraise_exception():
-                libvirt_utils.remove_logical_volumes(path)
+                lvm.remove_volumes(path)
 
     def snapshot_extract(self, target, out_format):
         images.convert_image(self.path, target, out_format,
@@ -433,7 +498,7 @@ class RBDVolumeProxy(object):
         try:
             self.volume = driver.rbd.Image(ioctx, str(name), snapshot=None)
         except driver.rbd.Error:
-            LOG.exception(_("error opening rbd image %s"), name)
+            LOG.exception(_LE("error opening rbd image %s"), name)
             driver._disconnect_from_rados(client, ioctx)
             raise
         self.driver = driver

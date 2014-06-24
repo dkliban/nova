@@ -42,16 +42,18 @@ from nova import db
 from nova.db import migration
 from nova.db.sqlalchemy import api as session
 from nova.network import manager as network_manager
+from nova import objects
 from nova.objects import base as objects_base
 from nova.openstack.common.fixture import logging as log_fixture
 from nova.openstack.common.fixture import moxstubout
-from nova.openstack.common import log as oslo_logging
+from nova.openstack.common import log as nova_logging
 from nova.openstack.common import timeutils
 from nova import paths
 from nova import rpc
 from nova import service
 from nova.tests import conf_fixture
 from nova.tests import policy_fixture
+from nova import utils
 
 
 test_opts = [
@@ -70,7 +72,12 @@ CONF.import_opt('sqlite_db', 'nova.openstack.common.db.options',
 CONF.import_opt('enabled', 'nova.api.openstack', group='osapi_v3')
 CONF.set_override('use_stderr', False)
 
-oslo_logging.setup('nova')
+nova_logging.setup('nova')
+
+# NOTE(comstud): Make sure we have all of the objects loaded. We do this
+# at module import time, because we may be using mock decorators in our
+# tests that run at import time.
+objects.register_all()
 
 _DB_CACHE = None
 _TRUE_VALUES = ('True', 'true', '1', 'yes')
@@ -194,6 +201,23 @@ class TestingException(Exception):
     pass
 
 
+class NullHandler(logging.Handler):
+    """custom default NullHandler to attempt to format the record.
+
+    Used in conjunction with
+    log_fixture.get_logging_handle_error_fixture to detect formatting errors in
+    debug level logs without saving the logs.
+    """
+    def handle(self, record):
+        self.format(record)
+
+    def emit(self, record):
+        pass
+
+    def createLock(self):
+        self.lock = None
+
+
 class TestCase(testtools.TestCase):
     """Test case base class for all unit tests.
 
@@ -240,10 +264,27 @@ class TestCase(testtools.TestCase):
         self.addCleanup(rpc.clear_extra_exmods)
         self.addCleanup(rpc.cleanup)
 
+        # set root logger to debug
+        root = logging.getLogger()
+        root.setLevel(logging.DEBUG)
+
+        # supports collecting debug level for local runs
+        if os.environ.get('OS_DEBUG') in _TRUE_VALUES:
+            level = logging.DEBUG
+        else:
+            level = logging.INFO
+
+        # Collect logs
         fs = '%(levelname)s [%(name)s] %(message)s'
-        self.log_fixture = self.useFixture(fixtures.FakeLogger(
-            level=logging.DEBUG,
-            format=fs))
+        self.useFixture(fixtures.FakeLogger(format=fs, level=None))
+        root.handlers[0].setLevel(level)
+
+        if level > logging.DEBUG:
+            # Just attempt to format debug level logs, but don't save them
+            handler = NullHandler()
+            self.useFixture(fixtures.LogHandler(handler, nuke_handlers=False))
+            handler.setLevel(logging.DEBUG)
+
         self.useFixture(conf_fixture.ConfFixture(CONF))
 
         self.messaging_conf = messaging_conffixture.ConfFixture(CONF)
@@ -270,6 +311,11 @@ class TestCase(testtools.TestCase):
         self._base_test_obj_backup = copy.copy(
             objects_base.NovaObject._obj_classes)
         self.addCleanup(self._restore_obj_registry)
+
+        # NOTE(mnaser): All calls to utils.is_neutron() are cached in
+        # nova.utils._IS_NEUTRON.  We set it to None to avoid any
+        # caching of that value.
+        utils._IS_NEUTRON = None
 
         mox_fixture = self.useFixture(moxstubout.MoxStubout())
         self.mox = mox_fixture.mox
@@ -332,3 +378,9 @@ class NoDBTestCase(TestCase):
     should derive from this class.
     """
     USES_DB = False
+
+
+class BaseHookTestCase(NoDBTestCase):
+    def assert_has_hook(self, expected_name, func):
+        self.assertTrue(hasattr(func, '__hook_name__'))
+        self.assertEqual(expected_name, func.__hook_name__)

@@ -30,8 +30,10 @@ from nova import test
 from nova.tests.image import fake as fake_image
 from nova.tests import utils as test_utils
 from nova.tests.virt.libvirt import fake_libvirt_utils
+from nova.tests.virt.libvirt import test_driver
 from nova.virt import event as virtevent
 from nova.virt import fake
+from nova.virt.libvirt import imagebackend
 
 LOG = logging.getLogger(__name__)
 
@@ -204,6 +206,12 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
                                                     fake.FakeVirtAPI())
         self.ctxt = test_utils.get_test_admin_context()
         self.image_service = fake_image.FakeImageService()
+        # NOTE(dripton): resolve_driver_format does some file reading and
+        # writing and chowning that complicate testing too much by requiring
+        # using real directories with proper permissions.  Just stub it out
+        # here; we test it in test_imagebackend.py
+        self.stubs.Set(imagebackend.Image, 'resolve_driver_format',
+                       imagebackend.Image._get_driver_format)
 
     def _get_running_instance(self, obj=False):
         instance_ref = test_utils.get_test_instance(obj=obj)
@@ -442,17 +450,19 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
             'root_device_name': None,
             'swap': None,
             'ephemerals': [],
-            'block_device_mapping': [{
-            'instance_uuid': instance_ref['uuid'],
-            'connection_info': {'driver_volume_type': 'fake'},
-            'mount_device': '/dev/sda',
-            'delete_on_termination': False,
-            'virtual_name': None,
-            'snapshot_id': None,
-            'volume_id': 'abcdedf',
-            'volume_size': None,
-            'no_device': None
-            }]
+            'block_device_mapping': [
+                test_driver.mocked_bdm(1, {
+                        'instance_uuid': instance_ref['uuid'],
+                        'connection_info': {'driver_volume_type': 'fake'},
+                        'mount_device': '/dev/sda',
+                        'delete_on_termination': False,
+                        'virtual_name': None,
+                        'snapshot_id': None,
+                        'volume_id': 'abcdedf',
+                        'volume_size': None,
+                        'no_device': None
+                        }),
+                ]
         }
         self.connection.power_on(self.ctxt, instance_ref, network_info, bdm)
         self.connection.detach_volume(connection_info,

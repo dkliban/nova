@@ -27,6 +27,7 @@ from nova.openstack.common import timeutils
 from nova.pci import pci_stats
 from nova.scheduler import filters
 from nova.scheduler.filters import extra_specs_ops
+from nova.scheduler.filters import ram_filter
 from nova.scheduler.filters import trusted_filter
 from nova import servicegroup
 from nova import test
@@ -499,7 +500,7 @@ class HostFiltersTestCase(test.NoDBTestCase):
     def test_ram_filter_fails_on_memory(self):
         self._stub_service_is_up(True)
         filt_cls = self.class_map['RamFilter']()
-        self.flags(ram_allocation_ratio=1.0)
+        ram_filter.RamFilter.ram_allocation_ratio = 1.0
         filter_properties = {'instance_type': {'memory_mb': 1024}}
         service = {'disabled': False}
         host = fakes.FakeHostState('host1', 'node1',
@@ -510,7 +511,7 @@ class HostFiltersTestCase(test.NoDBTestCase):
     def test_ram_filter_passes(self):
         self._stub_service_is_up(True)
         filt_cls = self.class_map['RamFilter']()
-        self.flags(ram_allocation_ratio=1.0)
+        ram_filter.RamFilter.ram_allocation_ratio = 1.0
         filter_properties = {'instance_type': {'memory_mb': 1024}}
         service = {'disabled': False}
         host = fakes.FakeHostState('host1', 'node1',
@@ -521,7 +522,7 @@ class HostFiltersTestCase(test.NoDBTestCase):
     def test_ram_filter_oversubscribe(self):
         self._stub_service_is_up(True)
         filt_cls = self.class_map['RamFilter']()
-        self.flags(ram_allocation_ratio=2.0)
+        ram_filter.RamFilter.ram_allocation_ratio = 2.0
         filter_properties = {'instance_type': {'memory_mb': 1024}}
         service = {'disabled': False}
         host = fakes.FakeHostState('host1', 'node1',
@@ -1555,28 +1556,44 @@ class HostFiltersTestCase(test.NoDBTestCase):
         filter_properties = {}
         self.assertFalse(filt_cls.host_passes(host, filter_properties))
 
-    def test_group_anti_affinity_filter_passes(self):
-        filt_cls = self.class_map['GroupAntiAffinityFilter']()
+    def _test_group_anti_affinity_filter_passes(self, cls, policy):
+        filt_cls = self.class_map[cls]()
         host = fakes.FakeHostState('host1', 'node1', {})
         filter_properties = {}
         self.assertTrue(filt_cls.host_passes(host, filter_properties))
         filter_properties = {'group_policies': ['affinity']}
         self.assertTrue(filt_cls.host_passes(host, filter_properties))
-        filter_properties = {'group_policies': ['anti-affinity']}
+        filter_properties = {'group_policies': [policy]}
         filter_properties['group_hosts'] = []
         self.assertTrue(filt_cls.host_passes(host, filter_properties))
         filter_properties['group_hosts'] = ['host2']
         self.assertTrue(filt_cls.host_passes(host, filter_properties))
 
-    def test_group_anti_affinity_filter_fails(self):
-        filt_cls = self.class_map['GroupAntiAffinityFilter']()
+    def test_group_anti_affinity_filter_passes(self):
+        self._test_group_anti_affinity_filter_passes(
+                'ServerGroupAntiAffinityFilter', 'anti-affinity')
+
+    def test_group_anti_affinity_filter_passes_legacy(self):
+        self._test_group_anti_affinity_filter_passes(
+                'GroupAntiAffinityFilter', 'legacy')
+
+    def _test_group_anti_affinity_filter_fails(self, cls, policy):
+        filt_cls = self.class_map[cls]()
         host = fakes.FakeHostState('host1', 'node1', {})
-        filter_properties = {'group_policies': ['anti-affinity'],
+        filter_properties = {'group_policies': [policy],
                              'group_hosts': ['host1']}
         self.assertFalse(filt_cls.host_passes(host, filter_properties))
 
-    def test_group_affinity_filter_passes(self):
-        filt_cls = self.class_map['GroupAffinityFilter']()
+    def test_group_anti_affinity_filter_fails(self):
+        self._test_group_anti_affinity_filter_fails(
+                'ServerGroupAntiAffinityFilter', 'anti-affinity')
+
+    def test_group_anti_affinity_filter_fails_legacy(self):
+        self._test_group_anti_affinity_filter_fails(
+                'GroupAntiAffinityFilter', 'legacy')
+
+    def _test_group_affinity_filter_passes(self, cls, policy):
+        filt_cls = self.class_map['ServerGroupAffinityFilter']()
         host = fakes.FakeHostState('host1', 'node1', {})
         filter_properties = {}
         self.assertTrue(filt_cls.host_passes(host, filter_properties))
@@ -1586,12 +1603,28 @@ class HostFiltersTestCase(test.NoDBTestCase):
                              'group_hosts': ['host1']}
         self.assertTrue(filt_cls.host_passes(host, filter_properties))
 
-    def test_group_affinity_filter_fails(self):
-        filt_cls = self.class_map['GroupAffinityFilter']()
+    def test_group_affinity_filter_passes(self):
+        self._test_group_affinity_filter_passes(
+                'ServerGroupAffinityFilter', 'affinity')
+
+    def test_group_affinity_filter_passes_legacy(self):
+        self._test_group_affinity_filter_passes(
+                'GroupAffinityFilter', 'legacy')
+
+    def _test_group_affinity_filter_fails(self, cls, policy):
+        filt_cls = self.class_map[cls]()
         host = fakes.FakeHostState('host1', 'node1', {})
-        filter_properties = {'group_policies': ['affinity'],
+        filter_properties = {'group_policies': [policy],
                              'group_hosts': ['host2']}
         self.assertFalse(filt_cls.host_passes(host, filter_properties))
+
+    def test_group_affinity_filter_fails(self):
+        self._test_group_affinity_filter_fails(
+                'ServerGroupAffinityFilter', 'affinity')
+
+    def test_group_affinity_filter_fails_legacy(self):
+        self._test_group_affinity_filter_fails(
+                'GroupAffinityFilter', 'legacy')
 
     def test_aggregate_multi_tenancy_isolation_with_meta_passes(self):
         self._stub_service_is_up(True)

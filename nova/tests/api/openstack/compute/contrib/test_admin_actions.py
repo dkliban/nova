@@ -19,7 +19,7 @@ from nova.api.openstack.compute.contrib import admin_actions
 from nova.compute import vm_states
 import nova.context
 from nova import exception
-from nova.objects import instance as instance_obj
+from nova import objects
 from nova.openstack.common import jsonutils
 from nova.openstack.common import timeutils
 from nova.openstack.common import uuidutils
@@ -63,8 +63,8 @@ class CommonMixin(object):
         instance = fake_instance.fake_db_instance(
                 id=1, uuid=uuid, vm_state=vm_states.ACTIVE,
                 task_state=None, launched_at=timeutils.utcnow())
-        instance = instance_obj.Instance._from_db_object(
-                self.context, instance_obj.Instance(), instance)
+        instance = objects.Instance._from_db_object(
+                self.context, objects.Instance(), instance)
         self.compute_api.get(self.context, uuid,
                              want_objects=True).AndReturn(instance)
         return instance
@@ -336,6 +336,10 @@ class AdminActionsTest(CommonMixin, test.NoDBTestCase):
         self._test_migrate_live_failed_with_exception(
             exception.InvalidHypervisorType())
 
+    def test_migrate_live_invalid_cpu_info(self):
+        self._test_migrate_live_failed_with_exception(
+            exception.InvalidCPUInfo(reason=""))
+
     def test_migrate_live_unable_to_migrate_to_self(self):
         uuid = uuidutils.generate_uuid()
         self._test_migrate_live_failed_with_exception(
@@ -358,6 +362,14 @@ class AdminActionsTest(CommonMixin, test.NoDBTestCase):
     def test_migrate_live_invalid_shared_storage(self):
         self._test_migrate_live_failed_with_exception(
             exception.InvalidSharedStorage(path='', reason=''))
+
+    def test_migrate_live_hypervisor_unavailable(self):
+        self._test_migrate_live_failed_with_exception(
+            exception.HypervisorUnavailable(host=""))
+
+    def test_migrate_live_instance_not_running(self):
+        self._test_migrate_live_failed_with_exception(
+            exception.InstanceNotRunning(instance_id=""))
 
     def test_migrate_live_migration_pre_check_error(self):
         self._test_migrate_live_failed_with_exception(
@@ -596,7 +608,7 @@ class ResetStateTests(test.NoDBTestCase):
                           {"os-resetState": {"state": "active"}})
 
     def _setup_mock(self, expected):
-        instance = instance_obj.Instance()
+        instance = objects.Instance()
         instance.uuid = self.uuid
         instance.vm_state = 'fake'
         instance.task_state = 'fake'

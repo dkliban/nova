@@ -57,79 +57,54 @@ LOG = logging.getLogger(__name__)
 
 xenapi_opts = [
     cfg.StrOpt('connection_url',
-               deprecated_name='xenapi_connection_url',
-               deprecated_group='DEFAULT',
                help='URL for connection to XenServer/Xen Cloud Platform. '
                     'A special value of unix://local can be used to connect '
                     'to the local unix socket.  '
                     'Required if compute_driver=xenapi.XenAPIDriver'),
     cfg.StrOpt('connection_username',
                default='root',
-               deprecated_name='xenapi_connection_username',
-               deprecated_group='DEFAULT',
                help='Username for connection to XenServer/Xen Cloud Platform. '
                     'Used only if compute_driver=xenapi.XenAPIDriver'),
     cfg.StrOpt('connection_password',
-               deprecated_name='xenapi_connection_password',
-               deprecated_group='DEFAULT',
                help='Password for connection to XenServer/Xen Cloud Platform. '
                     'Used only if compute_driver=xenapi.XenAPIDriver',
                secret=True),
     cfg.FloatOpt('vhd_coalesce_poll_interval',
                  default=5.0,
-                 deprecated_name='xenapi_vhd_coalesce_poll_interval',
-                 deprecated_group='DEFAULT',
                  help='The interval used for polling of coalescing vhds. '
                       'Used only if compute_driver=xenapi.XenAPIDriver'),
     cfg.BoolOpt('check_host',
                 default=True,
-                deprecated_name='xenapi_check_host',
-                deprecated_group='DEFAULT',
                 help='Ensure compute service is running on host XenAPI '
                      'connects to.'),
     cfg.IntOpt('vhd_coalesce_max_attempts',
                default=20,
-               deprecated_name='xenapi_vhd_coalesce_max_attempts',
-               deprecated_group='DEFAULT',
                help='Max number of times to poll for VHD to coalesce. '
                     'Used only if compute_driver=xenapi.XenAPIDriver'),
     cfg.StrOpt('sr_base_path',
                default='/var/run/sr-mount',
-               deprecated_name='xenapi_sr_base_path',
-               deprecated_group='DEFAULT',
                help='Base path to the storage repository'),
     cfg.StrOpt('target_host',
-               deprecated_name='target_host',
-               deprecated_group='DEFAULT',
                help='The iSCSI Target Host'),
     cfg.StrOpt('target_port',
                default='3260',
-               deprecated_name='target_port',
-               deprecated_group='DEFAULT',
                help='The iSCSI Target Port, default is port 3260'),
     cfg.StrOpt('iqn_prefix',
                default='iqn.2010-10.org.openstack',
-               deprecated_name='iqn_prefix',
-               deprecated_group='DEFAULT',
                help='IQN Prefix'),
     # NOTE(sirp): This is a work-around for a bug in Ubuntu Maverick,
     # when we pull support for it, we should remove this
     cfg.BoolOpt('remap_vbd_dev',
                 default=False,
-                deprecated_name='xenapi_remap_vbd_dev',
-                deprecated_group='DEFAULT',
                 help='Used to enable the remapping of VBD dev '
                      '(Works around an issue in Ubuntu Maverick)'),
     cfg.StrOpt('remap_vbd_dev_prefix',
                default='sd',
-               deprecated_name='xenapi_remap_vbd_dev_prefix',
-               deprecated_group='DEFAULT',
                help='Specify prefix to remap VBD dev to '
                     '(ex. /dev/xvdb -> /dev/sdb)'),
     ]
 
 CONF = cfg.CONF
-# xenapi options in the DEFAULT group were deprecated in Icehouse
 CONF.register_opts(xenapi_opts, 'xenserver')
 CONF.import_opt('host', 'nova.netconf')
 
@@ -177,18 +152,17 @@ class XenAPIDriver(driver.ComputeDriver):
         except Exception:
             LOG.exception(_('Failure while cleaning up attached VDIs'))
 
-    def instance_exists(self, instance_name):
+    def instance_exists(self, instance):
         """Checks existence of an instance on the host.
 
-        :param instance_name: The name of the instance to lookup
+        :param instance: The instance to lookup
 
-        Returns True if an instance with the supplied name exists on
-        the host, False otherwise.
+        Returns True if supplied instance exists on the host, False otherwise.
 
         NOTE(belliott): This is an override of the base method for
         efficiency.
         """
-        return self._vmops.instance_exists(instance_name)
+        return self._vmops.instance_exists(instance.name)
 
     def estimate_instance_overhead(self, instance_info):
         """Get virtualization overhead required to build an instance of the
@@ -462,6 +436,7 @@ class XenAPIDriver(driver.ComputeDriver):
         free_ram_mb = host_stats['host_memory_free_computed'] / units.Mi
         total_disk_gb = host_stats['disk_total'] / units.Gi
         used_disk_gb = host_stats['disk_used'] / units.Gi
+        allocated_disk_gb = host_stats['disk_allocated'] / units.Gi
         hyper_ver = utils.convert_version_to_int(self._session.product_version)
         dic = {'vcpus': host_stats['host_cpu_info']['cpu_count'],
                'memory_mb': total_ram_mb,
@@ -475,6 +450,7 @@ class XenAPIDriver(driver.ComputeDriver):
                # Todo(bobba) cpu_info may be in a format not supported by
                # arch_filter.py - see libvirt/driver.py get_cpu_info
                'cpu_info': jsonutils.dumps(host_stats['host_cpu_info']),
+               'disk_available_least': total_disk_gb - allocated_disk_gb,
                'supported_instances': jsonutils.dumps(
                    host_stats['supported_instances']),
                'pci_passthrough_devices': jsonutils.dumps(
@@ -546,10 +522,10 @@ class XenAPIDriver(driver.ComputeDriver):
         :param dest: destination host
         :param post_method:
             post operation method.
-            expected nova.compute.manager.post_live_migration.
+            expected nova.compute.manager._post_live_migration.
         :param recover_method:
             recovery method when any exception occurs.
-            expected nova.compute.manager.recover_live_migration.
+            expected nova.compute.manager._rollback_live_migration.
         :param block_migration: if true, migrate VM disk.
         :param migrate_data: implementation specific params
         """
@@ -576,7 +552,7 @@ class XenAPIDriver(driver.ComputeDriver):
         # TODO(JohnGarbutt) look again when boot-from-volume hits trunk
         pre_live_migration_result = {}
         pre_live_migration_result['sr_uuid_map'] = \
-                 self._vmops.attach_block_device_volumes(block_device_info)
+                 self._vmops.connect_block_device_volumes(block_device_info)
         return pre_live_migration_result
 
     def post_live_migration(self, ctxt, instance_ref, block_device_info,

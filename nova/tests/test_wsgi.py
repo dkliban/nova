@@ -104,8 +104,8 @@ class TestWSGIServer(test.NoDBTestCase):
         self.assertEqual("test_app", server.name)
 
     def test_custom_max_header_line(self):
-        CONF.max_header_line = 4096  # Default value is 16384.
-        server = nova.wsgi.Server("test_custom_max_header_line", None)
+        self.flags(max_header_line=4096)  # Default value is 16384.
+        nova.wsgi.Server("test_custom_max_header_line", None)
         self.assertEqual(CONF.max_header_line, eventlet.wsgi.MAX_HEADER_LINE)
 
     def test_start_random_port(self):
@@ -132,13 +132,13 @@ class TestWSGIServer(test.NoDBTestCase):
         server.start()
 
         uri = "http://127.0.0.1:%d/%s" % (server.port, 10000 * 'x')
-        resp = requests.get(uri)
+        resp = requests.get(uri, proxies={"http": ""})
         eventlet.sleep(0)
         self.assertNotEqual(resp.status_code,
                             requests.codes.REQUEST_URI_TOO_LARGE)
 
         uri = "http://127.0.0.1:%d/%s" % (server.port, 20000 * 'x')
-        resp = requests.get(uri)
+        resp = requests.get(uri, proxies={"http": ""})
         eventlet.sleep(0)
         self.assertEqual(resp.status_code,
                          requests.codes.REQUEST_URI_TOO_LARGE)

@@ -63,7 +63,8 @@ class ConsoleOutputExtensionTest(test.NoDBTestCase):
         self.app = fakes.wsgi_app_v3(init_only=('servers',
                                                 'os-console-output'))
 
-    def _create_request(self, length_dict={}):
+    def _create_request(self, length_dict=None):
+        length_dict = length_dict or {}
         body = {'get_console_output': length_dict}
         req = fakes.HTTPRequestV3.blank('/v3/servers/1/action')
         req.method = "POST"
@@ -91,6 +92,20 @@ class ConsoleOutputExtensionTest(test.NoDBTestCase):
         output = jsonutils.loads(res.body)
         self.assertEqual(res.status_int, 200)
         self.assertEqual(output, {'output': '2\n3\n4'})
+
+    def test_get_console_output_with_unlimited_length(self):
+        req = self._create_request(length_dict={'length': -1})
+        res = req.get_response(self.app)
+        output = jsonutils.loads(res.body)
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(output, {'output': '0\n1\n2\n3\n4'})
+
+    def test_get_console_output_with_unlimited_length_as_str(self):
+        req = self._create_request(length_dict={'length': '-1'})
+        res = req.get_response(self.app)
+        output = jsonutils.loads(res.body)
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(output, {'output': '0\n1\n2\n3\n4'})
 
     def test_get_console_output_with_non_integer_length(self):
         req = self._create_request(length_dict={'length': 'NaN'})
@@ -132,8 +147,8 @@ class ConsoleOutputExtensionTest(test.NoDBTestCase):
         res = req.get_response(self.app)
         self.assertEqual(res.status_int, 501)
 
-    def test_get_console_output_with_negative_length(self):
-        req = self._create_request(length_dict={'length': -1})
+    def test_get_console_output_with_small_length(self):
+        req = self._create_request(length_dict={'length': -2})
         res = req.get_response(self.app)
         self.assertEqual(res.status_int, 400)
 

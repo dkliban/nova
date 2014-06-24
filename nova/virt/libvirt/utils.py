@@ -25,11 +25,11 @@ import platform
 from lxml import etree
 from oslo.config import cfg
 
-from nova import exception
 from nova.openstack.common.gettextutils import _
+from nova.openstack.common.gettextutils import _LI
+from nova.openstack.common.gettextutils import _LW
 from nova.openstack.common import log as logging
 from nova.openstack.common import processutils
-from nova.openstack.common import units
 from nova import utils
 from nova.virt import images
 from nova.virt import volumeutils
@@ -38,9 +38,7 @@ libvirt_opts = [
     cfg.BoolOpt('snapshot_compression',
                 default=False,
                 help='Compress snapshot images when possible. This '
-                     'currently applies exclusively to qcow2 images',
-                deprecated_group='DEFAULT',
-                deprecated_name='libvirt_snapshot_compression'),
+                     'currently applies exclusively to qcow2 images'),
     ]
 
 CONF = cfg.CONF
@@ -68,13 +66,13 @@ def get_fc_hbas():
         # and systool is not installed
         # 96 = nova.cmd.rootwrap.RC_NOEXECFOUND:
         if exc.exit_code == 96:
-            LOG.warn(_("systool is not installed"))
+            LOG.warn(_LW("systool is not installed"))
         return []
     except OSError as exc:
         # This handles the case where rootwrap is NOT used
         # and systool is not installed
         if exc.errno == errno.ENOENT:
-            LOG.warn(_("systool is not installed"))
+            LOG.warn(_LW("systool is not installed"))
         return []
 
     if out is None:
@@ -193,8 +191,8 @@ def create_cow_image(backing_file, path, size=None):
     # See: http://www.gossamer-threads.com/lists/openstack/dev/10592
     # if 'preallocation' in base_details:
     #     cow_opts += ['preallocation=%s' % base_details['preallocation']]
-    if base_details and base_details.encryption:
-        cow_opts += ['encryption=%s' % base_details.encryption]
+    if base_details and base_details.encrypted:
+        cow_opts += ['encryption=%s' % base_details.encrypted]
     if size is not None:
         cow_opts += ['size=%s' % size]
     if cow_opts:
@@ -203,52 +201,6 @@ def create_cow_image(backing_file, path, size=None):
         cow_opts = ['-o', csv_opts]
     cmd = base_cmd + cow_opts + [path]
     execute(*cmd)
-
-
-def create_lvm_image(vg, lv, size, sparse=False):
-    """Create LVM image.
-
-    Creates a LVM image with given size.
-
-    :param vg: existing volume group which should hold this image
-    :param lv: name for this image (logical volume)
-    :size: size of image in bytes
-    :sparse: create sparse logical volume
-    """
-    vg_info = get_volume_group_info(vg)
-    free_space = vg_info['free']
-
-    def check_size(vg, lv, size):
-        if size > free_space:
-            raise RuntimeError(_('Insufficient Space on Volume Group %(vg)s.'
-                                 ' Only %(free_space)db available,'
-                                 ' but %(size)db required'
-                                 ' by volume %(lv)s.') %
-                               {'vg': vg,
-                                'free_space': free_space,
-                                'size': size,
-                                'lv': lv})
-
-    if sparse:
-        preallocated_space = 64 * units.Mi
-        check_size(vg, lv, preallocated_space)
-        if free_space < size:
-            LOG.warning(_('Volume group %(vg)s will not be able'
-                          ' to hold sparse volume %(lv)s.'
-                          ' Virtual volume size is %(size)db,'
-                          ' but free space on volume group is'
-                          ' only %(free_space)db.'),
-                        {'vg': vg,
-                         'free_space': free_space,
-                         'size': size,
-                         'lv': lv})
-
-        cmd = ('lvcreate', '-L', '%db' % preallocated_space,
-                '--virtualsize', '%db' % size, '-n', lv, vg)
-    else:
-        check_size(vg, lv, size)
-        cmd = ('lvcreate', '-L', '%db' % size, '-n', lv, vg)
-    execute(*cmd, run_as_root=True, attempts=3)
 
 
 def import_rbd_image(*args):
@@ -287,144 +239,8 @@ def remove_rbd_volumes(pool, *names):
         try:
             _run_rbd(*rbd_remove, attempts=3, run_as_root=True)
         except processutils.ProcessExecutionError:
-            LOG.warn(_("rbd remove %(name)s in pool %(pool)s failed"),
+            LOG.warn(_LW("rbd remove %(name)s in pool %(pool)s failed"),
                      {'name': name, 'pool': pool})
-
-
-def get_volume_group_info(vg):
-    """Return free/used/total space info for a volume group in bytes
-
-    :param vg: volume group name
-    :returns: A dict containing:
-             :total: How big the filesystem is (in bytes)
-             :free: How much space is free (in bytes)
-             :used: How much space is used (in bytes)
-    """
-
-    out, err = execute('vgs', '--noheadings', '--nosuffix',
-                       '--separator', '|',
-                       '--units', 'b', '-o', 'vg_size,vg_free', vg,
-                       run_as_root=True)
-
-    info = out.split('|')
-    if len(info) != 2:
-        raise RuntimeError(_("vg %s must be LVM volume group") % vg)
-
-    return {'total': int(info[0]),
-            'free': int(info[1]),
-            'used': int(info[0]) - int(info[1])}
-
-
-def list_logical_volumes(vg):
-    """List logical volumes paths for given volume group.
-
-    :param vg: volume group name
-    """
-    out, err = execute('lvs', '--noheadings', '-o', 'lv_name', vg,
-                       run_as_root=True)
-
-    return [line.strip() for line in out.splitlines()]
-
-
-def logical_volume_info(path):
-    """Get logical volume info.
-
-    :param path: logical volume path
-    """
-    out, err = execute('lvs', '-o', 'vg_all,lv_all',
-                       '--separator', '|', path, run_as_root=True)
-
-    info = [line.split('|') for line in out.splitlines()]
-
-    if len(info) != 2:
-        raise RuntimeError(_("Path %s must be LVM logical volume") % path)
-
-    return dict(zip(*info))
-
-
-def logical_volume_size(path):
-    """Get logical volume size in bytes.
-
-    :param path: logical volume path
-    """
-    out, _err = execute('blockdev', '--getsize64', path, run_as_root=True)
-
-    return int(out)
-
-
-def _zero_logical_volume(path, volume_size):
-    """Write zeros over the specified path
-
-    :param path: logical volume path
-    :param size: number of zeros to write
-    """
-    bs = units.Mi
-    direct_flags = ('oflag=direct',)
-    sync_flags = ()
-    remaining_bytes = volume_size
-
-    # The loop efficiently writes zeros using dd,
-    # and caters for versions of dd that don't have
-    # the easier to use iflag=count_bytes option.
-    while remaining_bytes:
-        zero_blocks = remaining_bytes / bs
-        seek_blocks = (volume_size - remaining_bytes) / bs
-        zero_cmd = ('dd', 'bs=%s' % bs,
-                    'if=/dev/zero', 'of=%s' % path,
-                    'seek=%s' % seek_blocks, 'count=%s' % zero_blocks)
-        zero_cmd += direct_flags
-        zero_cmd += sync_flags
-        if zero_blocks:
-            utils.execute(*zero_cmd, run_as_root=True)
-        remaining_bytes %= bs
-        bs /= units.Ki  # Limit to 3 iterations
-        # Use O_DIRECT with initial block size and fdatasync otherwise
-        direct_flags = ()
-        sync_flags = ('conv=fdatasync',)
-
-
-def clear_logical_volume(path):
-    """Obfuscate the logical volume.
-
-    :param path: logical volume path
-    """
-    volume_clear = CONF.libvirt.volume_clear
-
-    if volume_clear not in ('none', 'shred', 'zero'):
-        LOG.error(_("ignoring unrecognized volume_clear='%s' value"),
-                  volume_clear)
-        volume_clear = 'zero'
-
-    if volume_clear == 'none':
-        return
-
-    volume_clear_size = int(CONF.libvirt.volume_clear_size) * units.Mi
-    volume_size = logical_volume_size(path)
-
-    if volume_clear_size != 0 and volume_clear_size < volume_size:
-        volume_size = volume_clear_size
-
-    if volume_clear == 'zero':
-        # NOTE(p-draigbrady): we could use shred to do the zeroing
-        # with -n0 -z, however only versions >= 8.22 perform as well as dd
-        _zero_logical_volume(path, volume_size)
-    elif volume_clear == 'shred':
-        utils.execute('shred', '-n3', '-s%d' % volume_size, path,
-                      run_as_root=True)
-    else:
-        raise exception.Invalid(_("volume_clear='%s' is not handled")
-                                % volume_clear)
-
-
-def remove_logical_volumes(*paths):
-    """Remove one or more logical volume."""
-
-    for path in paths:
-        clear_logical_volume(path)
-
-    if paths:
-        lvremove = ('lvremove', '-f') + paths
-        execute(*lvremove, attempts=3, run_as_root=True)
 
 
 def pick_disk_driver_name(hypervisor_version, is_block_dev=False):
@@ -711,5 +527,5 @@ def is_mounted(mount_path, source=None):
     except OSError as exc:
         #info since it's not required to have this tool.
         if exc.errno == errno.ENOENT:
-            LOG.info(_("findmnt tool is not installed"))
+            LOG.info(_LI("findmnt tool is not installed"))
         return False
