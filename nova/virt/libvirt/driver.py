@@ -3184,6 +3184,7 @@ class LibvirtDriver(driver.ComputeDriver):
             else:
                 guest.os_boot_dev = blockinfo.get_boot_order(disk_info)
 
+<<<<<<< HEAD
         if (image_meta and
                 image_meta.get('properties', {}).get('os_command_line')):
             guest.os_cmdline = \
@@ -3191,6 +3192,12 @@ class LibvirtDriver(driver.ComputeDriver):
 
         if ((CONF.libvirt.virt_type != "lxc" and
              CONF.libvirt.virt_type != "uml")):
+=======
+            if instance['cmdline']:
+                guest.os_cmdline = instance['cmdline']
+
+        if CONF.libvirt_type != "lxc" and CONF.libvirt_type != "uml":
+>>>>>>> f4793f723eb74efac571f88abe09ee3ee6dc4d7a
             guest.acpi = True
             guest.apic = True
 
