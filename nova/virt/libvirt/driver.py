@@ -610,12 +610,9 @@ class LibvirtDriver(driver.ComputeDriver):
                         {'type': CONF.libvirt.virt_type, 'arch': arch})
 
     def init_host(self, host):
-<<<<<<< HEAD
-=======
         # NOTE(dkliban): Error handler needs to be registered before libvirt
         #                connection is used for the first time.  Otherwise, the
         #                handler does not get registered.
->>>>>>> upstream/master
         libvirt.registerErrorHandler(libvirt_error_handler, None)
         libvirt.virEventRegisterDefaultImpl()
         self._do_quality_warnings()
@@ -3222,23 +3219,17 @@ class LibvirtDriver(driver.ComputeDriver):
             if virt_props.obj_attr_is_set('hw_os_command_line'):
                 guest.os_cmdline = virt_props.hw_os_command_line
 
-<<<<<<< HEAD
-<<<<<<< HEAD
         if (image_meta and
                 image_meta.get('properties', {}).get('os_command_line')):
             guest.os_cmdline = \
                     image_meta['properties'].get('os_command_line')
 
-=======
->>>>>>> upstream/master
         if ((CONF.libvirt.virt_type != "lxc" and
              CONF.libvirt.virt_type != "uml")):
-=======
             if instance['cmdline']:
                 guest.os_cmdline = instance['cmdline']
 
         if CONF.libvirt_type != "lxc" and CONF.libvirt_type != "uml":
->>>>>>> f4793f723eb74efac571f88abe09ee3ee6dc4d7a
             guest.acpi = True
             guest.apic = True
 
